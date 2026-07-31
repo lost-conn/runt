@@ -5,8 +5,6 @@
 //! [`Engine::render`] a `TextureView`. Everything between those three calls is
 //! engine business.
 
-use glam::Mat4;
-
 use crate::input::InputEvent;
 use crate::sim::Sim;
 use crate::Renderer;
@@ -14,6 +12,9 @@ use crate::Renderer;
 pub struct Engine {
     sim: Sim,
     renderer: Renderer,
+    /// A world with no camera draws nothing; say so once rather than every
+    /// frame for as long as it stays broken.
+    warned_no_camera: bool,
 }
 
 impl Engine {
@@ -26,6 +27,7 @@ impl Engine {
         Engine {
             sim: Sim::new(),
             renderer: Renderer::new(device, queue, target_format),
+            warned_no_camera: false,
         }
     }
 
@@ -35,6 +37,7 @@ impl Engine {
         Ok(Engine {
             sim: Sim::new(),
             renderer: Renderer::headless(target_format).await?,
+            warned_no_camera: false,
         })
     }
 
@@ -49,6 +52,7 @@ impl Engine {
         Engine {
             sim: Sim::with_tick_rate(hz),
             renderer: Renderer::new(device, queue, target_format),
+            warned_no_camera: false,
         }
     }
 
@@ -70,22 +74,42 @@ impl Engine {
     /// `width` × `height`. Uses the interpolation alpha left by the last
     /// [`update`](Engine::update).
     ///
+    /// The whole frame in order: the sim produces a sorted draw list and the
+    /// camera's view-projection for this viewport, then the renderer uploads,
+    /// clears and draws it. The host contributes a size and a texture — no view
+    /// matrix, no model matrix, no scene knowledge (DESIGN §5).
+    ///
     /// [`target_format`]: Engine::target_format
     pub fn render(&mut self, view: &wgpu::TextureView, width: u32, height: u32) {
-        let model = self.sim.demo_model_matrix();
-        self.renderer.render(view, width, height, model);
-    }
+        let (width, height) = (width.max(1), height.max(1));
+        let aspect = width as f32 / height as f32;
 
-    /// Draw one frame with an explicit model matrix, bypassing the sim. For the
-    /// editor bridge and golden-image tests that want a fixed pose.
-    pub fn render_with_model(
-        &mut self,
-        view: &wgpu::TextureView,
-        width: u32,
-        height: u32,
-        model: Mat4,
-    ) {
-        self.renderer.render(view, width, height, model);
+        let Some(frame) = self.sim.frame_params(aspect) else {
+            if !self.warned_no_camera {
+                log::warn!("no camera entity in the world; nothing will be drawn");
+                self.warned_no_camera = true;
+            }
+            // Still clear, so a host sees a blank frame rather than garbage.
+            self.renderer.render(
+                view,
+                width,
+                height,
+                &crate::FrameParams::default(),
+                &[],
+                self.sim.mesh_library(),
+            );
+            return;
+        };
+
+        let draws = self.sim.draw_list();
+        self.renderer.render(
+            view,
+            width,
+            height,
+            &frame,
+            &draws,
+            self.sim.mesh_library(),
+        );
     }
 
     // -- accessors ----------------------------------------------------------

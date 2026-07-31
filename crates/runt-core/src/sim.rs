@@ -10,12 +10,22 @@
 //! number and the input trace. That is the property replays are built on.
 
 use bevy_ecs::prelude::*;
+use bevy_ecs::query::QueryState;
 use glam::Mat4;
 
-use crate::ecs::{
-    self, DemoEntity, FixedTick, Interpolated, TickCount, Transform,
-};
+use crate::camera::Camera;
+use crate::draw::{self, DrawItem, DrawQuery, FrameParams};
+use crate::ecs::{self, DemoEntity, FixedTick, Interpolated, Lighting, TickCount, Transform};
 use crate::input::{Input, InputEvent};
+use crate::registry::MeshLibrary;
+
+/// The camera components the render path reads.
+type CameraQuery = (
+    Entity,
+    &'static Camera,
+    &'static Transform,
+    Option<&'static Interpolated>,
+);
 
 /// The tick length DESIGN §4 fixes: 1/60 s exactly.
 pub const TICK_DT: f64 = 1.0 / 60.0;
@@ -47,6 +57,12 @@ pub struct Sim {
     consumed: f64,
     alpha: f32,
     pending: Vec<InputEvent>,
+
+    /// Cached query states for the render-side reads. Built once, updated for
+    /// new archetypes on use — rebuilding them per frame would be pure waste in
+    /// the one place that runs every frame.
+    draw_query: QueryState<DrawQuery>,
+    camera_query: QueryState<CameraQuery>,
 }
 
 impl Sim {
@@ -76,6 +92,11 @@ impl Sim {
         });
         world.insert_resource(TickCount::default());
         world.insert_resource(Input::new());
+        world.insert_resource(MeshLibrary::new());
+        world.insert_resource(Lighting::default());
+
+        let draw_query = world.query::<DrawQuery>();
+        let camera_query = world.query::<CameraQuery>();
 
         let mut sim = Sim {
             world,
@@ -87,6 +108,8 @@ impl Sim {
             consumed: 0.0,
             alpha: 0.0,
             pending: Vec::new(),
+            draw_query,
+            camera_query,
         };
         sim.startup.run(&mut sim.world);
         sim
@@ -123,7 +146,7 @@ impl Sim {
         self.alpha as f64 * self.tick_dt
     }
 
-    /// The single entity holding the merged demo scene.
+    /// The demo's spinning entity (the twisted box).
     pub fn demo_entity(&self) -> Entity {
         self.world.resource::<DemoEntity>().0
     }
@@ -226,11 +249,75 @@ impl Sim {
         })
     }
 
-    /// The demo scene's interpolated model matrix — what the renderer draws the
-    /// merged buffer with until per-entity draws land (DESIGN §12 step 3).
+    /// The demo spinner's interpolated model matrix. Convenience for tests; the
+    /// render path goes through [`draw_list`](Sim::draw_list) like everything
+    /// else.
     pub fn demo_model_matrix(&self) -> Mat4 {
         self.model_matrix(self.demo_entity())
             .unwrap_or(Mat4::IDENTITY)
+    }
+
+    /// Generated geometry, keyed by content hash. The renderer uploads from
+    /// here on demand.
+    pub fn mesh_library(&self) -> &MeshLibrary {
+        self.world.resource::<MeshLibrary>()
+    }
+
+    /// The scene's light rig.
+    pub fn lighting(&self) -> Lighting {
+        *self.world.resource::<Lighting>()
+    }
+
+    /// The single camera entity (DESIGN §5: exactly one per `render()`).
+    ///
+    /// If a scene somehow spawns several, the lowest `Entity` wins — an
+    /// arbitrary rule, but a *stable* one, which beats "whichever archetype the
+    /// query reached first".
+    pub fn camera_entity(&mut self) -> Option<Entity> {
+        let mut found: Option<Entity> = None;
+        let mut count = 0usize;
+        for (entity, _, _, _) in self.camera_query.iter(&self.world) {
+            count += 1;
+            found = Some(match found {
+                Some(best) => best.min(entity),
+                None => entity,
+            });
+        }
+        debug_assert!(count <= 1, "DESIGN §5: exactly one camera, found {count}");
+        found
+    }
+
+    /// The per-frame constants for a viewport of the given aspect ratio:
+    /// view-projection from the camera entity's interpolated pose, plus the
+    /// light rig. `None` when the world has no camera at all.
+    pub fn frame_params(&mut self, aspect: f32) -> Option<FrameParams> {
+        self.frame_params_at(aspect, self.alpha)
+    }
+
+    /// As [`frame_params`](Sim::frame_params) but at an explicit alpha.
+    pub fn frame_params_at(&mut self, aspect: f32, alpha: f32) -> Option<FrameParams> {
+        let entity = self.camera_entity()?;
+        let (_, camera, transform, interpolated) = self.camera_query.get(&self.world, entity).ok()?;
+        let pose = match interpolated {
+            Some(prev) => prev.blend(transform, alpha),
+            None => transform.matrix(),
+        };
+        Some(FrameParams {
+            view_proj: camera.view_proj(pose, aspect),
+            lighting: *self.world.resource::<Lighting>(),
+        })
+    }
+
+    /// Every drawable entity at the current alpha, sorted for the render pass
+    /// (DESIGN §5). Entities without an [`Interpolated`] are drawn at their
+    /// current transform.
+    pub fn draw_list(&mut self) -> Vec<DrawItem> {
+        self.draw_list_at(self.alpha)
+    }
+
+    /// As [`draw_list`](Sim::draw_list) but at an explicit alpha.
+    pub fn draw_list_at(&mut self, alpha: f32) -> Vec<DrawItem> {
+        draw::extract_draw_list(&mut self.draw_query, &self.world, alpha)
     }
 }
 

@@ -1,5 +1,5 @@
 //! Headless render-to-texture smoke test (DESIGN §2, build step 1; §3/§4 for
-//! the ECS drive).
+//! the ECS drive; §5 for the per-entity draw path).
 //!
 //! Proves the core really is windowless: it builds its own device with no
 //! surface, ticks the sim to a fixed wall time, renders the demo scene into an
@@ -7,10 +7,20 @@
 //! landed on screen. This is the foundation for real screenshot/regression
 //! tests later.
 //!
+//! Since step 3 the scene is seven entities drawn one by one, so the frame is
+//! also checked *per entity*: two objects at different distances are projected
+//! through the engine's own camera and the pixels there must show their own
+//! materials — which only holds if the draw list, the dynamic instance offsets
+//! and the depth buffer all did their jobs.
+//!
 //! `TIME` is a whole number of 60 Hz ticks (0.7 s = 42 ticks), so the frame is
 //! captured at alpha ≈ 0 and the pose matches what the pre-ECS renderer drew
 //! from a raw time value.
+//!
+//! Set `RUNT_SCREENSHOT_DUMP=/path/frame.rgba` to write the raw
+//! `SIZE × SIZE × 4` pixels for eyeballing.
 
+use glam::{Mat4, Vec3};
 use runt_core::Engine;
 
 const SIZE: u32 = 512;
@@ -19,13 +29,60 @@ const TIME: f64 = 0.7;
 /// `TIME` in whole ticks.
 const TICKS: u64 = 42;
 
+/// Two probe points, one on the twisted box's upper half (clear of the torus in
+/// front of it) and one at the center of the blue sphere twin. They are ~1.4
+/// world units apart in depth and both have ground plane behind them, so a
+/// pixel showing their own color is a depth-test claim as well as a draw claim.
+const BOX_PROBE: Vec3 = Vec3::new(0.0, 1.15, 0.0);
+const TWIN_PROBE: Vec3 = Vec3::new(-2.0, 0.5, 1.9);
+
 /// `copy_texture_to_buffer` requires `bytes_per_row` to be a multiple of 256.
 fn align_256(n: u32) -> u32 {
     n.div_ceil(256) * 256
 }
 
+/// One rendered frame: pixels plus the camera matrix they were drawn with.
+struct Frame {
+    pixels: Vec<u8>,
+    view_proj: Mat4,
+}
+
+impl Frame {
+    /// Where a world point lands, in pixels.
+    fn project(&self, p: Vec3) -> (u32, u32) {
+        let clip = self.view_proj * p.extend(1.0);
+        assert!(clip.w > 0.0, "{p:?} is behind the camera");
+        let ndc = clip.truncate() / clip.w;
+        let x = ((ndc.x * 0.5 + 0.5) * SIZE as f32).round() as i32;
+        let y = ((0.5 - ndc.y * 0.5) * SIZE as f32).round() as i32;
+        (
+            x.clamp(0, SIZE as i32 - 1) as u32,
+            y.clamp(0, SIZE as i32 - 1) as u32,
+        )
+    }
+
+    /// Mean color of a 5×5 block, so one stray edge pixel cannot decide a test.
+    fn sample(&self, p: Vec3) -> [f32; 3] {
+        let (cx, cy) = self.project(p);
+        let mut sum = [0f32; 3];
+        let mut n = 0f32;
+        for dy in -2i32..=2 {
+            for dx in -2i32..=2 {
+                let x = (cx as i32 + dx).clamp(0, SIZE as i32 - 1) as usize;
+                let y = (cy as i32 + dy).clamp(0, SIZE as i32 - 1) as usize;
+                let i = (y * SIZE as usize + x) * 4;
+                for c in 0..3 {
+                    sum[c] += self.pixels[i + c] as f32 / 255.0;
+                }
+                n += 1.0;
+            }
+        }
+        [sum[0] / n, sum[1] / n, sum[2] / n]
+    }
+}
+
 /// Render one frame headless and return the tightly-packed RGBA8 pixels.
-fn render_headless() -> Option<Vec<u8>> {
+fn render_headless() -> Option<Frame> {
     let mut engine = match pollster::block_on(Engine::headless(FORMAT)) {
         Ok(e) => e,
         Err(e) => {
@@ -73,6 +130,13 @@ fn render_headless() -> Option<Vec<u8>> {
         "captured just after a tick, alpha was {}",
         engine.alpha()
     );
+    // The same camera the frame is about to be drawn with — the probes below
+    // must not be allowed to disagree with the renderer about where things are.
+    let view_proj = engine
+        .sim_mut()
+        .frame_params(1.0)
+        .expect("the demo spawns a camera")
+        .view_proj;
     engine.render(&view, SIZE, SIZE);
 
     let unpadded_row = SIZE * 4;
@@ -123,16 +187,22 @@ fn render_headless() -> Option<Vec<u8>> {
     drop(padded);
     readback.unmap();
 
-    Some(pixels)
+    if let Ok(path) = std::env::var("RUNT_SCREENSHOT_DUMP") {
+        std::fs::write(&path, &pixels).expect("write dump");
+        println!("wrote {SIZE}x{SIZE} RGBA8 to {path}");
+    }
+
+    Some(Frame { pixels, view_proj })
 }
 
 #[test]
 fn headless_render_draws_geometry() {
-    let Some(pixels) = render_headless() else {
+    let Some(frame) = render_headless() else {
         // No GPU adapter in this environment (CI container without Vulkan/GL);
         // nothing to assert, but the code path above still compiled and ran.
         return;
     };
+    let pixels = &frame.pixels;
 
     assert_eq!(pixels.len(), (SIZE * SIZE * 4) as usize, "full frame read back");
 
@@ -157,7 +227,7 @@ fn headless_render_draws_geometry() {
     // A stable fingerprint of the frame — printed with `cargo test -- --nocapture`
     // so a future golden-image test has something to lock onto.
     let mut hash: u64 = 0xcbf29ce484222325;
-    for b in &pixels {
+    for b in pixels {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -168,4 +238,29 @@ fn headless_render_draws_geometry() {
         "expected geometry to cover >=5% of the frame, got {:.2}% ({drawn}/{total})",
         frac * 100.0
     );
+
+    // -- per-entity probes --------------------------------------------------
+    //
+    // Both probes sit in front of the ground plane, at different distances from
+    // the camera, and neither material exists anywhere else in the scene. If
+    // the instance offsets were wrong, every entity would draw with one
+    // material and these two could not both pass.
+
+    let boxed = frame.sample(BOX_PROBE);
+    println!("twisted box probe rgb {boxed:?}");
+    assert!(
+        boxed[0] > boxed[1] + 0.08 && boxed[2] > boxed[1] + 0.08,
+        "the twisted box's purple (0.80, 0.45, 0.90) should dominate, got {boxed:?}"
+    );
+
+    let twin = frame.sample(TWIN_PROBE);
+    println!("sphere twin probe rgb {twin:?}");
+    assert!(
+        twin[2] > twin[0] + 0.15 && twin[1] > twin[0] + 0.08,
+        "the twin sphere's flat blue (0.35, 0.75, 0.95) should dominate, got {twin:?}"
+    );
+
+    // The twin reuses the red ball's *geometry*, so a material mix-up would
+    // show up here as red.
+    assert!(twin[0] < twin[2], "the twin must not be wearing the ball's red");
 }

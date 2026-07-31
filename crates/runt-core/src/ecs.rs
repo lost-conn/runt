@@ -12,6 +12,8 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::ScheduleLabel;
 use glam::{Mat4, Quat, Vec3};
 
+use crate::registry::MeshHandle;
+
 // ---------------------------------------------------------------------------
 // Schedule labels
 // ---------------------------------------------------------------------------
@@ -48,11 +50,41 @@ pub struct FixedTick {
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TickCount(pub u64);
 
-/// The one entity carrying the merged demo-scene buffer. Placeholder until
-/// per-entity draws land (DESIGN §12 step 3), at which point this goes away in
-/// favour of `MeshRef` on many entities.
+/// The demo's spinning entity (the twisted box). Only a convenience handle for
+/// tests and the demo's follow camera — nothing in the render path needs it.
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct DemoEntity(pub Entity);
+
+/// The scene's light rig, uploaded verbatim into the per-frame uniform
+/// (DESIGN §5): one directional key light plus a sky/ground hemisphere ambient.
+///
+/// A resource, not a component, because v1 has exactly one rig; when a scene
+/// wants more it becomes a component on a light entity and this stays as the
+/// fallback.
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct Lighting {
+    /// Direction *towards* the key light. Normalized in the shader.
+    pub key_dir: Vec3,
+    pub key_color: Vec3,
+    /// Ambient seen by upward-facing normals.
+    pub sky_color: Vec3,
+    /// Ambient seen by downward-facing normals.
+    pub ground_color: Vec3,
+}
+
+impl Default for Lighting {
+    /// The pre-material look, restated as a rig: the same key direction, and an
+    /// ambient that averages to the flat 0.25 term the old shader used, split
+    /// into a cool sky and a warm-dark ground.
+    fn default() -> Lighting {
+        Lighting {
+            key_dir: Vec3::new(0.4, 1.0, 0.6),
+            key_color: Vec3::new(0.74, 0.72, 0.68),
+            sky_color: Vec3::new(0.30, 0.33, 0.40),
+            ground_color: Vec3::new(0.14, 0.13, 0.12),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Components
@@ -97,6 +129,16 @@ impl Transform {
         Transform {
             scale,
             ..Transform::IDENTITY
+        }
+    }
+
+    /// A transform at `eye` oriented so that local −Z points at `target` — the
+    /// camera convention, and the exact inverse of `Mat4::look_at_rh`.
+    pub fn looking_at(eye: Vec3, target: Vec3, up: Vec3) -> Transform {
+        Transform {
+            translation: eye,
+            rotation: crate::camera::look_rotation(eye, target, up),
+            scale: Vec3::ONE,
         }
     }
 
@@ -161,6 +203,14 @@ impl Interpolated {
     }
 }
 
+/// Which geometry an entity draws (DESIGN §3, §5).
+///
+/// A content hash, not a pointer: identical generated meshes collapse onto one
+/// handle and therefore one pair of GPU buffers. Step 4 (§6) grows this into
+/// "hash + generator params ref" without the render path noticing.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MeshRef(pub MeshHandle);
+
 /// Demo-only: constant-rate rotation about a local axis.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct Spin {
@@ -168,7 +218,7 @@ pub struct Spin {
     pub rad_per_sec: f32,
 }
 
-/// Marks the single entity that owns the merged demo-scene mesh.
+/// Marks entities belonging to the built-in demo scene.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct DemoScene;
 
@@ -216,26 +266,6 @@ pub fn advance_tick_count(mut count: ResMut<TickCount>) {
     count.0 += 1;
 }
 
-/// `Startup`: spawn the merged demo scene as a single spinning entity.
-///
-/// 0.4 rad/s about +Y — the rate the pre-ECS renderer hardcoded, kept so the
-/// screenshot test compares like with like.
-pub fn spawn_demo_scene(mut commands: Commands) {
-    let entity = commands
-        .spawn((
-            DemoScene,
-            Transform::IDENTITY,
-            GlobalTransform::default(),
-            Interpolated::default(),
-            Spin {
-                axis: Vec3::Y,
-                rad_per_sec: 0.4,
-            },
-        ))
-        .id();
-    commands.insert_resource(DemoEntity(entity));
-}
-
 // ---------------------------------------------------------------------------
 // Schedule construction
 // ---------------------------------------------------------------------------
@@ -251,7 +281,7 @@ fn deterministic_schedule(label: impl ScheduleLabel) -> Schedule {
 
 pub fn startup_schedule() -> Schedule {
     let mut s = deterministic_schedule(Startup);
-    s.add_systems(spawn_demo_scene);
+    s.add_systems(crate::scene::spawn_demo_scene);
     s
 }
 
@@ -263,6 +293,16 @@ pub fn post_sim_schedule() -> Schedule {
 
 pub fn fixed_sim_schedule() -> Schedule {
     let mut s = deterministic_schedule(FixedSim);
-    s.add_systems((spin, propagate_transforms, advance_tick_count).chain());
+    // Cameras follow *after* the things they follow have moved, so a follow is
+    // never a tick behind its target.
+    s.add_systems(
+        (
+            spin,
+            crate::camera::follow_camera,
+            propagate_transforms,
+            advance_tick_count,
+        )
+            .chain(),
+    );
     s
 }
