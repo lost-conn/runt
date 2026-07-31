@@ -1,0 +1,35 @@
+[package]
+name = "runt-app"
+version.workspace = true
+edition.workspace = true
+description = "runt player host: winit event loop, surface + present, web canvas glue."
+
+[lib]
+name = "runt_app"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "runt-native"
+path = "src/main.rs"
+
+[dependencies]
+runt-core.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+glam.workspace = true
+web-time.workspace = true
+log.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster.workspace = true
+env_logger = "0.11"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The WebGL2 fallback lives with the host: it is a backend/presentation
+# concern, and runt-core never touches a surface.
+wgpu = { workspace = true, features = ["webgl"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+console_log = "1"
+web-sys = { version = "0.3", features = ["Document", "Window", "Element", "HtmlElement", "Node"] }

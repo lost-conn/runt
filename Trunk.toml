@@ -1,0 +1,11 @@
+# Trunk needs a config file at the workspace root. Without one it falls back to
+# reading the cwd `Cargo.toml` as its config source and demands a *root
+# package*, which a virtual workspace manifest does not have — it dies with
+# "could not find the root package of the target crate" before it ever parses
+# index.html. See trunk-rs/trunk#909 (0.20 -> 0.21 regression, still open).
+#
+# The Rust crate to bundle is chosen by the `href` on the `data-trunk` link in
+# index.html (crates/runt-app), resolved relative to this directory.
+[build]
+target = "index.html"
+dist = "dist"

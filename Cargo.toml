@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/runt-mesh", "crates/runt-core", "crates/runt-app"]
+# `cargo run` / `cargo build` from the root act on the player host.
+default-members = ["crates/runt-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+runt-mesh = { path = "crates/runt-mesh" }
+runt-core = { path = "crates/runt-core" }
+
+wgpu = "30"
+winit = "0.30"
+# À la carte: the ECS only. No bevy umbrella, no bevy_reflect yet (DESIGN §3 —
+# reflection lands with the editor). `multi_threaded` stays off so schedules run
+# on the single-threaded executor everywhere, which is what determinism wants.
+bevy_ecs = { version = "0.19", default-features = false, features = ["std"] }
+glam = "0.33"
+bytemuck = { version = "1", features = ["derive"] }
+web-time = "1"
+log = "0.4"
+pollster = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

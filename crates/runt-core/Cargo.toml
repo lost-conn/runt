@@ -1,0 +1,16 @@
+[package]
+name = "runt-core"
+version.workspace = true
+edition.workspace = true
+description = "runt engine core: windowless renderer that draws into a caller-provided TextureView."
+
+[dependencies]
+runt-mesh.workspace = true
+bevy_ecs.workspace = true
+wgpu.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true
