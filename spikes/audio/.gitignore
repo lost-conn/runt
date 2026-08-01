@@ -1,0 +1,4 @@
+# Own cargo workspace -> own target dir.
+/target
+# Build output of build-web.sh (reproduce with ./build-web.sh).
+/web/spike_worklet.wasm

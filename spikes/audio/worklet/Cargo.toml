@@ -1,0 +1,15 @@
+[package]
+name = "spike-worklet"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# A raw `cdylib`: no wasm-bindgen, no JS glue, C ABI over linear memory.
+# This is the deliberate answer to the AudioWorkletGlobalScope problem —
+# see FINDINGS.md. wasm-bindgen's glue needs TextEncoder/TextDecoder, which do
+# not exist in a worklet scope; exporting plain functions needs neither.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+spike-patch.workspace = true

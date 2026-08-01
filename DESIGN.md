@@ -179,16 +179,55 @@ Same philosophy as meshes, one level down the pipeline.
 - v1 ships baked-only; the material variant key already reserves a bit for
   live eval so shaders don't need restructuring later.
 
-## 8. Audio — synthesized, de-risk first
+## 8. Audio — synthesized, worklet-resident
 
-- `fundsp` for synthesis, rendered in an `AudioWorklet` on web / cpal native.
-- **Known risk, unresolved:** AudioWorklet + wasm module loading + COOP/COEP
-  headers (if `SharedArrayBuffer` is used for the audio ring buffer). This is
-  the next *spike* before any audio feature work: a page that plays a fundsp
-  patch through AudioWorklet with the same trunk build we ship. Outcome
-  updates this section.
-- Audio params are content too: patches are param structs, seeded, serialized
-  in scene files like generators.
+**Decision (2026-08-01, spike complete — see `spikes/audio/FINDINGS.md`):**
+`fundsp` for synthesis, running *inside* an `AudioWorklet` on web and on the
+cpal callback natively. The same patch code serves both hosts; the host is a
+dumb pump.
+
+- **No `SharedArrayBuffer`, no COOP/COEP, no service worker.** The demo ships
+  on GitHub Pages, which cannot set response headers, so cross-origin
+  isolation is unavailable and the engine does not ask for it. A SAB
+  ring-buffer path was built and measured; it is strictly worse here (160 ms
+  of buffering to stay glitch-free, vs zero) and is **not** adopted.
+- **The worklet wasm is a separate raw `cdylib`, not a wasm-bindgen module.**
+  `AudioWorkletGlobalScope` lacks `TextEncoder`/`TextDecoder`/`fetch`, which
+  wasm-bindgen's glue requires. A C-ABI module over linear memory needs none
+  of them and has zero imports. The main thread compiles the module and
+  passes the structured-cloneable `WebAssembly.Module` through
+  `processorOptions`; the processor instantiates it synchronously and is live
+  on its first `process()`. Measured: 200 KB raw / 84 KB gzip, 6 ms compile,
+  fetched lazily on first audio start.
+- **Cost:** 12 µs per 128-frame stereo quantum in wasm (1.19× native) against
+  a 2 666 µs budget — 0.45% of one core. Voice count is bounded by design
+  taste, not CPU.
+- **Control path:** params and note triggers cross as `postMessage` records,
+  drained at the top of `process()`. Measured round trip median 6.6 ms, p95
+  10.8 ms. Event→sound is dominated by the OS audio stack; ~25–55 ms
+  end-to-end on real hardware — acceptable for game SFX as-is.
+- **Audio params are content**, like generators (§6): a patch is a
+  `Reflect + Serialize + Hash` param struct plus an explicit seed, serialized
+  in scene RON, edited through the same reflected panels as mesh generators
+  (§10), content-addressed by params hash.
+- **Determinism scope — same as sim (§4):** same params + seed + build +
+  platform → bit-identical samples (verified across processes). Cross-platform
+  bit-identity is **not** promised and does not hold (~1e-10 libm divergence
+  through IIR state; perceptually identical).
+- **Low-end story (§3):** one code path everywhere; the tier knob, if ever
+  needed, is voice count / oversampling — data, not divergent code. No
+  capability gate: AudioWorklet exists in every browser runt targets.
+- Sim-side seam: an `AudioOut` resource queues `AudioEvent`s during `FixedSim`
+  and flushes once per tick — never mid-tick, so replays stay deterministic.
+  Hosts implement one `AudioBackend::submit(&[AudioEvent])` trait; web
+  serializes to `postMessage`, native pushes to an SPSC queue read by the
+  cpal callback.
+- Phase-3 order: `runt-audio` crate (Patch trait + pluck/drone + offline hash
+  test) → worklet cdylib + trunk wiring (recipe in FINDINGS) → `AudioOut` +
+  pickup sound in the v0 demo → voice pool with stealing + master limiter +
+  camera-relative pan → editor patch panels with audition button.
+- **Not doing:** sample playback pipelines, music sequencing, convolution
+  reverb, HRTF/ambisonics, SAB in any form.
 
 ## 9. Physics — hand-rolled kinematic
 
@@ -292,8 +331,10 @@ seeded deterministic runs) in browser + native.
   when editor work starts (phase 2); CPU ray against generated tri data is
   likely enough.
 - **Worker story on web** for generation (§6): plain web worker with message
-  passing vs. SharedArrayBuffer. Interacts with the audio COOP/COEP question —
-  resolve both in the audio spike.
+  passing vs. SharedArrayBuffer. Audio no longer shares this question (§8
+  needs no isolation); if generation-on-a-worker later wants SAB it must
+  justify coi-serviceworker's costs (first-load reload, COEP embed breakage)
+  on its own. Default assumption: message passing suffices.
 - **Text/HUD rendering** in the player (not editor): none designed. Cheapest
   candidate: DOM overlay on web, nothing native, until a real need appears.
 - **rinch wgpu convergence:** revisit the GPU bridge when rinch leaves the

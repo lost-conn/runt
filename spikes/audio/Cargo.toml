@@ -1,0 +1,23 @@
+# Standalone workspace. Deliberately NOT a member of the runt root workspace:
+# a spike must not be able to break the engine build, and the wasm worklet crate
+# needs a `cdylib` profile the root workspace has no business carrying.
+[workspace]
+resolver = "2"
+members = ["patch", "native", "worklet"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+spike-patch = { path = "patch" }
+fundsp = { version = "0.23", default-features = false, features = ["std"] }
+
+# Size matters for the worklet build: it is downloaded before the first sound.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

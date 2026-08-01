@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>runt audio spike</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+         background:#14161a; color:#dfe3ea; margin:0; padding:24px; max-width:900px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  h2 { font-size:14px; margin:24px 0 8px; color:#8fb7ff; border-bottom:1px solid #2a2f38; padding-bottom:4px;}
+  .sub { color:#8b93a1; margin:0 0 20px; }
+  button { font:inherit; background:#252a33; color:#dfe3ea; border:1px solid #3a4150;
+           border-radius:6px; padding:6px 12px; cursor:pointer; }
+  button:hover:not(:disabled) { background:#2f3541; }
+  button:disabled { opacity:.4; cursor:default; }
+  button.primary { background:#2d5bd7; border-color:#3d6be7; }
+  label { display:flex; align-items:center; gap:10px; margin:8px 0; }
+  label span:first-child { width:130px; color:#8b93a1; }
+  input[type=range] { flex:1; max-width:340px; }
+  pre { background:#0e1013; border:1px solid #2a2f38; border-radius:6px;
+        padding:10px; overflow-x:auto; white-space:pre-wrap; margin:8px 0; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:8px 0; }
+  .ok { color:#5fd98a; } .bad { color:#ff7b72; } .warn { color:#e3b341; }
+  code { color:#e3b341; }
+</style>
+</head>
+<body>
+
+<h1>runt audio spike — fundsp in an AudioWorklet</h1>
+<p class="sub">
+  Path A = synth runs inside the worklet, params over <code>postMessage</code>, no SharedArrayBuffer.<br>
+  Path B = worker synth writes a SAB ring, worklet drains it. Needs cross-origin isolation.
+</p>
+
+<h2>environment</h2>
+<pre id="env">…</pre>
+<div class="row">
+  <a href="?"><button>reload without COI shim (GitHub&nbsp;Pages reality)</button></a>
+  <a href="?coi=1"><button>reload with coi-serviceworker</button></a>
+</div>
+
+<h2>path A — no SharedArrayBuffer</h2>
+<div class="row">
+  <button id="startA" class="primary">start audio (path A)</button>
+  <button id="stopA" disabled>stop</button>
+</div>
+<label><span>cutoff</span><input id="cutoff" type="range" min="80" max="8000" value="700" step="1"><span id="cutoffV">700 Hz</span></label>
+<label><span>drone pitch</span><input id="drone" type="range" min="27" max="220" value="55" step="0.5"><span id="droneV">55 Hz</span></label>
+<label><span>pluck pitch</span><input id="pluckHz" type="range" min="110" max="1760" value="440" step="1"><span id="pluckHzV">440 Hz</span></label>
+<div class="row">
+  <button id="trigger" disabled>trigger pluck</button>
+  <button id="latency" disabled>measure latency (100 trials)</button>
+  <button id="bench" disabled>bench CPU / quantum</button>
+  <button id="hash" disabled>determinism hash</button>
+</div>
+<pre id="statA">not started</pre>
+<pre id="resultsA"></pre>
+
+<h2>path B — SharedArrayBuffer ring</h2>
+<div class="row">
+  <button id="startB">start audio (path B)</button>
+  <button id="stopB" disabled>stop</button>
+  <button id="latencyB" disabled>measure latency (100 trials)</button>
+</div>
+<pre id="statB">not started</pre>
+<pre id="resultsB"></pre>
+
+<script>
+  // The COI shim must run before anything else and reloads the page once on
+  // first visit. Gated on ?coi=1 so path A can be measured in the *real*
+  // GitHub Pages condition (no isolation) in the same build.
+  if (new URLSearchParams(location.search).get('coi') === '1') {
+    document.write('<script src="coi-serviceworker.js"><\/script>');
+  }
+</script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
