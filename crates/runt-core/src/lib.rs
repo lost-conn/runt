@@ -21,6 +21,7 @@ pub mod engine;
 pub mod gen;
 pub mod input;
 pub mod material;
+pub mod physics;
 pub mod registry;
 pub mod scene;
 pub mod sim;
@@ -36,6 +37,10 @@ pub use engine::Engine;
 pub use gen::{GeneratorSpec, Shading};
 pub use input::{Input, InputEvent, Key};
 pub use material::{Material, MaterialVariant};
+pub use physics::{
+    AabbCollider, Ball, BallController, Grounded, OverlapEvent, RollSpin, SphereCollider, Trigger,
+    Velocity,
+};
 pub use registry::{GpuMesh, MeshHandle, MeshLibrary, MeshRegistry};
 pub use runt_mesh::{HeightField, MeshData as Mesh, Quality, TerrainParams};
 pub use scene::{load_scene, save_scene, SceneDesc, SceneError};

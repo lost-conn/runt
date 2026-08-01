@@ -57,6 +57,9 @@ use crate::ecs::{
 };
 use crate::gen::GeneratorSpec;
 use crate::material::{Material, MaterialVariant};
+use crate::physics::{
+    self, AabbCollider, Ball, BallController, Grounded, RollSpin, SphereCollider, Trigger, Velocity,
+};
 use crate::registry::{MeshHandle, MeshLibrary};
 
 /// The demo scene, embedded at build time (DESIGN §12 step 4).
@@ -142,9 +145,109 @@ pub struct EntityDesc {
     pub spin: Option<SpinDesc>,
     /// Give it an [`Interpolated`] so the renderer blends its pose between
     /// ticks. Only entities that actually move need it (DESIGN §4); a static
-    /// prop with one is just a wasted component. Implied by `spin`.
+    /// prop with one is just a wasted component. Implied by `spin` and by
+    /// `ball`.
     #[serde(default)]
     pub interpolated: bool,
+
+    // -- physics (DESIGN §9) ------------------------------------------------
+    /// Make it a rolling ball. Implies [`Velocity`], [`Grounded`], an
+    /// [`Interpolated`], and — unless `sphere_collider` says otherwise — a
+    /// [`SphereCollider`] of the ball's own radius.
+    #[serde(default)]
+    pub ball: Option<BallDesc>,
+    /// Starting velocity, m/s. Implies a [`Velocity`] even without `ball`.
+    #[serde(default)]
+    pub velocity: Option<Vec3>,
+    /// Sphere overlap shape, radius in world units.
+    #[serde(default)]
+    pub sphere_collider: Option<f32>,
+    /// Box overlap shape, half-extents in world units, world axes.
+    #[serde(default)]
+    pub aabb_collider: Option<Vec3>,
+    /// Overlapping this collider reports an event but pushes nothing out.
+    #[serde(default)]
+    pub trigger: bool,
+    /// Drive this ball from keyboard input. Exactly one per scene in v1.
+    #[serde(default)]
+    pub ball_controller: Option<BallControllerDesc>,
+}
+
+/// A [`Ball`]'s parameters, every one of them optional so a scene can say
+/// `ball: Some(())` and get the tuned defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BallDesc {
+    #[serde(default = "ball_radius")]
+    pub radius: f32,
+    #[serde(default = "ball_gravity")]
+    pub gravity: f32,
+    /// Tangential decay **rate** while grounded, 1/s — not a per-tick fraction.
+    #[serde(default = "ball_rolling_friction")]
+    pub rolling_friction: f32,
+    /// Whole-velocity decay **rate**, 1/s.
+    #[serde(default = "ball_air_damping")]
+    pub air_damping: f32,
+    #[serde(default = "ball_restitution")]
+    pub restitution: f32,
+    #[serde(default = "ball_max_speed")]
+    pub max_speed: f32,
+    /// Roll the mesh to match the motion. Cosmetic, and on by default because a
+    /// sliding sphere reads as broken.
+    #[serde(default = "yes")]
+    pub roll_spin: bool,
+}
+
+impl Default for BallDesc {
+    fn default() -> BallDesc {
+        BallDesc::from(Ball::default())
+    }
+}
+
+impl From<Ball> for BallDesc {
+    fn from(b: Ball) -> BallDesc {
+        BallDesc {
+            radius: b.radius,
+            gravity: b.gravity,
+            rolling_friction: b.rolling_friction,
+            air_damping: b.air_damping,
+            restitution: b.restitution,
+            max_speed: b.max_speed,
+            roll_spin: true,
+        }
+    }
+}
+
+impl BallDesc {
+    pub fn to_ball(self) -> Ball {
+        Ball {
+            radius: self.radius,
+            gravity: self.gravity,
+            rolling_friction: self.rolling_friction,
+            air_damping: self.air_damping,
+            restitution: self.restitution,
+            max_speed: self.max_speed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BallControllerDesc {
+    #[serde(default = "ball_accel")]
+    pub accel: f32,
+}
+
+impl Default for BallControllerDesc {
+    fn default() -> BallControllerDesc {
+        BallControllerDesc {
+            accel: physics::BALL_ACCEL,
+        }
+    }
+}
+
+impl BallControllerDesc {
+    pub fn to_controller(self) -> BallController {
+        BallController { accel: self.accel }
+    }
 }
 
 /// TRS placement. Every field is optional and defaults to identity.
@@ -395,6 +498,27 @@ fn near() -> f32 {
 fn far() -> f32 {
     100.0
 }
+fn ball_radius() -> f32 {
+    physics::BALL_RADIUS
+}
+fn ball_gravity() -> f32 {
+    physics::BALL_GRAVITY
+}
+fn ball_rolling_friction() -> f32 {
+    physics::BALL_ROLLING_FRICTION
+}
+fn ball_air_damping() -> f32 {
+    physics::BALL_AIR_DAMPING
+}
+fn ball_restitution() -> f32 {
+    physics::BALL_RESTITUTION
+}
+fn ball_max_speed() -> f32 {
+    physics::BALL_MAX_SPEED
+}
+fn ball_accel() -> f32 {
+    physics::BALL_ACCEL
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -509,6 +633,8 @@ pub fn spawn_scene(world: &mut World, desc: SceneDesc) -> Result<SceneStats, Sce
     world.init_resource::<MeshLibrary>();
     world.init_resource::<GenCache>();
     world.init_resource::<QualityTier>();
+    // A scene may spawn colliders, and the overlap pass writes messages.
+    physics::register_messages(world);
     let tier = *world.resource::<QualityTier>();
 
     // Validate before mutating anything: an entity naming a missing generator
@@ -583,9 +709,49 @@ pub fn spawn_scene(world: &mut World, desc: SceneDesc) -> Result<SceneStats, Sce
             });
         }
         // A spinner without `Interpolated` would judder; the file does not get
-        // to make that mistake.
-        if placement.interpolated || placement.spin.is_some() {
+        // to make that mistake. Neither does a ball, which moves by definition.
+        if placement.interpolated || placement.spin.is_some() || placement.ball.is_some() {
             entity.insert(Interpolated::from(&transform));
+        }
+
+        // --- physics (DESIGN §9) ------------------------------------------
+        //
+        // The dependencies between these components are the loader's problem,
+        // not the scene author's: a `Ball` with no `Velocity` would simply be
+        // skipped by the integrator, which is a silent failure, so the loader
+        // supplies every piece the systems require.
+        if let Some(ball) = placement.ball {
+            entity.insert((ball.to_ball(), Grounded::default()));
+            if ball.roll_spin {
+                entity.insert(RollSpin);
+            }
+            // The overlap pass tests the ball's *collider*, so give it one
+            // matching its physics radius unless the file overrides it.
+            if placement.sphere_collider.is_none() {
+                entity.insert(SphereCollider {
+                    radius: ball.radius,
+                });
+            }
+        }
+        if placement.ball.is_some() || placement.velocity.is_some() {
+            entity.insert(Velocity(placement.velocity.unwrap_or(Vec3::ZERO)));
+        }
+        if let Some(radius) = placement.sphere_collider {
+            entity.insert(SphereCollider { radius });
+        }
+        if let Some(half_extents) = placement.aabb_collider {
+            debug_assert!(
+                transform.rotation == Quat::IDENTITY,
+                "AABB collider entities must be translation-only; \
+                 a rotated box is not an axis-aligned box"
+            );
+            entity.insert(AabbCollider { half_extents });
+        }
+        if placement.trigger {
+            entity.insert(Trigger);
+        }
+        if let Some(controller) = placement.ball_controller {
+            entity.insert(controller.to_controller());
         }
 
         // Terrain carries its analytic field so physics can sample it without
@@ -744,6 +910,17 @@ pub fn scene_desc(world: &World) -> Result<SceneDesc, SceneError> {
         // hand-typed `Euler((90, 0, 0))` into an equal-but-unreadable quaternion.
         if !transform_eq(*live, placement.transform.to_transform()) {
             placement.transform = TransformDesc::from_transform(live);
+        }
+
+        // Velocity is authored state that the sim rewrites, so it is refreshed
+        // on the same terms as the transform: written back only once it differs
+        // from what the file said, so an authored `None` survives a save of a
+        // ball that has not moved yet.
+        if let Some(live) = world.get::<Velocity>(entity) {
+            let authored = placement.velocity.unwrap_or(Vec3::ZERO);
+            if !live.0.abs_diff_eq(authored, 1e-6) {
+                placement.velocity = Some(live.0);
+            }
         }
     }
 

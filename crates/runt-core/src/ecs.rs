@@ -425,13 +425,37 @@ pub fn post_sim_schedule() -> Schedule {
     s
 }
 
+/// The tick, in order (DESIGN §3: explicitly chained, never ambiguous).
+///
+/// ```text
+/// update_overlap_messages   advance the OverlapEvent double buffer (§9)
+/// spin                      demo-only constant rotation
+/// integrate_balls           input + gravity + terrain contact (§9)
+/// resolve_overlaps          discrete shapes → events + push-out (§9)
+/// roll_spin                 cosmetic ball rotation, reads velocity only (§9)
+/// follow_camera             cameras chase where things ended up
+/// propagate_transforms      local → world
+/// advance_tick_count        the tick is now complete
+/// ```
+///
+/// Why that order: the message swap goes first so an event written this tick
+/// survives into the next one intact (see [`OverlapEvent`](crate::OverlapEvent));
+/// the integrator produces a position before the overlap pass corrects it;
+/// `roll_spin` reads the *final* velocity; cameras follow *after* the things they
+/// follow have moved, so a follow is never a tick behind its target.
+///
+/// Every physics system is a no-op on a world with no `Ball` and no collider —
+/// `assets/demo.ron` has neither, and `tests/physics.rs` pins its tick output to
+/// the value it had before any of this existed.
 pub fn fixed_sim_schedule() -> Schedule {
     let mut s = deterministic_schedule(FixedSim);
-    // Cameras follow *after* the things they follow have moved, so a follow is
-    // never a tick behind its target.
     s.add_systems(
         (
+            crate::physics::update_overlap_messages,
             spin,
+            crate::physics::integrate_balls,
+            crate::physics::resolve_overlaps,
+            crate::physics::roll_spin,
             crate::camera::follow_camera,
             propagate_transforms,
             advance_tick_count,

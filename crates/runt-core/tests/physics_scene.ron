@@ -1,0 +1,96 @@
+// A physics scene, in the same save-as-params RON everything else uses
+// (DESIGN §6, §9). `assets/demo.ron` stays a *rendering* demo; this file is
+// where the step-5 components are exercised by `tests/physics.rs`.
+//
+// Nothing here is baked. The ground is an analytic height field: the mesh below
+// is a tessellation of h(x, z) and the ball rolls on h(x, z) itself, so the
+// trajectory is the same at every quality tier.
+(
+    generators: [
+        (
+            name: "ground",
+            spec: Terrain((
+                seed: 5,
+                size: (60.0, 60.0),
+                // Dead flat, on purpose: a test that wants a slope makes its own
+                // field, and a test that wants "does it settle" wants no noise
+                // in the answer.
+                amplitude: 0.0,
+                octaves: 4,
+                frequency: 0.05,
+                lacunarity: 2.0,
+                gain: 0.5,
+                base_segments: 32,
+                color: Some((0.20, 0.24, 0.20)),
+            )),
+        ),
+        (
+            name: "marble",
+            spec: UvSphere(
+                radius: 0.5,
+                rings: 16,
+                sectors: 24,
+                shading: Smooth(180.0),
+                color: Some((0.90, 0.35, 0.35)),
+            ),
+        ),
+        (
+            name: "gem",
+            spec: Torus(
+                major_radius: 0.45,
+                minor_radius: 0.15,
+                major_segments: 24,
+                minor_segments: 12,
+                color: Some((0.55, 0.85, 0.55)),
+            ),
+        ),
+        (
+            name: "block",
+            spec: Cube(size: 1.0, color: Some((0.35, 0.55, 0.95))),
+        ),
+    ],
+
+    entities: [
+        (
+            name: Some("ground"),
+            generator: "ground",
+        ),
+        // The player ball. Every physics parameter it does not name comes from
+        // the tuned defaults in `physics.rs`, and the loader supplies the
+        // components the systems require: Velocity, Grounded, RollSpin, an
+        // Interpolated, and a SphereCollider matching the physics radius.
+        (
+            name: Some("player"),
+            generator: "marble",
+            transform: (translation: (0.0, 4.0, 0.0)),
+            ball: Some((radius: 0.5)),
+            ball_controller: Some((accel: 22.0)),
+        ),
+        // A pickup: reports the overlap, resolves nothing.
+        (
+            name: Some("pickup"),
+            generator: "gem",
+            transform: (translation: (3.0, 0.5, 0.0)),
+            sphere_collider: Some(0.6),
+            trigger: true,
+        ),
+        // A solid obstacle. Translation only — a rotated box is not an
+        // axis-aligned box, and the loader asserts it in debug builds.
+        (
+            name: Some("wall"),
+            generator: "block",
+            transform: (translation: (-3.0, 0.5, 0.0)),
+            aabb_collider: Some((0.5, 0.5, 2.0)),
+        ),
+    ],
+
+    camera: (
+        eye: (0.0, 6.0, 10.0),
+        target: (0.0, 0.0, 0.0),
+        follow: Some((
+            entity: "player",
+            offset: (0.0, 6.0, 10.0),
+            stiffness: 6.0,
+        )),
+    ),
+)
