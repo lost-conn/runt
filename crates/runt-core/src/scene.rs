@@ -78,6 +78,7 @@ pub const DEMO_EYE: Vec3 = Vec3::new(0.0, 2.4, 6.5);
 
 /// A whole scene, as it appears in a `.ron` file.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct SceneDesc {
     /// Generator invocations, each under a name entities refer to.
     #[serde(default)]
@@ -93,6 +94,7 @@ pub struct SceneDesc {
 
 /// One named generator invocation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct GeneratorEntry {
     /// What entities call it. Scene-local; unrelated to
     /// [`GeneratorSpec::kind`].
@@ -105,6 +107,7 @@ pub struct GeneratorEntry {
 /// How a generator's tessellation responds to the device tier (DESIGN §6:
 /// "per-generator overrides allowed").
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub enum QualityPolicy {
     /// Use the session's [`QualityTier`] as-is. The normal case.
     #[default]
@@ -129,6 +132,7 @@ impl QualityPolicy {
 
 /// One entity placement.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct EntityDesc {
     /// Optional handle so other parts of the file (the follow camera) can point
     /// at this entity.
@@ -158,12 +162,14 @@ pub struct EntityDesc {
     pub ball: Option<BallDesc>,
     /// Starting velocity, m/s. Implies a [`Velocity`] even without `ball`.
     #[serde(default)]
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::OptVec3Def))]
     pub velocity: Option<Vec3>,
     /// Sphere overlap shape, radius in world units.
     #[serde(default)]
     pub sphere_collider: Option<f32>,
     /// Box overlap shape, half-extents in world units, world axes.
     #[serde(default)]
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::OptVec3Def))]
     pub aabb_collider: Option<Vec3>,
     /// Overlapping this collider reports an event but pushes nothing out.
     #[serde(default)]
@@ -176,6 +182,7 @@ pub struct EntityDesc {
 /// A [`Ball`]'s parameters, every one of them optional so a scene can say
 /// `ball: Some(())` and get the tuned defaults.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct BallDesc {
     #[serde(default = "ball_radius")]
     pub radius: f32,
@@ -231,6 +238,7 @@ impl BallDesc {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct BallControllerDesc {
     #[serde(default = "ball_accel")]
     pub accel: f32,
@@ -252,12 +260,15 @@ impl BallControllerDesc {
 
 /// TRS placement. Every field is optional and defaults to identity.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct TransformDesc {
     #[serde(default)]
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def))]
     pub translation: Vec3,
     #[serde(default)]
     pub rotation: RotationDesc,
     #[serde(default = "vec3_one")]
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def))]
     pub scale: Vec3,
 }
 
@@ -280,13 +291,14 @@ impl Default for TransformDesc {
 /// triples) and would silently rewrite a hand-authored file into a different
 /// but equal rotation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub enum RotationDesc {
     #[default]
     Identity,
     /// Degrees, `EulerRot::XYZ`.
-    Euler(Vec3),
+    Euler(#[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def))] Vec3),
     /// Raw `(x, y, z, w)`. Normalized on load.
-    Quat(Vec4),
+    Quat(#[cfg_attr(feature = "reflect", reflect(ignore))] Vec4),
 }
 
 impl RotationDesc {
@@ -337,11 +349,14 @@ impl TransformDesc {
 /// A material, with the variant bitflags spelled out as booleans so a scene file
 /// never contains a magic number.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct MaterialDesc {
     #[serde(default = "vec4_one")]
+    #[cfg_attr(feature = "reflect", reflect(ignore))]
     pub base_color: Vec4,
     /// Reserved uniform slot (ramp threshold/softness as §5's variants land).
     #[serde(default)]
+    #[cfg_attr(feature = "reflect", reflect(ignore))]
     pub params: Vec4,
     #[serde(default = "yes")]
     pub vertex_color: bool,
@@ -391,19 +406,24 @@ impl MaterialDesc {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct SpinDesc {
     #[serde(default = "vec3_y")]
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def))]
     pub axis: Vec3,
     pub rad_per_sec: f32,
 }
 
 /// The scene's one camera (DESIGN §5).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct CameraDesc {
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def))]
     pub eye: Vec3,
     /// What it initially looks at. With a `follow`, this is only the starting
     /// aim; the target's position takes over from the first tick.
     #[serde(default)]
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def))]
     pub target: Vec3,
     #[serde(default = "sixty")]
     pub fov_y_degrees: f32,
@@ -429,10 +449,12 @@ impl Default for CameraDesc {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct FollowDesc {
     /// The `name` of an entity in this scene.
     pub entity: String,
     /// World-space offset from the target to the camera's rest position.
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def))]
     pub offset: Vec3,
     /// Approach rate, 1/seconds. ~2 is a lazy drift, ~12 is nearly rigid.
     pub stiffness: f32,
@@ -440,11 +462,16 @@ pub struct FollowDesc {
 
 /// The light rig (DESIGN §5). Mirrors [`Lighting`] field for field.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct LightingDesc {
     /// Direction *towards* the key light.
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def))]
     pub key_dir: Vec3,
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def))]
     pub key_color: Vec3,
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def))]
     pub sky_color: Vec3,
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def))]
     pub ground_color: Vec3,
 }
 

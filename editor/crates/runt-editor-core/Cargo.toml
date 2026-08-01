@@ -1,0 +1,17 @@
+[package]
+name = "runt-editor-core"
+version.workspace = true
+edition.workspace = true
+description = "Editor logic with no GUI dependency: the CPU frame bridge, the engine thread, the command protocol and the reflection widget mapper."
+
+[dependencies]
+runt-core.workspace = true
+runt-mesh.workspace = true
+wgpu.workspace = true
+glam.workspace = true
+bevy_reflect.workspace = true
+log.workspace = true
+pollster.workspace = true
+bevy_ecs.workspace = true
+ron.workspace = true
+

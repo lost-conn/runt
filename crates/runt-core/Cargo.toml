@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 description = "runt engine core: windowless renderer that draws into a caller-provided TextureView."
 
+[features]
+default = []
+# Editor-only reflection (DESIGN §3, §10). Off by default so the wasm player
+# never pays for it — `cargo tree --target wasm32-unknown-unknown -p runt-app`
+# must stay free of `bevy_reflect`.
+reflect = ["dep:bevy_reflect"]
+
 [dependencies]
 runt-mesh = { workspace = true, features = ["serde"] }
 bevy_ecs.workspace = true
@@ -14,6 +21,13 @@ log.workspace = true
 serde.workspace = true
 ron.workspace = true
 postcard.workspace = true
+# Same 0.19 release train as `bevy_ecs`. Deliberately *without* its `glam`
+# feature: that feature targets glam 0.32 and runt is on 0.33 — a different
+# semver major, so its `Reflect` impls would not apply to our vectors anyway.
+# `src/reflect.rs` supplies remote definitions for the glam types instead.
+bevy_reflect = { version = "0.19", optional = true, default-features = false, features = [
+    "std",
+] }
 
 [dev-dependencies]
 pollster.workspace = true

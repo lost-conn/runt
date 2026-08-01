@@ -1,4 +1,7 @@
 /target
+# The editor is its own cargo workspace (see editor/Cargo.toml), so it has its
+# own target directory and its own lockfile.
+/editor/target
 /dist
 demo/*/dist
 /.playwright-mcp

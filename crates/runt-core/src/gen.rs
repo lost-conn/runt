@@ -24,14 +24,17 @@
 //! Renaming one is a breaking scene-file change; adding a `#[serde(default)]`
 //! field is not.
 //!
-//! ## Known deviation from §6
+//! ## Reflection (§6's `Params: Reflect + Serialize + Hash`)
 //!
-//! §6 specifies `Params: Reflect + Serialize + Hash`. `bevy_reflect` is
-//! **deliberately deferred to phase 2** (the editor is the only consumer, and it
-//! is dead weight in the wasm bundle until then). `Serialize` plus the
-//! serialized-bytes hash below covers everything determinism and caching need
-//! today; the editor's reflection-driven param panels are the only thing waiting
-//! on it.
+//! `Reflect` arrives with the editor, behind the **`reflect` feature**, which is
+//! off by default: the editor is its only consumer and `bevy_reflect` is dead
+//! weight in the wasm player's bundle. `Serialize` plus the serialized-bytes
+//! hash below covers everything determinism and caching need with the feature
+//! off, so nothing in the engine may depend on reflection being available.
+//!
+//! Because glam is a version behind in `bevy_reflect`, the vector params carry
+//! `#[reflect(remote = …)]` pointers into [`crate::reflect`]; see that module
+//! for why. The `#[reflect(@FieldRange…)]` attributes are editor slider bounds.
 
 use glam::{Vec2, Vec3};
 use runt_mesh::{cone, cube, cylinder, plane, terrain, torus, uv_sphere, MeshData, Quality};
@@ -45,6 +48,7 @@ pub use runt_mesh::{HeightField, TerrainParams};
 /// sphere is a different *mesh* faceted vs. smoothed, but it is the same shape
 /// request with a different finish.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub enum Shading {
     /// Keep whatever normals the primitive generated (smooth for the curved
     /// ones, per-face for the box).
@@ -61,64 +65,116 @@ pub enum Shading {
 /// Variants map onto `runt-mesh` primitives and ops. New generators are appended
 /// at the end — see [`param_key`](GeneratorSpec::param_key) for why order is
 /// (mildly) load-bearing.
+/// ## Editor ranges
+///
+/// The `#[reflect(@FieldRange…)]` attributes below are what the editor's
+/// reflection-driven panels use for slider bounds (see
+/// [`crate::reflect`]). They are **advisory** — every generator still has to
+/// behave outside them, because a scene file can say anything — but they are
+/// declared here rather than in a table in the editor so that adding a param
+/// cannot leave its bound behind in another crate.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub enum GeneratorSpec {
     /// Flat XZ grid, normal +Y.
     Plane {
+        #[cfg_attr(
+            feature = "reflect",
+            reflect(remote = crate::reflect::Vec2Def, @crate::reflect::FieldRange::new(0.1, 128.0))
+        )]
         size: Vec2,
         /// Quads per side at `Quality::FULL`.
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(1.0, 256.0)))]
         subdivisions: u32,
         #[serde(default)]
         shading: Shading,
         #[serde(default)]
+        #[cfg_attr(
+            feature = "reflect",
+            reflect(remote = crate::reflect::OptVec3Def, @crate::reflect::FieldRange::new(0.0, 1.0))
+        )]
         color: Option<Vec3>,
     },
     /// Axis-aligned box of `size` on every edge.
     Cube {
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.01, 20.0)))]
         size: f32,
         #[serde(default)]
         shading: Shading,
         #[serde(default)]
+        #[cfg_attr(
+            feature = "reflect",
+            reflect(remote = crate::reflect::OptVec3Def, @crate::reflect::FieldRange::new(0.0, 1.0))
+        )]
         color: Option<Vec3>,
     },
     UvSphere {
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.01, 20.0)))]
         radius: f32,
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(2.0, 128.0)))]
         rings: u32,
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(3.0, 256.0)))]
         sectors: u32,
         #[serde(default)]
         shading: Shading,
         #[serde(default)]
+        #[cfg_attr(
+            feature = "reflect",
+            reflect(remote = crate::reflect::OptVec3Def, @crate::reflect::FieldRange::new(0.0, 1.0))
+        )]
         color: Option<Vec3>,
     },
     /// Y-axis cylinder, centered, flat caps.
     Cylinder {
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.01, 20.0)))]
         radius: f32,
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.01, 50.0)))]
         height: f32,
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(3.0, 256.0)))]
         segments: u32,
         #[serde(default)]
         shading: Shading,
         #[serde(default)]
+        #[cfg_attr(
+            feature = "reflect",
+            reflect(remote = crate::reflect::OptVec3Def, @crate::reflect::FieldRange::new(0.0, 1.0))
+        )]
         color: Option<Vec3>,
     },
     /// Y-axis cone, base at `-height/2`, apex at `+height/2`.
     Cone {
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.01, 20.0)))]
         radius: f32,
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.01, 50.0)))]
         height: f32,
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(3.0, 256.0)))]
         segments: u32,
         #[serde(default)]
         shading: Shading,
         #[serde(default)]
+        #[cfg_attr(
+            feature = "reflect",
+            reflect(remote = crate::reflect::OptVec3Def, @crate::reflect::FieldRange::new(0.0, 1.0))
+        )]
         color: Option<Vec3>,
     },
     /// Torus in the XZ plane.
     Torus {
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.01, 20.0)))]
         major_radius: f32,
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.001, 10.0)))]
         minor_radius: f32,
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(3.0, 256.0)))]
         major_segments: u32,
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(3.0, 128.0)))]
         minor_segments: u32,
         #[serde(default)]
         shading: Shading,
         #[serde(default)]
+        #[cfg_attr(
+            feature = "reflect",
+            reflect(remote = crate::reflect::OptVec3Def, @crate::reflect::FieldRange::new(0.0, 1.0))
+        )]
         color: Option<Vec3>,
     },
     /// A box stretched to `dims`, twisted about Y, then tapered along Y.
@@ -127,22 +183,113 @@ pub enum GeneratorSpec {
     /// and legitimately changes the content hash — unlike the `scale` a
     /// placement would use.
     TwistedBox {
+        #[cfg_attr(
+            feature = "reflect",
+            reflect(remote = crate::reflect::Vec3Def, @crate::reflect::FieldRange::new(0.01, 20.0))
+        )]
         dims: Vec3,
         /// Radians of twist per world unit along Y.
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(-6.2832, 6.2832)))]
         twist: f32,
         /// Cross-section scale at the top; `1.0` is no taper.
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.0, 4.0)))]
         taper: f32,
         #[serde(default)]
         shading: Shading,
         #[serde(default)]
+        #[cfg_attr(
+            feature = "reflect",
+            reflect(remote = crate::reflect::OptVec3Def, @crate::reflect::FieldRange::new(0.0, 1.0))
+        )]
         color: Option<Vec3>,
     },
     /// Heightfield terrain — a *view* of the analytic surface physics samples
     /// (DESIGN §9). See [`TerrainParams`].
-    Terrain(TerrainParams),
+    Terrain(
+        #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::TerrainParamsDef))]
+        TerrainParams,
+    ),
 }
 
 impl GeneratorSpec {
+    /// Every generator's [`kind`](GeneratorSpec::kind), in declaration order.
+    ///
+    /// The editor's variant dropdown is built from this. Kept next to the enum
+    /// (rather than derived by reflection) so it exists with the `reflect`
+    /// feature off and so the compiler's exhaustiveness check on
+    /// [`default_of_kind`](GeneratorSpec::default_of_kind) is the thing that
+    /// keeps it honest.
+    pub const KINDS: &'static [&'static str] = &[
+        "Plane",
+        "Cube",
+        "UvSphere",
+        "Cylinder",
+        "Cone",
+        "Torus",
+        "TwistedBox",
+        "Terrain",
+    ];
+
+    /// A sensible starting spec for a named variant — what "switch this
+    /// generator to a Torus" should produce.
+    ///
+    /// Not `Default`: there is no meaningful default *generator*, only a default
+    /// per shape. The numbers are the smallest set that renders as a recognizable
+    /// version of the thing, so a switch never lands on a degenerate mesh.
+    pub fn default_of_kind(kind: &str) -> Option<GeneratorSpec> {
+        Some(match kind {
+            "Plane" => GeneratorSpec::Plane {
+                size: Vec2::splat(4.0),
+                subdivisions: 8,
+                shading: Shading::default(),
+                color: None,
+            },
+            "Cube" => GeneratorSpec::Cube {
+                size: 1.0,
+                shading: Shading::default(),
+                color: None,
+            },
+            "UvSphere" => GeneratorSpec::UvSphere {
+                radius: 1.0,
+                rings: 16,
+                sectors: 24,
+                shading: Shading::default(),
+                color: None,
+            },
+            "Cylinder" => GeneratorSpec::Cylinder {
+                radius: 0.5,
+                height: 2.0,
+                segments: 24,
+                shading: Shading::default(),
+                color: None,
+            },
+            "Cone" => GeneratorSpec::Cone {
+                radius: 0.5,
+                height: 1.5,
+                segments: 20,
+                shading: Shading::default(),
+                color: None,
+            },
+            "Torus" => GeneratorSpec::Torus {
+                major_radius: 1.0,
+                minor_radius: 0.3,
+                major_segments: 32,
+                minor_segments: 16,
+                shading: Shading::default(),
+                color: None,
+            },
+            "TwistedBox" => GeneratorSpec::TwistedBox {
+                dims: Vec3::new(1.0, 1.6, 1.0),
+                twist: 0.9,
+                taper: 0.6,
+                shading: Shading::Flat,
+                color: None,
+            },
+            "Terrain" => GeneratorSpec::Terrain(TerrainParams::default()),
+            _ => return None,
+        })
+    }
+
     /// The variant's stable name. Used in logs and mixed into
     /// [`param_key`](GeneratorSpec::param_key); it is not the scene file's
     /// generator *entry* name (that one is chosen per scene).

@@ -106,6 +106,7 @@ impl StatusLine {
 /// The device-tier probe of §11 will write this at startup; until then it is
 /// 1.0 unless a caller says otherwise.
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct QualityTier(pub f32);
 
 impl Default for QualityTier {

@@ -1,0 +1,78 @@
+# The editor is its own cargo workspace, deliberately NOT a member of runt's
+# (DESIGN §10).
+#
+# rinch pins a forked wgpu 27 and a forked winit 0.31-beta through
+# `[patch.crates-io]`, and cargo only honours a `[patch]` table at a *workspace
+# root*. Making `editor/` a member of the runt workspace would mean putting
+# rinch's patches into runt's root manifest — which would drag the wasm player
+# and every engine test into rinch's forks for no reason at all.
+#
+# So: two workspaces, two lockfiles, two target directories. The patches below
+# are copied verbatim from `~/projects/personal/rinch/Cargo.toml`; they must stay
+# byte-identical to it or cargo will build a second, incompatible copy of rinch's
+# whole dependency tree.
+#
+# The version split is the entire reason DESIGN §10 specifies a CPU bridge: this
+# graph contains **both** wgpu 27 (patched, rinch's, for the window) and wgpu 30
+# (from crates.io, runt-core's, for the engine). They are different semver
+# majors, so they coexist happily and cannot share a texture — hence RGBA8
+# pixels over a channel instead of a shared `TextureView`.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+default-members = ["crates/runt-editor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+runt-editor-core = { path = "crates/runt-editor-core" }
+
+# The engine, with the editor-only reflection feature turned on. This is the
+# only place in the repo that enables it.
+runt-core = { path = "../crates/runt-core", features = ["reflect"] }
+runt-mesh = { path = "../crates/runt-mesh" }
+
+rinch = { path = "../../../personal/rinch/crates/rinch", default-features = false, features = [
+    "desktop",
+    "gpu",
+    "components",
+    "theme",
+    # rinch's IPC debug server: `rinch-test screenshot --port <p>` against a
+    # running editor. Set RINCH_DEBUG=0 to turn it off.
+    "debug",
+    # rfd-backed open/save dialogs (rinch::dialogs).
+    "file-dialogs",
+] }
+
+wgpu = "30"
+glam = "0.33"
+bevy_reflect = { version = "0.19", default-features = false, features = ["std"] }
+log = "0.4"
+env_logger = "0.11"
+pollster = "1"
+bevy_ecs = { version = "0.19", default-features = false, features = ["std"] }
+ron = "0.12"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# ---------------------------------------------------------------------------
+# Copied verbatim from rinch's own Cargo.toml. Do not edit independently.
+# ---------------------------------------------------------------------------
+[patch.crates-io]
+wgpu = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+wgpu-core = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+wgpu-hal = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+wgpu-types = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+naga = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+winit = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-core = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-common = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-wayland = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-x11 = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+dpi = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }

@@ -2016,6 +2016,7 @@ name = "runt-core"
 version = "0.1.0"
 dependencies = [
  "bevy_ecs",
+ "bevy_reflect",
  "bytemuck",
  "glam 0.33.2",
  "log",

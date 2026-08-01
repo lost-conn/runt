@@ -1,0 +1,13 @@
+[package]
+name = "runt-editor"
+version.workspace = true
+edition.workspace = true
+description = "runt editor v1 — a native rinch app with a RenderSurface viewport (DESIGN §10)."
+
+[dependencies]
+runt-editor-core.workspace = true
+runt-core.workspace = true
+rinch.workspace = true
+glam.workspace = true
+log.workspace = true
+env_logger.workspace = true

@@ -22,6 +22,10 @@ pub mod gen;
 pub mod input;
 pub mod material;
 pub mod physics;
+/// Editor-facing reflection (DESIGN §3, §10). Off by default; the wasm player
+/// must never pull `bevy_reflect` in.
+#[cfg(feature = "reflect")]
+pub mod reflect;
 pub mod registry;
 pub mod scene;
 pub mod sim;
