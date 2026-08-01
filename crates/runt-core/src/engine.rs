@@ -6,7 +6,7 @@
 //! engine business.
 
 use crate::input::InputEvent;
-use crate::sim::Sim;
+use crate::sim::{Sim, SimConfig};
 use crate::Renderer;
 
 pub struct Engine {
@@ -54,6 +54,33 @@ impl Engine {
             renderer: Renderer::new(device, queue, target_format),
             warned_no_camera: false,
         }
+    }
+
+    /// Build with an explicit [`SimConfig`] — the quality tier, the cache store
+    /// and the scene a host actually wants (DESIGN §6).
+    pub fn from_config(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        target_format: wgpu::TextureFormat,
+        config: SimConfig,
+    ) -> Engine {
+        Engine {
+            sim: Sim::from_config(config),
+            renderer: Renderer::new(device, queue, target_format),
+            warned_no_camera: false,
+        }
+    }
+
+    /// As [`headless`](Engine::headless), with an explicit [`SimConfig`].
+    pub async fn headless_with_config(
+        target_format: wgpu::TextureFormat,
+        config: SimConfig,
+    ) -> Result<Engine, String> {
+        Ok(Engine {
+            sim: Sim::from_config(config),
+            renderer: Renderer::headless(target_format).await?,
+            warned_no_camera: false,
+        })
     }
 
     // -- host surface -------------------------------------------------------

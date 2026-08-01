@@ -1,0 +1,168 @@
+// runt demo scene — save-as-params (DESIGN §6).
+//
+// Two lists. `generators` says what to build; `entities` says where to put it.
+// Nothing here is baked: every mesh below is regenerated from these numbers on
+// load, resolved through the content cache, and keyed by the hash of what it
+// produced. Edit a number, run, see it.
+//
+// The `ball` generator is referenced by *two* entities. That is deliberate: the
+// second one differs only in transform and material, so both resolve to the same
+// content hash and the renderer uploads one pair of buffers for the pair. If you
+// want two visually different spheres, change the generator — placement is not
+// shape.
+(
+    generators: [
+        // The ground is an analytic height field (DESIGN §9), not a mesh with
+        // collision baked into it. What you see is a tessellation of h(x, z);
+        // physics samples the same h directly, so the surface the ball rolls on
+        // is the surface you are looking at at every quality tier.
+        (
+            name: "ground",
+            spec: Terrain((
+                seed: 20260731,
+                size: (40.0, 40.0),
+                amplitude: 1.2,
+                octaves: 4,
+                frequency: 0.055,
+                lacunarity: 2.0,
+                gain: 0.5,
+                base_segments: 64,
+                color: Some((0.17, 0.21, 0.18)),
+            )),
+        ),
+        (
+            name: "ball",
+            spec: UvSphere(
+                radius: 0.9,
+                rings: 24,
+                sectors: 32,
+                shading: Smooth(180.0),
+                color: Some((0.90, 0.35, 0.35)),
+            ),
+        ),
+        (
+            name: "post",
+            spec: Cylinder(
+                radius: 0.35,
+                height: 1.8,
+                segments: 24,
+                color: Some((0.35, 0.55, 0.95)),
+            ),
+        ),
+        (
+            name: "spike",
+            spec: Cone(
+                radius: 0.6,
+                height: 1.4,
+                segments: 20,
+                color: Some((0.95, 0.80, 0.30)),
+            ),
+        ),
+        (
+            name: "ring",
+            spec: Torus(
+                major_radius: 0.7,
+                minor_radius: 0.22,
+                major_segments: 32,
+                minor_segments: 16,
+                color: Some((0.55, 0.85, 0.55)),
+            ),
+        ),
+        // Stretch, twist and taper are *shape*: they change the geometry, so
+        // they belong in the generator and legitimately change the content hash.
+        // A placement `scale` would not.
+        (
+            name: "twisted_box",
+            spec: TwistedBox(
+                dims: (1.0, 1.6, 1.0),
+                twist: 0.9,
+                taper: 0.4,
+                shading: Flat,
+                color: Some((0.80, 0.45, 0.90)),
+            ),
+        ),
+    ],
+
+    entities: [
+        // Dropped just far enough that the props rest on the high ground rather
+        // than in it: with this seed the field peaks at ~+0.72 under their
+        // footprints, so -2.0 leaves every underside about 0.14 clear.
+        // `tests/scene.rs` asserts that, so a seed change fails loudly instead
+        // of quietly burying the spike.
+        // Translation only — a rotated height field is not a height field.
+        (
+            name: Some("ground"),
+            generator: "ground",
+            transform: (translation: (0.0, -2.0, 0.0)),
+        ),
+        (
+            name: Some("ball"),
+            generator: "ball",
+            transform: (translation: (-1.9, -0.3, 0.0)),
+        ),
+        (
+            name: Some("post"),
+            generator: "post",
+            transform: (translation: (0.0, -0.3, -1.6)),
+        ),
+        (
+            name: Some("spike"),
+            generator: "spike",
+            transform: (translation: (1.9, -0.5, 0.0)),
+        ),
+        (
+            name: Some("ring"),
+            generator: "ring",
+            // Degrees, applied X→Y→Z: stood upright, facing the camera.
+            transform: (
+                translation: (0.0, 0.4, 1.7),
+                rotation: Euler((90.0, 0.0, 0.0)),
+            ),
+        ),
+        // The dedup twin: same generator as "ball", half the size from the
+        // *transform*, and a flat material that ignores the mesh's vertex
+        // colors — which also means a second shader variant and a second
+        // pipeline. One mesh, two looks.
+        (
+            name: Some("ball_twin"),
+            generator: "ball",
+            transform: (
+                translation: (-2.0, 0.5, 1.9),
+                scale: (0.5, 0.5, 0.5),
+            ),
+            material: (
+                base_color: (0.35, 0.75, 0.95, 1.0),
+                vertex_color: false,
+            ),
+        ),
+        // The one moving piece. `Interpolated` is implied by `spin`.
+        (
+            name: Some("spinner"),
+            generator: "twisted_box",
+            transform: (translation: (0.0, 0.5, 0.0)),
+            spin: Some((axis: (0.0, 1.0, 0.0), rad_per_sec: 0.4)),
+        ),
+    ],
+
+    camera: (
+        eye: (0.0, 2.4, 6.5),
+        target: (0.0, 0.0, 0.0),
+        fov_y_degrees: 60.0,
+        z_near: 0.1,
+        z_far: 100.0,
+        // The spinner does not translate, so the follow reads as a soft settle
+        // over the first second and a rock-steady frame afterwards.
+        follow: Some((
+            entity: "spinner",
+            offset: (0.0, 1.9, 6.5),
+            stiffness: 2.0,
+        )),
+    ),
+
+    lighting: (
+        key_dir: (0.4, 1.0, 0.6),
+        key_color: (0.74, 0.72, 0.68),
+        sky_color: (0.30, 0.33, 0.40),
+        ground_color: (0.14, 0.13, 0.12),
+    ),
+)

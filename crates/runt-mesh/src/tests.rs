@@ -189,3 +189,237 @@ fn plane_faces_up() {
         assert!(face_n.y > 0.0, "plane winds up-facing");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Height field / terrain (DESIGN §6, §9)
+// ---------------------------------------------------------------------------
+
+fn demo_field() -> HeightField {
+    HeightField {
+        seed: 20260731,
+        amplitude: 1.2,
+        octaves: 4,
+        frequency: 0.055,
+        lacunarity: 2.0,
+        gain: 0.5,
+    }
+}
+
+fn demo_params() -> TerrainParams {
+    let f = demo_field();
+    TerrainParams {
+        seed: f.seed,
+        size: Vec2::splat(40.0),
+        amplitude: f.amplitude,
+        octaves: f.octaves,
+        frequency: f.frequency,
+        lacunarity: f.lacunarity,
+        gain: f.gain,
+        base_segments: 64,
+        color: Some(Vec3::new(0.17, 0.21, 0.18)),
+    }
+}
+
+/// A spread of sample points including negative coordinates (where a naive
+/// `as i32` lattice index silently folds) and exact lattice hits.
+fn sample_points() -> Vec<(f32, f32)> {
+    let mut out = Vec::new();
+    for i in -7..=7 {
+        for j in -7..=7 {
+            out.push((i as f32 * 2.7183, j as f32 * -3.1416));
+        }
+    }
+    out.extend([(0.0, 0.0), (1.0 / 0.055, 0.0), (-1.0 / 0.055, 2.0 / 0.055)]);
+    out
+}
+
+#[test]
+fn the_field_is_a_pure_function_of_its_params() {
+    let f = demo_field();
+    for (x, z) in sample_points() {
+        // Bit-exact, not approximately: `h` is what physics integrates against,
+        // and "almost the same height" is how a replay diverges.
+        assert_eq!(
+            f.height(x, z).to_bits(),
+            f.height(x, z).to_bits(),
+            "h({x}, {z}) must be reproducible"
+        );
+        assert_eq!(demo_field().height(x, z).to_bits(), f.height(x, z).to_bits());
+    }
+}
+
+#[test]
+fn a_different_seed_is_a_different_surface() {
+    let a = demo_field();
+    let b = HeightField { seed: a.seed + 1, ..a };
+    let differing = sample_points()
+        .into_iter()
+        .filter(|&(x, z)| (a.height(x, z) - b.height(x, z)).abs() > 1e-4)
+        .count();
+    assert!(
+        differing > 200,
+        "one seed apart should change nearly every sample, changed {differing}"
+    );
+}
+
+#[test]
+fn the_gradient_is_the_derivative_of_the_height() {
+    // The gradient is analytic (a closed form of the bilinear patch), so this
+    // is a genuine cross-check of two independent computations rather than a
+    // tautology — physics reads the gradient and the mesh reads the heights,
+    // and they have to describe one surface.
+    let f = demo_field();
+    let h = 1.0e-2_f32;
+    for (x, z) in sample_points() {
+        let g = f.gradient(x, z);
+        let fd_x = (f.height(x + h, z) - f.height(x - h, z)) / (2.0 * h);
+        let fd_z = (f.height(x, z + h) - f.height(x, z - h)) / (2.0 * h);
+        // Central differences are second-order accurate; the surface's own
+        // curvature sets the floor on how close they can get.
+        assert!(
+            (g.x - fd_x).abs() < 2.0e-3,
+            "d/dx at ({x}, {z}): analytic {} vs finite {fd_x}",
+            g.x
+        );
+        assert!(
+            (g.y - fd_z).abs() < 2.0e-3,
+            "d/dz at ({x}, {z}): analytic {} vs finite {fd_z}",
+            g.y
+        );
+    }
+}
+
+#[test]
+fn the_normal_agrees_with_the_gradient() {
+    let f = demo_field();
+    for (x, z) in sample_points() {
+        let n = f.normal(x, z);
+        assert!((n.length() - 1.0).abs() < 1e-5, "unit normal");
+        assert!(n.y > 0.0, "a height field never overhangs");
+        // Tangent along X is (1, h_x, 0); the normal must be perpendicular.
+        let g = f.gradient(x, z);
+        assert!(n.dot(Vec3::new(1.0, g.x, 0.0)).abs() < 1e-4);
+        assert!(n.dot(Vec3::new(0.0, g.y, 1.0)).abs() < 1e-4);
+    }
+}
+
+#[test]
+fn height_stays_inside_the_amplitude() {
+    let f = demo_field();
+    for (x, z) in sample_points() {
+        assert!(
+            f.height(x, z).abs() <= f.amplitude + 1e-4,
+            "octave weights are normalized, so amplitude is a real bound"
+        );
+    }
+}
+
+#[test]
+fn the_field_does_not_depend_on_tessellation() {
+    // DESIGN §9's load-bearing property: the mesh is a *view* of the field, so
+    // visual LOD cannot move the surface physics feels. Meshing at three
+    // qualities must place every shared vertex at the same height.
+    let params = demo_params();
+    let coarse = terrain(&params, Quality(0.25));
+    let fine = terrain(&params, Quality(1.0));
+    assert!(coarse.positions.len() < fine.positions.len(), "quality did something");
+
+    let field = params.field();
+    for m in [&coarse, &fine] {
+        for p in &m.positions {
+            assert_eq!(
+                p.y.to_bits(),
+                field.height(p.x, p.z).to_bits(),
+                "vertex {p:?} must sit exactly on h(x, z)"
+            );
+        }
+    }
+
+    // And the field itself, asked directly, ignores quality entirely — there is
+    // no quality argument to `height` at all, which is the design, not an
+    // accident of these params.
+    for (x, z) in sample_points() {
+        assert_eq!(
+            params.field().height(x, z).to_bits(),
+            demo_params().field().height(x, z).to_bits()
+        );
+    }
+}
+
+#[test]
+fn terrain_normals_come_from_the_field_not_the_facets() {
+    let params = TerrainParams { base_segments: 8, ..demo_params() };
+    let m = terrain(&params, Quality::FULL);
+    assert_well_formed(&m);
+    let field = params.field();
+    for (p, n) in m.positions.iter().zip(&m.normals) {
+        let want = field.normal(p.x, p.z);
+        assert!(
+            n.abs_diff_eq(want, 1e-5),
+            "normal at {p:?} is {n:?}, field says {want:?}"
+        );
+    }
+
+    // Face-averaged normals would be a *different* answer at this tessellation,
+    // which is the whole reason we do not use them: prove the two disagree so
+    // this test cannot pass vacuously.
+    let faceted = m.clone().flat_normals();
+    let drift = faceted
+        .normals
+        .iter()
+        .zip(&faceted.positions)
+        .map(|(n, p)| n.angle_between(field.normal(p.x, p.z)))
+        .fold(0.0f32, f32::max);
+    assert!(drift > 0.01, "flat normals should visibly differ, max drift {drift}");
+}
+
+#[test]
+fn terrain_is_a_well_formed_upward_grid() {
+    let params = TerrainParams { base_segments: 6, ..demo_params() };
+    let m = terrain(&params, Quality::FULL);
+    assert_well_formed(&m);
+
+    for t in m.indices.chunks_exact(3) {
+        let (a, b, c) = (
+            m.positions[t[0] as usize],
+            m.positions[t[1] as usize],
+            m.positions[t[2] as usize],
+        );
+        assert!((b - a).cross(c - a).y > 0.0, "terrain winds up-facing");
+    }
+
+    let (min, max) = m.bounds().expect("terrain has vertices");
+    assert!((min.x + 20.0).abs() < 1e-4 && (max.x - 20.0).abs() < 1e-4, "size honored on X");
+    assert!((min.z + 20.0).abs() < 1e-4 && (max.z - 20.0).abs() < 1e-4, "size honored on Z");
+    for uv in &m.uvs {
+        assert!((0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y));
+    }
+    for c in &m.colors {
+        assert_eq!(*c, Vec3::new(0.17, 0.21, 0.18));
+    }
+}
+
+#[test]
+fn terrain_quality_scales_segments_with_a_floor() {
+    let params = TerrainParams { base_segments: 64, ..demo_params() };
+    assert_eq!(params.segments(Quality::FULL), 64);
+    assert_eq!(params.segments(Quality(0.5)), 32);
+    // DESIGN §11: scale down, never fail. An absurd tier still meshes.
+    assert_eq!(params.segments(Quality(0.0)), 1);
+    assert!(!terrain(&params, Quality(0.0)).is_empty());
+}
+
+#[test]
+fn the_lattice_hash_is_not_diagonally_symmetric() {
+    // A symmetric coordinate combine hashes (a, b) and (b, a) alike and shows up
+    // as a mirror ridge across the diagonal — cheap to write, hard to unsee.
+    let f = HeightField { octaves: 1, frequency: 1.0, ..demo_field() };
+    let mirrored = (1..40)
+        .map(|i| {
+            let (x, z) = (i as f32 * 0.37, i as f32 * 1.61);
+            (f.height(x, z) - f.height(z, x)).abs()
+        })
+        .filter(|d| *d < 1e-6)
+        .count();
+    assert!(mirrored <= 1, "h(x,z) must not mirror h(z,x) ({mirrored} matches)");
+}

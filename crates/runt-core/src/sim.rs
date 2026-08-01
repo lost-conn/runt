@@ -13,11 +13,15 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::query::QueryState;
 use glam::Mat4;
 
+use crate::cache::{CacheStore, GenCache, NoopCache};
 use crate::camera::Camera;
 use crate::draw::{self, DrawItem, DrawQuery, FrameParams};
-use crate::ecs::{self, DemoEntity, FixedTick, Interpolated, Lighting, TickCount, Transform};
+use crate::ecs::{
+    self, DemoEntity, FixedTick, Interpolated, Lighting, QualityTier, TickCount, Transform,
+};
 use crate::input::{Input, InputEvent};
 use crate::registry::MeshLibrary;
+use crate::scene::{PendingScene, DEMO_SCENE_RON};
 
 /// The camera components the render path reads.
 type CameraQuery = (
@@ -38,6 +42,70 @@ pub const MAX_ACCUMULATED: f64 = 0.25;
 /// Largest `f32` strictly below 1.0 — `alpha` is documented as `[0,1)` and
 /// callers are entitled to rely on it.
 const ALPHA_MAX: f32 = 1.0 - f32::EPSILON;
+
+/// Everything a [`Sim`] needs before its first tick.
+///
+/// A struct rather than five constructors because the axes are independent:
+/// tick rate is a §4 concern, quality and cache are §6 concerns, and the scene
+/// is content. Tests reach for exactly one of them at a time.
+pub struct SimConfig {
+    /// Seconds per tick. See [`Sim::with_tick_rate`].
+    pub tick_dt: f64,
+    /// Device/LOD multiplier applied to every generator at load (DESIGN §6).
+    pub quality: QualityTier,
+    /// Persistence for the generation cache. The default stores nothing, so
+    /// building a `Sim` never touches a filesystem — a host opts into
+    /// [`cache::platform_default`](crate::cache::platform_default).
+    pub cache: Box<dyn CacheStore>,
+    /// Scene RON to load during `Startup`, or `None` for an empty world.
+    pub scene: Option<String>,
+}
+
+impl Default for SimConfig {
+    fn default() -> SimConfig {
+        SimConfig {
+            tick_dt: TICK_DT,
+            quality: QualityTier::default(),
+            cache: Box::new(NoopCache),
+            scene: Some(DEMO_SCENE_RON.to_string()),
+        }
+    }
+}
+
+impl SimConfig {
+    pub fn with_tick_dt(mut self, tick_dt: f64) -> SimConfig {
+        self.tick_dt = tick_dt;
+        self
+    }
+
+    pub fn with_tick_rate(mut self, hz: f64) -> SimConfig {
+        assert!(hz > 0.0, "tick rate must be positive, got {hz}");
+        self.tick_dt = 1.0 / hz;
+        self
+    }
+
+    pub fn with_quality(mut self, quality: f32) -> SimConfig {
+        self.quality = QualityTier(quality);
+        self
+    }
+
+    pub fn with_cache(mut self, cache: Box<dyn CacheStore>) -> SimConfig {
+        self.cache = cache;
+        self
+    }
+
+    pub fn with_scene(mut self, scene: impl Into<String>) -> SimConfig {
+        self.scene = Some(scene.into());
+        self
+    }
+
+    /// No scene at all: the code-path fallback for tests that want a world they
+    /// populate themselves.
+    pub fn without_scene(mut self) -> SimConfig {
+        self.scene = None;
+        self
+    }
+}
 
 pub struct Sim {
     world: World,
@@ -75,12 +143,29 @@ impl Sim {
     /// tick-rate toggle: dropping to 10 Hz makes render interpolation visible
     /// (and testable) instead of a 16 ms detail.
     pub fn with_tick_rate(hz: f64) -> Sim {
-        assert!(hz > 0.0, "tick rate must be positive, got {hz}");
-        Sim::with_tick_dt(1.0 / hz)
+        Sim::from_config(SimConfig::default().with_tick_rate(hz))
     }
 
     /// A sim with an explicit tick length in seconds.
     pub fn with_tick_dt(tick_dt: f64) -> Sim {
+        Sim::from_config(SimConfig::default().with_tick_dt(tick_dt))
+    }
+
+    /// A sim with no scene loaded: an empty world with the standard resources
+    /// and schedules. The code-path fallback for tests.
+    pub fn without_scene() -> Sim {
+        Sim::from_config(SimConfig::default().without_scene())
+    }
+
+    /// The general constructor. Resources go in, `Startup` runs (which is where
+    /// the scene is generated and spawned), and the sim is ready to tick.
+    pub fn from_config(config: SimConfig) -> Sim {
+        let SimConfig {
+            tick_dt,
+            quality,
+            cache,
+            scene,
+        } = config;
         assert!(
             tick_dt > 0.0 && tick_dt.is_finite(),
             "tick_dt must be positive and finite, got {tick_dt}"
@@ -94,6 +179,9 @@ impl Sim {
         world.insert_resource(Input::new());
         world.insert_resource(MeshLibrary::new());
         world.insert_resource(Lighting::default());
+        world.insert_resource(quality);
+        world.insert_resource(GenCache::new(cache));
+        world.insert_resource(PendingScene(scene));
 
         let draw_query = world.query::<DrawQuery>();
         let camera_query = world.query::<CameraQuery>();
@@ -147,8 +235,40 @@ impl Sim {
     }
 
     /// The demo's spinning entity (the twisted box).
+    ///
+    /// Panics if the loaded scene has nothing to focus on; use
+    /// [`try_demo_entity`](Sim::try_demo_entity) on a world built without one.
     pub fn demo_entity(&self) -> Entity {
         self.world.resource::<DemoEntity>().0
+    }
+
+    /// As [`demo_entity`](Sim::demo_entity), but `None` on a scene-less world.
+    pub fn try_demo_entity(&self) -> Option<Entity> {
+        self.world.get_resource::<DemoEntity>().map(|d| d.0)
+    }
+
+    /// A scene entity by its `name` in the scene file.
+    pub fn scene_entity(&self, name: &str) -> Option<Entity> {
+        self.world
+            .get_resource::<crate::scene::LoadedScene>()?
+            .entity(name)
+    }
+
+    /// The generation cache's counters (DESIGN §6). Diagnostics only — nothing
+    /// in the engine may branch on them.
+    pub fn cache_stats(&self) -> crate::cache::CacheStats {
+        self.world
+            .get_resource::<GenCache>()
+            .map(|c| c.stats())
+            .unwrap_or_default()
+    }
+
+    /// The session's quality multiplier.
+    pub fn quality_tier(&self) -> QualityTier {
+        self.world
+            .get_resource::<QualityTier>()
+            .copied()
+            .unwrap_or_default()
     }
 
     // -- input --------------------------------------------------------------

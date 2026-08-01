@@ -5,12 +5,15 @@ edition.workspace = true
 description = "runt engine core: windowless renderer that draws into a caller-provided TextureView."
 
 [dependencies]
-runt-mesh.workspace = true
+runt-mesh = { workspace = true, features = ["serde"] }
 bevy_ecs.workspace = true
 wgpu.workspace = true
-glam.workspace = true
+glam = { workspace = true, features = ["serde"] }
 bytemuck.workspace = true
 log.workspace = true
+serde.workspace = true
+ron.workspace = true
+postcard.workspace = true
 
 [dev-dependencies]
 pollster.workspace = true

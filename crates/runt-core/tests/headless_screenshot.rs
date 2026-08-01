@@ -7,6 +7,13 @@
 //! landed on screen. This is the foundation for real screenshot/regression
 //! tests later.
 //!
+//! Since step 4 the scene comes from `assets/demo.ron`, so this also exercises
+//! the whole content pipeline end to end: RON → generator specs → cache →
+//! `MeshLibrary` → lazy GPU upload → pixels. The ground is heightfield terrain
+//! (DESIGN §9), which is by far the largest mesh in the frame — if generation,
+//! caching or the field itself broke, the coverage check below is the first
+//! thing to notice.
+//!
 //! Since step 3 the scene is seven entities drawn one by one, so the frame is
 //! also checked *per entity*: two objects at different distances are projected
 //! through the engine's own camera and the pixels there must show their own

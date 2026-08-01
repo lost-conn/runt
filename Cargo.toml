@@ -23,6 +23,12 @@ bytemuck = { version = "1", features = ["derive"] }
 web-time = "1"
 log = "0.4"
 pollster = "1"
+# Content pipeline (DESIGN §6). `serde` is the stable param interface; `ron` is
+# the hand-editable scene format; `postcard` is the compact byte form both the
+# param hash and the on-disk mesh cache are built on.
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 
 [profile.release]
 opt-level = "s"

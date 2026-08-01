@@ -13,27 +13,36 @@ use bytemuck::{Pod, Zeroable};
 pub use runt_mesh as mesh;
 use runt_mesh::MeshData;
 
+pub mod cache;
 pub mod camera;
 pub mod draw;
 pub mod ecs;
 pub mod engine;
+pub mod gen;
 pub mod input;
 pub mod material;
 pub mod registry;
 pub mod scene;
 pub mod sim;
 
+pub use cache::{CacheStats, CacheStore, GenCache, NoopCache};
 pub use camera::{Camera, FollowCamera};
 pub use draw::{DrawItem, FrameParams};
 pub use ecs::{
-    DemoScene, FixedSim, GlobalTransform, Interpolated, Lighting, MeshRef, PostSim, Spin, Startup,
-    TickCount, Transform,
+    DemoScene, FixedSim, GeneratorRef, GlobalTransform, Interpolated, Lighting, MeshRef, PostSim,
+    QualityTier, Spin, Startup, TerrainSurface, TickCount, Transform,
 };
 pub use engine::Engine;
+pub use gen::{GeneratorSpec, Shading};
 pub use input::{Input, InputEvent, Key};
 pub use material::{Material, MaterialVariant};
 pub use registry::{GpuMesh, MeshHandle, MeshLibrary, MeshRegistry};
-pub use sim::{Sim, MAX_ACCUMULATED, TICK_DT};
+pub use runt_mesh::{HeightField, MeshData as Mesh, Quality, TerrainParams};
+pub use scene::{load_scene, save_scene, SceneDesc, SceneError};
+pub use sim::{Sim, SimConfig, MAX_ACCUMULATED, TICK_DT};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use cache::NativeDiskCache;
 
 // ---------------------------------------------------------------------------
 // GPU vertex layout

@@ -10,10 +10,15 @@
 
 use glam::{Mat3, Mat4, Quat, Vec2, Vec3};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 pub mod ops;
 pub mod primitives;
+pub mod terrain;
 
 pub use primitives::*;
+pub use terrain::{terrain, HeightField, TerrainParams};
 
 #[cfg(test)]
 mod tests;
@@ -21,7 +26,14 @@ mod tests;
 /// A triangle mesh in struct-of-arrays form. `positions` and `indices` are
 /// authoritative; `normals`, `uvs`, and `colors` are either empty or exactly
 /// `positions.len()` long (primitives always fill all four).
+///
+/// With the `serde` feature this round-trips through `postcard` — that is the
+/// on-disk form of the content cache's layer B (DESIGN §6). Serialization is
+/// plain field order with no versioning: entries are keyed by
+/// [`content_hash`](MeshData::content_hash) and validated on load, so a layout
+/// change simply misses the cache instead of corrupting a scene.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MeshData {
     pub positions: Vec<Vec3>,
     pub normals: Vec<Vec3>,
@@ -170,6 +182,7 @@ impl MeshData {
 /// base segment counts; the tier system scales them. A different quality is a
 /// legitimately different mesh (and cache key), so determinism is preserved.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Quality(pub f32);
 
 impl Quality {

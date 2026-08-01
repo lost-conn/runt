@@ -6,3 +6,11 @@ description = "Pure, GPU-free procedural mesh generation for runt."
 
 [dependencies]
 glam.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+# Off by default so a host that only generates meshes never pulls serde in.
+# `runt-core` turns it on: the content cache serializes `MeshData`, and
+# generator params are the scene file's stable interface (DESIGN §6).
+serde = ["dep:serde", "glam/serde"]

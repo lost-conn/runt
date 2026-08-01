@@ -87,7 +87,15 @@ impl Host {
         };
         surface.configure(&device, &config);
 
-        let engine = Engine::new(device.clone(), queue, format);
+        // The host is where the persistent half of the content cache is opted
+        // into (DESIGN §6): a disk cache natively, nothing on web until the
+        // IndexedDB/worker story lands. `runt-core` itself never assumes storage.
+        let engine = Engine::from_config(
+            device.clone(),
+            queue,
+            format,
+            runt_core::SimConfig::default().with_cache(runt_core::cache::platform_default()),
+        );
 
         Ok(Host {
             window,

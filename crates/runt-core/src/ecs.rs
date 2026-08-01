@@ -10,7 +10,8 @@
 
 use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::ScheduleLabel;
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat4, Quat, Vec2, Vec3};
+use runt_mesh::{HeightField, Quality, TerrainParams};
 
 use crate::registry::MeshHandle;
 
@@ -52,8 +53,124 @@ pub struct TickCount(pub u64);
 
 /// The demo's spinning entity (the twisted box). Only a convenience handle for
 /// tests and the demo's follow camera — nothing in the render path needs it.
+///
+/// Set by the scene loader from the camera's follow target, falling back to the
+/// first entity that spins.
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct DemoEntity(pub Entity);
+
+/// The device/LOD quality multiplier for this session (DESIGN §6, §11).
+///
+/// Read once, at scene load, and turned into a [`Quality`] per generator via the
+/// scene's quality policy. It is not consulted per frame: a different quality is
+/// a different *mesh*, not a different way of drawing one, so changing it means
+/// reloading the scene.
+///
+/// The device-tier probe of §11 will write this at startup; until then it is
+/// 1.0 unless a caller says otherwise.
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct QualityTier(pub f32);
+
+impl Default for QualityTier {
+    fn default() -> QualityTier {
+        QualityTier(1.0)
+    }
+}
+
+impl QualityTier {
+    pub fn quality(self) -> Quality {
+        Quality(self.0)
+    }
+}
+
+/// Which scene generator an entity's geometry came from.
+///
+/// [`MeshRef`] is a content hash and stays one — it is the renderer's key and it
+/// must not grow a provenance field the render path would have to skip past.
+/// This is the other half: the *inputs* that produced that hash, so a later
+/// quality change or editor param tweak can regenerate an entity without
+/// reloading the scene, and so `save_scene` knows which generator entry an
+/// entity belongs to.
+#[derive(Component, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GeneratorRef {
+    /// The scene file's generator entry name.
+    pub name: String,
+    /// `GeneratorSpec::param_key(quality)` for the spec that ran — the layer-A
+    /// cache key, so regeneration is a cache lookup away.
+    pub param_key: u64,
+}
+
+/// The analytic terrain surface an entity renders (DESIGN §9).
+///
+/// **This is the seam physics uses.** Step 5's ball integrator queries
+/// `(&TerrainSurface, &Transform)` and calls the `*_world` methods below; it
+/// never looks at the mesh, the `MeshRef`, or the tessellation. The mesh on the
+/// same entity is a *view* of this field, so the two cannot disagree at any
+/// quality tier.
+///
+/// v1 assumes a terrain entity is translated only — no rotation, no scale — so
+/// world↔field is a subtraction. A rotated heightfield is not a heightfield in
+/// world space, and pretending otherwise is how "the ball fell through the
+/// terrain" bugs start; the loader asserts it in debug builds instead.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub struct TerrainSurface {
+    /// The pure field. Sample it directly for anything that is not tied to this
+    /// entity's placement.
+    pub field: HeightField,
+    /// World extent of the meshed patch on X and Z, centered on the entity.
+    /// Outside it the field is still defined; there is simply nothing drawn.
+    pub size: Vec2,
+}
+
+impl TerrainSurface {
+    pub fn new(params: &TerrainParams) -> TerrainSurface {
+        TerrainSurface {
+            field: params.field(),
+            size: params.size,
+        }
+    }
+
+    /// Field-space coordinates for a world point, given the entity's origin.
+    #[inline]
+    pub fn to_local(origin: Vec3, x: f32, z: f32) -> Vec2 {
+        Vec2::new(x - origin.x, z - origin.z)
+    }
+
+    /// World-space surface height under `(x, z)`.
+    #[inline]
+    pub fn height_world(&self, origin: Vec3, x: f32, z: f32) -> f32 {
+        let p = TerrainSurface::to_local(origin, x, z);
+        origin.y + self.field.height(p.x, p.y)
+    }
+
+    /// World-space slope `(∂h/∂x, ∂h/∂z)`. Translation does not affect it.
+    #[inline]
+    pub fn gradient_world(&self, origin: Vec3, x: f32, z: f32) -> Vec2 {
+        let p = TerrainSurface::to_local(origin, x, z);
+        self.field.gradient(p.x, p.y)
+    }
+
+    /// World-space unit surface normal.
+    #[inline]
+    pub fn normal_world(&self, origin: Vec3, x: f32, z: f32) -> Vec3 {
+        runt_mesh::terrain::normal_from_gradient(self.gradient_world(origin, x, z))
+    }
+
+    /// Height and gradient together — one field evaluation, which is what a
+    /// contact solve wants.
+    #[inline]
+    pub fn sample_world(&self, origin: Vec3, x: f32, z: f32) -> (f32, Vec2) {
+        let p = TerrainSurface::to_local(origin, x, z);
+        let (h, g) = self.field.sample(p.x, p.y);
+        (origin.y + h, g)
+    }
+
+    /// Whether `(x, z)` falls inside the meshed patch.
+    pub fn contains_world(&self, origin: Vec3, x: f32, z: f32) -> bool {
+        let p = TerrainSurface::to_local(origin, x, z);
+        p.x.abs() <= self.size.x * 0.5 && p.y.abs() <= self.size.y * 0.5
+    }
+}
 
 /// The scene's light rig, uploaded verbatim into the per-frame uniform
 /// (DESIGN §5): one directional key light plus a sky/ground hemisphere ambient.
@@ -218,7 +335,11 @@ pub struct Spin {
     pub rad_per_sec: f32,
 }
 
-/// Marks entities belonging to the built-in demo scene.
+/// Marks entities spawned by a scene file.
+///
+/// Named for the demo it was introduced with; it means "came from the loaded
+/// scene" now. Entities spawned by gameplay code carry no such marker and are
+/// (deliberately) not saved — see [`crate::scene::save_scene`].
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct DemoScene;
 
@@ -279,10 +400,23 @@ fn deterministic_schedule(label: impl ScheduleLabel) -> Schedule {
     schedule
 }
 
+/// `Startup`: load whatever scene the [`Sim`](crate::sim::Sim) was configured
+/// with (DESIGN §6 — the scene file *is* the content).
+///
+/// Exclusive, because resolving generators needs `GenCache` and `MeshLibrary`
+/// mutably at the same time and spawning needs the world itself. There is
+/// exactly one startup system and it runs once, so nothing is lost by not
+/// parallelizing it.
 pub fn startup_schedule() -> Schedule {
     let mut s = deterministic_schedule(Startup);
-    s.add_systems(crate::scene::spawn_demo_scene);
+    s.add_systems(crate::scene::load_pending_scene);
     s
+}
+
+/// A `Startup` that does nothing: the code-path fallback for tests that want a
+/// world with no content in it.
+pub fn empty_startup_schedule() -> Schedule {
+    deterministic_schedule(Startup)
 }
 
 pub fn post_sim_schedule() -> Schedule {
