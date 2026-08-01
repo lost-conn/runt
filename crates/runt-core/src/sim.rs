@@ -17,7 +17,8 @@ use crate::cache::{CacheStore, GenCache, NoopCache};
 use crate::camera::Camera;
 use crate::draw::{self, DrawItem, DrawQuery, FrameParams};
 use crate::ecs::{
-    self, DemoEntity, FixedTick, Interpolated, Lighting, QualityTier, TickCount, Transform,
+    self, DemoEntity, FixedTick, Interpolated, Lighting, QualityTier, StatusLine, TickCount,
+    Transform,
 };
 use crate::input::{Input, InputEvent};
 use crate::registry::MeshLibrary;
@@ -179,6 +180,7 @@ impl Sim {
         world.insert_resource(Input::new());
         world.insert_resource(MeshLibrary::new());
         world.insert_resource(Lighting::default());
+        world.insert_resource(StatusLine::default());
         world.insert_resource(quality);
         world.insert_resource(GenCache::new(cache));
         world.insert_resource(PendingScene(scene));
@@ -292,6 +294,50 @@ impl Sim {
     /// sees this tick's overlaps on this tick.
     pub fn fixed_sim_mut(&mut self) -> &mut Schedule {
         &mut self.fixed_sim
+    }
+
+    /// The line of text a game asked the host to display (DESIGN §13's open
+    /// HUD question, answered with the cheapest thing that works). Empty until
+    /// something writes [`StatusLine`].
+    pub fn status_line(&self) -> &str {
+        self.world
+            .get_resource::<StatusLine>()
+            .map(|s| s.as_str())
+            .unwrap_or("")
+    }
+
+    // -- input traces (DESIGN §4) -------------------------------------------
+
+    /// Start recording every tick's input into an [`InputTrace`].
+    ///
+    /// Installed at the head of `FixedSim`, after [`trace::apply`] so that
+    /// recording *a replay* records what the replay actually fed the tick.
+    pub fn record_input_trace(&mut self) {
+        self.world.init_resource::<crate::trace::InputTrace>();
+        self.fixed_sim.add_systems(
+            crate::trace::record
+                .after(crate::physics::update_overlap_messages)
+                .after(crate::trace::apply)
+                .before(crate::physics::integrate_balls),
+        );
+    }
+
+    /// Replay `trace`: from now on every tick's [`Input`] comes from it and
+    /// from nothing else, host events included (see [`trace::apply`]).
+    pub fn play_input_trace(&mut self, trace: crate::trace::InputTrace) {
+        self.world
+            .insert_resource(crate::trace::Playback::new(trace));
+        self.fixed_sim.add_systems(
+            crate::trace::apply
+                .after(crate::physics::update_overlap_messages)
+                .before(crate::physics::integrate_balls),
+        );
+    }
+
+    /// The trace recorded so far, if [`record_input_trace`](Sim::record_input_trace)
+    /// was called.
+    pub fn input_trace(&self) -> Option<&crate::trace::InputTrace> {
+        self.world.get_resource::<crate::trace::InputTrace>()
     }
 
     /// The session's quality multiplier.

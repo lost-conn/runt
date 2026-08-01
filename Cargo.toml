@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/runt-mesh", "crates/runt-core", "crates/runt-app"]
+members = ["crates/runt-mesh", "crates/runt-core", "crates/runt-app", "demo/*"]
 # `cargo run` / `cargo build` from the root act on the player host.
 default-members = ["crates/runt-app"]
 

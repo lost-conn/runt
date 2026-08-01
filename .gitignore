@@ -1,3 +1,4 @@
 /target
 /dist
+demo/*/dist
 /.playwright-mcp

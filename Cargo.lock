@@ -1997,6 +1997,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "runt-ball"
+version = "0.1.0"
+dependencies = [
+ "bevy_ecs",
+ "env_logger",
+ "glam 0.33.2",
+ "log",
+ "pollster",
+ "runt-app",
+ "runt-core",
+ "wasm-bindgen",
+ "wgpu",
+]
+
+[[package]]
 name = "runt-core"
 version = "0.1.0"
 dependencies = [

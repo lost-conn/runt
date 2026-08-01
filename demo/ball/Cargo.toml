@@ -1,0 +1,35 @@
+[package]
+name = "runt-ball"
+version.workspace = true
+edition.workspace = true
+description = "runt v0 demo game: a rolling-ball collector on procedural terrain (DESIGN §12 step 6)."
+
+[lib]
+name = "runt_ball"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "runt-ball"
+path = "src/main.rs"
+
+[dependencies]
+# `default-features = false` drops runt-app's own `#[wasm_bindgen(start)]`: this
+# crate is the wasm target and declares its own. See runt-app's `wasm-entry`.
+runt-app = { path = "../../crates/runt-app", default-features = false }
+runt-core.workspace = true
+bevy_ecs.workspace = true
+glam.workspace = true
+log.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+env_logger = "0.11"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The WebGL2 fallback is a host/backend concern, but the feature has to be
+# switched on by whichever crate is the wasm *target* — that is this one.
+wgpu = { workspace = true, features = ["webgl"] }
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+pollster.workspace = true
+wgpu.workspace = true

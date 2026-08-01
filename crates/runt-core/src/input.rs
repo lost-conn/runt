@@ -9,6 +9,7 @@
 
 use bevy_ecs::resource::Resource;
 use glam::Vec2;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Keys
@@ -19,7 +20,12 @@ use glam::Vec2;
 /// Deliberately small: what a ball game needs. Anything else the host cannot map
 /// arrives as [`Key::Other`], which is a single bucket by design (we never want
 /// unmapped keys silently acquiring meaning).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// `Serialize`/`Deserialize` exist so an [`InputTrace`](crate::trace::InputTrace)
+/// can be written to a file. Postcard encodes a unit variant as its **index**, so
+/// append new keys at the end (before [`Key::Other`] is fine to break; a stored
+/// trace is a debugging artifact, not a save format).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Key {
     A,
@@ -163,8 +169,8 @@ pub use keyset::KeySet;
 // ---------------------------------------------------------------------------
 
 /// One host input event. This is the *entire* engine input vocabulary; a replay
-/// trace is a `Vec<(tick, InputEvent)>`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// trace is a `Vec<(tick, InputEvent)>` — see [`crate::trace`].
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum InputEvent {
     KeyDown(Key),
     KeyUp(Key),
@@ -295,6 +301,15 @@ impl Input {
     /// Held keys in `Key::ALL` order.
     pub fn held_keys(&self) -> impl Iterator<Item = Key> + '_ {
         self.held.iter()
+    }
+    /// Keys pressed *this tick*, in `Key::ALL` order. What a trace recorder
+    /// turns back into [`InputEvent::KeyDown`]s (see [`crate::trace`]).
+    pub fn just_pressed_keys(&self) -> impl Iterator<Item = Key> + '_ {
+        self.just_pressed.iter()
+    }
+    /// Keys released *this tick*, in `Key::ALL` order.
+    pub fn just_released_keys(&self) -> impl Iterator<Item = Key> + '_ {
+        self.just_released.iter()
     }
 
     #[inline]

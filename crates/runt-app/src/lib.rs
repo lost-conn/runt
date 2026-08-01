@@ -4,10 +4,28 @@
 //! engine itself is `runt-core`, which never sees a `Window` or a `Surface`:
 //! this host acquires the frame's `TextureView` and hands it to
 //! [`runt_core::Renderer::render`].
+//!
+//! ## No game logic lives here (DESIGN §2)
+//!
+//! > *Hosts contain no engine logic. If a feature needs host code beyond event
+//! > translation and surface management, it's designed wrong.*
+//!
+//! So the host does not know what it is running. [`RunConfig`] is the whole
+//! contract: a title, a scene, a quality tier and a `setup` hook that runs once
+//! against the [`Sim`](runt_core::Sim) before its first tick. `runt-native` is
+//! `run_with(RunConfig::engine_demo())`; `demo/ball` is the same call with its
+//! own scene and a setup that registers its `FixedSim` systems. Neither program
+//! adds a line of code to this file.
+//!
+//! The one thing that *looks* like an exception is the status line (see
+//! [`Host::sync_status`]): the engine has no text renderer, so a game writes
+//! [`StatusLine`](runt_core::StatusLine) and the host paints it with whatever
+//! cheap text its platform has. That is presentation — the host reads a string
+//! and never writes one.
 
 use std::sync::Arc;
 
-use runt_core::{Engine, InputEvent, Key};
+use runt_core::{Engine, InputEvent, Key, Sim};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
@@ -15,6 +33,93 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 mod input;
+
+// ---------------------------------------------------------------------------
+// What to run
+// ---------------------------------------------------------------------------
+
+/// A one-shot hook that runs against the [`Sim`] after `Startup` (so the scene
+/// is loaded and its entities exist) and before the first tick.
+///
+/// This is where a game registers its `FixedSim` systems and inserts its
+/// resources. `FnOnce` rather than the plain `fn` pointer the host would prefer:
+/// `runt-ball --replay <file>` has to hand the loaded trace to setup, and a
+/// function pointer cannot carry it. Boxing costs one allocation per process.
+pub type SetupFn = Box<dyn FnOnce(&mut Sim)>;
+
+/// Everything the host needs to know about the program it is hosting.
+///
+/// Deliberately small. If something wants to be in here that is not a title, a
+/// scene, a quality tier or a setup hook, it is probably engine state and
+/// belongs behind [`SetupFn`].
+pub struct RunConfig {
+    /// Window title natively; the base of `document.title` on web. A
+    /// [`StatusLine`](runt_core::StatusLine) replaces it once a game writes one.
+    pub title: String,
+    /// The scene RON, normally an `include_str!` so the wasm build needs no
+    /// fetch (the same trick `runt-core` plays with `assets/demo.ron`).
+    pub scene_ron: String,
+    /// Device/LOD multiplier (DESIGN §6, §11). `None` takes the engine default
+    /// until §11's probe exists to choose one.
+    pub quality: Option<f32>,
+    /// Run once against the sim before the first tick.
+    pub setup: Option<SetupFn>,
+    /// Run once after the event loop exits, on the sim it left behind.
+    ///
+    /// Where `runt-ball --record` writes its input trace. **Native only**: a web
+    /// page is closed, not exited, and the browser never gives the wasm module
+    /// the last word. Anything that must survive on web has to be written as it
+    /// happens.
+    pub on_exit: Option<SetupFn>,
+}
+
+impl RunConfig {
+    /// A config for `scene_ron`, with no setup hook.
+    pub fn new(title: impl Into<String>, scene_ron: impl Into<String>) -> RunConfig {
+        RunConfig {
+            title: title.into(),
+            scene_ron: scene_ron.into(),
+            quality: None,
+            setup: None,
+            on_exit: None,
+        }
+    }
+
+    /// The engine's own demo scene — what `runt-native` and the root
+    /// `index.html` run. Not a game: no setup hook, because there is no game
+    /// logic to register (DESIGN §2).
+    pub fn engine_demo() -> RunConfig {
+        RunConfig::new("runt", runt_core::scene::DEMO_SCENE_RON)
+    }
+
+    pub fn with_quality(mut self, quality: f32) -> RunConfig {
+        self.quality = Some(quality);
+        self
+    }
+
+    pub fn with_setup(mut self, setup: impl FnOnce(&mut Sim) + 'static) -> RunConfig {
+        self.setup = Some(Box::new(setup));
+        self
+    }
+
+    /// See [`on_exit`](RunConfig::on_exit). Native only; ignored on web.
+    pub fn with_on_exit(mut self, on_exit: impl FnOnce(&mut Sim) + 'static) -> RunConfig {
+        self.on_exit = Some(Box::new(on_exit));
+        self
+    }
+
+    /// The [`SimConfig`](runt_core::SimConfig) this describes, with the host's
+    /// platform cache attached (DESIGN §6: persistence is a host opt-in).
+    fn sim_config(&self) -> runt_core::SimConfig {
+        let config = runt_core::SimConfig::default()
+            .with_scene(self.scene_ron.clone())
+            .with_cache(runt_core::cache::platform_default());
+        match self.quality {
+            Some(q) => config.with_quality(q),
+            None => config,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Host: surface + present
@@ -29,10 +134,15 @@ struct Host {
     start: web_time::Instant,
     /// winit reports absolute cursor positions; the engine wants deltas.
     last_cursor: Option<(f64, f64)>,
+    /// What the program is called when it has nothing to say.
+    title: String,
+    /// The last [`StatusLine`](runt_core::StatusLine) painted, so an unchanged
+    /// line costs nothing per frame.
+    shown_status: String,
 }
 
 impl Host {
-    async fn new(window: Arc<Window>) -> Result<Host, String> {
+    async fn new(window: Arc<Window>, run: RunConfig) -> Result<Host, String> {
         let mut size = window.inner_size();
         size.width = size.width.max(1);
         size.height = size.height.max(1);
@@ -90,14 +200,16 @@ impl Host {
         // The host is where the persistent half of the content cache is opted
         // into (DESIGN §6): a disk cache natively, nothing on web until the
         // IndexedDB/worker story lands. `runt-core` itself never assumes storage.
-        let engine = Engine::from_config(
-            device.clone(),
-            queue,
-            format,
-            runt_core::SimConfig::default().with_cache(runt_core::cache::platform_default()),
-        );
+        let mut engine = Engine::from_config(device.clone(), queue, format, run.sim_config());
 
-        Ok(Host {
+        // The scene exists (`Startup` ran inside `from_config`) and no tick has
+        // happened yet: the one moment a game can install `FixedSim` systems
+        // *and* see a fully-built world.
+        if let Some(setup) = run.setup {
+            setup(engine.sim_mut());
+        }
+
+        let mut host = Host {
             window,
             surface,
             device,
@@ -105,7 +217,50 @@ impl Host {
             engine,
             start: web_time::Instant::now(),
             last_cursor: None,
-        })
+            title: run.title,
+            shown_status: String::new(),
+        };
+        host.sync_status();
+        Ok(host)
+    }
+
+    /// Paint [`StatusLine`](runt_core::StatusLine) wherever this platform has
+    /// cheap text, if it changed since the last frame.
+    ///
+    /// DESIGN §13 leaves HUD text open and the renderer has no glyphs, so the
+    /// answer for v0 is the two places every platform already gives us for free:
+    /// the window title natively, and on web `document.title` plus the optional
+    /// `#runt-status` element a game's `index.html` may declare — §13's
+    /// "cheapest candidate: DOM overlay on web, nothing native".
+    ///
+    /// An empty status line falls back to the configured title, so a scene that
+    /// never writes one looks exactly as it did before this existed.
+    fn sync_status(&mut self) {
+        let status = self.engine.sim().status_line();
+        if status == self.shown_status {
+            return;
+        }
+        self.shown_status = status.to_string();
+
+        let text = if self.shown_status.is_empty() {
+            self.title.clone()
+        } else {
+            self.shown_status.clone()
+        };
+        self.window.set_title(&text);
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                doc.set_title(&text);
+                // Optional by design: a page with no `#runt-status` still gets
+                // the tab title, and the host does not create DOM the page did
+                // not ask for.
+                if let Some(el) = doc.get_element_by_id("runt-status") {
+                    el.set_text_content(Some(&self.shown_status));
+                }
+            }
+        }
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -149,6 +304,7 @@ impl Host {
             .render(&view, self.config.width, self.config.height);
 
         self.engine.queue().present(frame);
+        self.sync_status();
     }
 
     /// Translate one winit window event into engine input. Returns `true` if it
@@ -216,11 +372,20 @@ impl Host {
 // ---------------------------------------------------------------------------
 
 enum UserEvent {
+    // Only ever sent from the wasm graphics-init future; natively the host is
+    // built inline and this arm is unreachable.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     HostReady(Host),
 }
 
 struct App {
     host: Option<Host>,
+    /// Taken by the first `resumed`; `None` afterwards, which is also what
+    /// stops a second resume from rebuilding the world (the setup hook is
+    /// `FnOnce` and the sim it configured is already running).
+    run: Option<RunConfig>,
+    /// Held out of `run` so it survives into `run_with`'s tail.
+    on_exit: Option<SetupFn>,
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     proxy: Option<EventLoopProxy<UserEvent>>,
 }
@@ -230,7 +395,10 @@ impl ApplicationHandler<UserEvent> for App {
         if self.host.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title("runt");
+        let Some(run) = self.run.take() else {
+            return; // Already resumed once; graphics init is in flight.
+        };
+        let attrs = Window::default_attributes().with_title(&run.title);
 
         #[cfg(target_arch = "wasm32")]
         let attrs = {
@@ -242,7 +410,7 @@ impl ApplicationHandler<UserEvent> for App {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            match pollster::block_on(Host::new(window)) {
+            match pollster::block_on(Host::new(window, run)) {
                 Ok(h) => self.host = Some(h),
                 Err(e) => {
                     log::error!("graphics init failed: {e}");
@@ -255,7 +423,7 @@ impl ApplicationHandler<UserEvent> for App {
         {
             let proxy = self.proxy.take().expect("proxy");
             wasm_bindgen_futures::spawn_local(async move {
-                match Host::new(window).await {
+                match Host::new(window, run).await {
                     Ok(h) => {
                         let _ = proxy.send_event(UserEvent::HostReady(h));
                     }
@@ -269,6 +437,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        #[cfg_attr(not(target_arch = "wasm32"), allow(unused_mut))]
         let UserEvent::HostReady(mut h) = event;
         // Apply the real viewport size immediately; the surface was created at
         // whatever tiny default winit gave the fresh canvas.
@@ -307,16 +476,34 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+/// Run the engine's own demo scene. `runt-native` and the root `index.html`.
 pub fn run() {
+    run_with(RunConfig::engine_demo());
+}
+
+/// Open a window (or take over the canvas) and run `config` until it closes.
+///
+/// The entry point for *any* runt program: the engine demo, `demo/ball`, and
+/// whatever comes next all reach the platform through this one function.
+pub fn run_with(mut config: RunConfig) {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("build event loop");
     let proxy = event_loop.create_proxy();
     let mut app = App {
         host: None,
+        on_exit: config.on_exit.take(),
+        run: Some(config),
         proxy: Some(proxy),
     };
     event_loop.run_app(&mut app).expect("run app");
+
+    // Native only in practice: on web `run_app` diverges into the browser's
+    // event loop and this line is never reached, which is exactly what
+    // `on_exit`'s docs promise.
+    if let (Some(on_exit), Some(host)) = (app.on_exit.take(), app.host.as_mut()) {
+        on_exit(host.engine.sim_mut());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -357,10 +544,27 @@ fn show_fatal(msg: &str) {
     }
 }
 
+/// Panic hook + console logger. Every wasm entry point wants these and none of
+/// them wants to remember the two crate names, so the host owns the boilerplate
+/// even though the `#[wasm_bindgen(start)]` itself cannot live here for a game
+/// (see [`wasm_start`]).
 #[cfg(target_arch = "wasm32")]
-#[wasm_bindgen::prelude::wasm_bindgen(start)]
-pub fn wasm_start() {
+pub fn wasm_init() {
     console_error_panic_hook::set_once();
     console_log::init_with_level(log::Level::Info).ok();
+}
+
+/// The engine demo's browser entry point.
+///
+/// Behind the default `wasm-entry` feature because **a wasm module may have
+/// exactly one `#[wasm_bindgen(start)]`**, and it is collected from dependency
+/// rlibs too. A game crate that is itself the wasm target therefore depends on
+/// `runt-app` with `default-features = false` and declares its own start — see
+/// `demo/ball/src/lib.rs`. Building `crates/runt-app` directly (the root
+/// `index.html`) keeps the default and gets this one.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-entry"))]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn wasm_start() {
+    wasm_init();
     run();
 }

@@ -59,6 +59,43 @@ pub struct TickCount(pub u64);
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct DemoEntity(pub Entity);
 
+/// One line of text the host is asked to show somewhere outside the 3D frame.
+///
+/// **The engine has no text renderer** and DESIGN §13 leaves HUD text open
+/// ("cheapest candidate: DOM overlay on web, nothing native, until a real need
+/// appears"). A game still needs to say *3/12 · 12.4 s* somewhere on tick one of
+/// its existence, so this is the seam: a game system writes a string, and the
+/// host paints it wherever its platform has cheap text — the window title
+/// natively, `document.title` plus a `#runt-status` element on web.
+///
+/// Deliberately a plain `String` and deliberately *not* read by anything in the
+/// engine: it is an output channel, never sim state. Nothing branches on it, so
+/// a host that ignores it entirely still runs the same simulation, and it cannot
+/// enter a determinism fingerprint (which is over transforms).
+///
+/// Written from a `FixedSim` system like any other gameplay output; the host
+/// reads [`Sim::status_line`](crate::Sim::status_line) after each frame and only
+/// touches the platform when the string actually changed.
+#[derive(Resource, Clone, Debug, Default, PartialEq, Eq)]
+pub struct StatusLine(pub String);
+
+impl StatusLine {
+    /// Replace the line, reporting whether it actually changed. Cheap enough to
+    /// call every tick, which is what a game system wants to do.
+    pub fn set(&mut self, text: impl Into<String>) -> bool {
+        let text = text.into();
+        if self.0 == text {
+            return false;
+        }
+        self.0 = text;
+        true
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The device/LOD quality multiplier for this session (DESIGN §6, §11).
 ///
 /// Read once, at scene load, and turned into a [`Quality`] per generator via the

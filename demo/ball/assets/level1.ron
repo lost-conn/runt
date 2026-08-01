@@ -1,0 +1,285 @@
+// runt ball — level 1 (DESIGN §12 step 6).
+//
+// Save-as-params, like every runt scene: nothing here is baked. The terrain is
+// four octaves of value noise regenerated on load, and physics samples the same
+// analytic h(x, z) the mesh is a view of (DESIGN §9) — so the hills you roll on
+// are the hills you see at every quality tier, and a low-end device gets a
+// coarser mesh and an identical run.
+//
+// The numbers below are not typed by feel. `tests/level.rs` re-derives the field
+// and asserts every one of them: each pickup sits 0.3–1.5 m above the ground at
+// its own (x, z), the spawn is on a slope under 5°, no pickup is on a slope a
+// jumpless ball could not climb, and nothing overlaps anything. Edit a
+// coordinate and the test tells you what you broke.
+//
+// Seed 514 was chosen by survey (see the tuning notes in README.md): of 600
+// seeds at this amplitude/frequency it was the one with the widest height range
+// whose steepest point anywhere on the patch is still under 30°. So the level
+// has hills worth cresting and not one slope the ball cannot climb.
+(
+    generators: [
+        // 48×48 m of ground. `base_segments: 96` is a 0.5 m grid at full
+        // quality; a low tier thins it and the physics does not care.
+        (
+            name: "ground",
+            spec: Terrain((
+                seed: 514,
+                size: (48.0, 48.0),
+                amplitude: 2.5,
+                octaves: 4,
+                frequency: 0.07,
+                lacunarity: 2.0,
+                gain: 0.5,
+                base_segments: 96,
+                color: Some((0.16, 0.22, 0.17)),
+            )),
+        ),
+        (
+            name: "player",
+            spec: UvSphere(
+                radius: 0.5,
+                rings: 20,
+                sectors: 28,
+                shading: Smooth(180.0),
+                color: Some((0.92, 0.36, 0.30)),
+            ),
+        ),
+        // The collectible's silhouette *is* the gameplay, so its tessellation is
+        // pinned rather than inherited: a weak device gets a coarser world and
+        // the same readable ring (DESIGN §6, `QualityPolicy::Fixed`).
+        (
+            name: "pickup",
+            spec: Torus(
+                major_radius: 0.5,
+                minor_radius: 0.18,
+                major_segments: 28,
+                minor_segments: 14,
+                shading: Smooth(180.0),
+                color: Some((1.0, 0.78, 0.22)),
+            ),
+            quality: Fixed(1.0),
+        ),
+        (
+            name: "post",
+            spec: Cylinder(
+                radius: 0.4,
+                height: 2.0,
+                segments: 20,
+                color: Some((0.44, 0.50, 0.64)),
+            ),
+        ),
+    ],
+
+    entities: [
+        // Translation only. A rotated height field is not a height field, and
+        // the loader debug-asserts it.
+        (
+            name: Some("ground"),
+            generator: "ground",
+        ),
+
+        // The player. `y = h(-3, 0) + radius + 0.017` — a 17 mm drop, which is
+        // under the absorb threshold (`BOUNCE_SPEED`), so it settles on tick one
+        // instead of opening the game with a bounce.
+        //
+        // Tuning, and why (see README for the full derivation):
+        //   accel 16, rolling_friction 2.2  → terminal roll 16/2.2 ≈ 7.3 m/s,
+        //     which crosses the 48 m patch in ~7 s and half of it in ~3.5 s.
+        //     The engine defaults (22 / 1.2 → 18 m/s) turn a 48 m map into a
+        //     3 s map and make the follow camera seasick.
+        //   max_speed 14  → a downhill run can outpace the roll terminal
+        //     velocity, but not by enough to tunnel a 0.8 m post in one tick
+        //     (14 · 1/60 = 0.23 m).
+        (
+            name: Some("player"),
+            generator: "player",
+            transform: (translation: (-3.0, 0.55, 0.0)),
+            ball: Some((
+                radius: 0.5,
+                rolling_friction: 2.2,
+                max_speed: 14.0,
+            )),
+            ball_controller: Some((accel: 16.0)),
+        ),
+
+        // --- pickups: 12 rings, each 0.9 m above its own patch of ground ----
+        //
+        // `trigger: true` means the overlap is reported and nothing is pushed
+        // out — the ball rolls straight through and `collect_pickups` despawns
+        // it. The 0.7 collider is a little wider than the torus (0.5 + 0.18) so
+        // the take feels generous rather than pixel-perfect. `spin` also implies
+        // an `Interpolated`, which the bob then rides.
+        (
+            name: Some("pickup_01"),
+            generator: "pickup",
+            transform: (translation: (-14.25, 0.8627, -15.5)),
+            sphere_collider: Some(0.7),
+            trigger: true,
+            spin: Some((axis: (0.0, 1.0, 0.0), rad_per_sec: 1.6)),
+        ),
+        (
+            name: Some("pickup_02"),
+            generator: "pickup",
+            transform: (translation: (0.0, 1.5785, -16.25)),
+            sphere_collider: Some(0.7),
+            trigger: true,
+            spin: Some((axis: (0.0, 1.0, 0.0), rad_per_sec: 1.6)),
+        ),
+        (
+            name: Some("pickup_03"),
+            generator: "pickup",
+            transform: (translation: (14.25, 0.8241, -14.5)),
+            sphere_collider: Some(0.7),
+            trigger: true,
+            spin: Some((axis: (0.0, 1.0, 0.0), rad_per_sec: 1.6)),
+        ),
+        (
+            name: Some("pickup_04"),
+            generator: "pickup",
+            transform: (translation: (-18.25, 2.5718, 0.0)),
+            sphere_collider: Some(0.7),
+            trigger: true,
+            spin: Some((axis: (0.0, 1.0, 0.0), rad_per_sec: 1.6)),
+        ),
+        (
+            name: Some("pickup_05"),
+            generator: "pickup",
+            transform: (translation: (19.5, 0.5739, -4.5)),
+            sphere_collider: Some(0.7),
+            trigger: true,
+            spin: Some((axis: (0.0, 1.0, 0.0), rad_per_sec: 1.6)),
+        ),
+        (
+            name: Some("pickup_06"),
+            generator: "pickup",
+            transform: (translation: (-8.0, 1.6897, 7.0)),
+            sphere_collider: Some(0.7),
+            trigger: true,
+            spin: Some((axis: (0.0, 1.0, 0.0), rad_per_sec: 1.6)),
+        ),
+        (
+            name: Some("pickup_07"),
+            generator: "pickup",
+            transform: (translation: (-14.25, 0.7589, 14.25)),
+            sphere_collider: Some(0.7),
+            trigger: true,
+            spin: Some((axis: (0.0, 1.0, 0.0), rad_per_sec: 1.6)),
+        ),
+        (
+            name: Some("pickup_08"),
+            generator: "pickup",
+            transform: (translation: (0.0, 1.8078, 16.0)),
+            sphere_collider: Some(0.7),
+            trigger: true,
+            spin: Some((axis: (0.0, 1.0, 0.0), rad_per_sec: 1.6)),
+        ),
+        (
+            name: Some("pickup_09"),
+            generator: "pickup",
+            transform: (translation: (14.25, -0.4324, 14.25)),
+            sphere_collider: Some(0.7),
+            trigger: true,
+            spin: Some((axis: (0.0, 1.0, 0.0), rad_per_sec: 1.6)),
+        ),
+        (
+            name: Some("pickup_10"),
+            generator: "pickup",
+            transform: (translation: (7.0, 0.1922, 7.0)),
+            sphere_collider: Some(0.7),
+            trigger: true,
+            spin: Some((axis: (0.0, 1.0, 0.0), rad_per_sec: 1.6)),
+        ),
+        (
+            name: Some("pickup_11"),
+            generator: "pickup",
+            transform: (translation: (-4.75, 0.9075, -6.5)),
+            sphere_collider: Some(0.7),
+            trigger: true,
+            spin: Some((axis: (0.0, 1.0, 0.0), rad_per_sec: 1.6)),
+        ),
+        (
+            name: Some("pickup_12"),
+            generator: "pickup",
+            transform: (translation: (7.0, 1.5558, -8.75)),
+            sphere_collider: Some(0.7),
+            trigger: true,
+            spin: Some((axis: (0.0, 1.0, 0.0), rad_per_sec: 1.6)),
+        ),
+
+        // --- posts: 7 solid obstacles --------------------------------------
+        //
+        // Half-extents (0.4, 1.0, 0.4) box the 0.4-radius, 2.0-tall cylinder,
+        // centred at h + 1.0 so the base meets the ground. Solid, so the
+        // resolver pushes the ball out and kills only the velocity heading into
+        // the face — you graze a post and slide, you do not stop dead.
+        (
+            name: Some("post_1"),
+            generator: "post",
+            transform: (translation: (-6.75, 1.7321, -15.5)),
+            aabb_collider: Some((0.4, 1.0, 0.4)),
+        ),
+        (
+            name: Some("post_2"),
+            generator: "post",
+            transform: (translation: (8.0, 1.1804, -14.25)),
+            aabb_collider: Some((0.4, 1.0, 0.4)),
+        ),
+        (
+            name: Some("post_3"),
+            generator: "post",
+            transform: (translation: (-14.25, 2.1838, 6.25)),
+            aabb_collider: Some((0.4, 1.0, 0.4)),
+        ),
+        (
+            name: Some("post_4"),
+            generator: "post",
+            transform: (translation: (14.25, 0.8923, 4.5)),
+            aabb_collider: Some((0.4, 1.0, 0.4)),
+        ),
+        (
+            name: Some("post_5"),
+            generator: "post",
+            transform: (translation: (-3.25, 1.6192, 11.5)),
+            aabb_collider: Some((0.4, 1.0, 0.4)),
+        ),
+        (
+            name: Some("post_6"),
+            generator: "post",
+            transform: (translation: (2.75, 0.8684, -2.25)),
+            aabb_collider: Some((0.4, 1.0, 0.4)),
+        ),
+        (
+            name: Some("post_7"),
+            generator: "post",
+            transform: (translation: (-2.75, 0.8807, 4.0)),
+            aabb_collider: Some((0.4, 1.0, 0.4)),
+        ),
+    ],
+
+    // Behind and above, easing in at ~3.5/s: loose enough to lag a little on a
+    // hard turn (which is what sells the speed) and tight enough not to swing.
+    // The 8 m of lift matters more than it looks: the terrain tops out at +1.5
+    // and the camera never drops below `ball_y + 8`, so it cannot clip a hill
+    // even with the ball in the deepest hollow on the map.
+    camera: (
+        eye: (-3.0, 7.5, 10.5),
+        target: (-3.0, 0.5, 0.0),
+        fov_y_degrees: 55.0,
+        z_near: 0.1,
+        z_far: 200.0,
+        follow: Some((
+            entity: "player",
+            offset: (0.0, 7.0, 10.5),
+            stiffness: 3.5,
+        )),
+    ),
+
+    // Late-afternoon key from the front-left, a cool sky ambient and a warm
+    // bounce, so the gold pickups read against the green ground from any angle.
+    lighting: (
+        key_dir: (0.45, 0.85, 0.35),
+        key_color: (0.95, 0.88, 0.74),
+        sky_color: (0.32, 0.38, 0.46),
+        ground_color: (0.16, 0.14, 0.11),
+    ),
+)

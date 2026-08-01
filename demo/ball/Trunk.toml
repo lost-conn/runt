@@ -1,0 +1,9 @@
+# Trunk config for the demo game. Run `trunk build --release` (or `trunk serve`)
+# from this directory; the root `Trunk.toml` still builds the engine demo.
+#
+# Unlike the workspace root, this directory *is* a package, so trunk finds a root
+# crate without help — the file is here for `dist` and to keep the two builds
+# from writing over each other.
+[build]
+target = "index.html"
+dist = "dist"

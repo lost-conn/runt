@@ -12,6 +12,14 @@ crate-type = ["cdylib", "rlib"]
 name = "runt-native"
 path = "src/main.rs"
 
+[features]
+# The `#[wasm_bindgen(start)]` for the engine demo. On by default so building
+# this crate as the wasm target Just Works; a game crate that is *itself* the
+# wasm target turns it off, because a module may only have one start function
+# and wasm-bindgen collects them from dependencies too.
+default = ["wasm-entry"]
+wasm-entry = []
+
 [dependencies]
 runt-core.workspace = true
 wgpu.workspace = true

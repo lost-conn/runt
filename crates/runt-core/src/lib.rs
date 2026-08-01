@@ -25,13 +25,14 @@ pub mod physics;
 pub mod registry;
 pub mod scene;
 pub mod sim;
+pub mod trace;
 
 pub use cache::{CacheStats, CacheStore, GenCache, NoopCache};
 pub use camera::{Camera, FollowCamera};
 pub use draw::{DrawItem, FrameParams};
 pub use ecs::{
     DemoScene, FixedSim, GeneratorRef, GlobalTransform, Interpolated, Lighting, MeshRef, PostSim,
-    QualityTier, Spin, Startup, TerrainSurface, TickCount, Transform,
+    QualityTier, Spin, Startup, StatusLine, TerrainSurface, TickCount, Transform,
 };
 pub use engine::Engine;
 pub use gen::{GeneratorSpec, Shading};
@@ -45,6 +46,7 @@ pub use registry::{GpuMesh, MeshHandle, MeshLibrary, MeshRegistry};
 pub use runt_mesh::{HeightField, MeshData as Mesh, Quality, TerrainParams};
 pub use scene::{load_scene, save_scene, SceneDesc, SceneError};
 pub use sim::{Sim, SimConfig, MAX_ACCUMULATED, TICK_DT};
+pub use trace::{InputTrace, TickEvent};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use cache::NativeDiskCache;
