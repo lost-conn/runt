@@ -70,6 +70,7 @@ fn every_variant() -> Vec<GeneratorSpec> {
             gain: 0.5,
             base_segments: 12,
             color: None,
+            tint: None,
         }),
     ]
 }
@@ -232,6 +233,64 @@ fn omitted_optional_fields_take_their_defaults() {
             shading: Shading::Generated,
             color: None,
         }
+    );
+}
+
+#[test]
+fn a_terrain_tint_is_part_of_the_cache_key_and_omitting_it_changes_nothing() {
+    // Two halves of the same promise (DESIGN §6). A scene written before tints
+    // existed omits the field, must parse to `None`, and must key *and* generate
+    // exactly as it did — otherwise every cached terrain on disk is silently
+    // invalidated and every content hash in a saved scene moves.
+    let terse: GeneratorSpec = ron::from_str(
+        "Terrain((seed: 5, size: (8.0, 8.0), amplitude: 1.0, octaves: 3, \
+          frequency: 0.1, lacunarity: 2.0, gain: 0.5, base_segments: 8))",
+    )
+    .expect("parse");
+    let GeneratorSpec::Terrain(params) = terse else {
+        panic!("that is a terrain");
+    };
+    assert_eq!(params.tint, None, "an omitted tint is no tint");
+
+    let explicit_none = GeneratorSpec::Terrain(TerrainParams { tint: None, ..params });
+    assert_eq!(
+        terse.param_key(Quality::FULL),
+        explicit_none.param_key(Quality::FULL)
+    );
+    assert_eq!(
+        terse.generate(Quality::FULL).content_hash(),
+        explicit_none.generate(Quality::FULL).content_hash()
+    );
+
+    // And the other half: a tint is content, so it moves the key. Two patches
+    // differing only in colour must not collide in the cache and hand one
+    // scene the other's mesh.
+    let tinted = GeneratorSpec::Terrain(TerrainParams {
+        tint: Some(runt_core::TerrainTint::default()),
+        ..params
+    });
+    assert_ne!(terse.param_key(Quality::FULL), tinted.param_key(Quality::FULL));
+    assert_ne!(
+        terse.generate(Quality::FULL).content_hash(),
+        tinted.generate(Quality::FULL).content_hash()
+    );
+    assert_eq!(
+        terse.generate(Quality::FULL).positions,
+        tinted.generate(Quality::FULL).positions,
+        "a tint is colour, so the surface underneath it must not have moved"
+    );
+
+    // The tint's own thresholds are part of it, too.
+    let steeper = GeneratorSpec::Terrain(TerrainParams {
+        tint: Some(runt_core::TerrainTint {
+            steep_start_deg: 5.0,
+            ..runt_core::TerrainTint::default()
+        }),
+        ..params
+    });
+    assert_ne!(
+        tinted.param_key(Quality::FULL),
+        steeper.param_key(Quality::FULL)
     );
 }
 

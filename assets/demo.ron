@@ -27,7 +27,23 @@
                 lacunarity: 2.0,
                 gain: 0.5,
                 base_segments: 64,
-                color: Some((0.17, 0.21, 0.18)),
+                // `tint` supersedes the flat `color` this patch used to carry.
+                // Every stop is read from the analytic field (height + gradient),
+                // never from the meshed lattice, so the colouring is the same at
+                // every quality tier — the §9 rule applied to shading.
+                //
+                // Kept deliberately close to the old flat 0.17/0.21/0.18: the
+                // demo is a lighting and dedup showcase, and a technicolor ground
+                // would fight the props it exists to show off. The band is
+                // normalised by `amplitude` (1.2), which is a bound rather than
+                // a tight range, so real ground lands around t = 0.2..0.8 of it.
+                tint: Some((
+                    low_color: (0.14, 0.20, 0.15),   // moss, in the hollows
+                    high_color: (0.34, 0.32, 0.24),  // dry grass on the crests
+                    steep_color: (0.24, 0.22, 0.20), // grey-brown where it falls away
+                    steep_start_deg: 20.0,
+                    steep_full_deg: 38.0,
+                )),
             )),
         ),
         (
@@ -159,10 +175,17 @@
         )),
     ),
 
+    // The same three ambient colours light the surfaces *and* paint the
+    // background gradient (DESIGN §5): sky at the zenith, ground at the nadir,
+    // `horizon` where the view ray is level. Omitting `horizon` takes the
+    // sky/ground midpoint, which is what every scene written before the sky
+    // existed gets; this one names a slightly warmer, brighter band so the dark
+    // props have something to read against.
     lighting: (
         key_dir: (0.4, 1.0, 0.6),
         key_color: (0.74, 0.72, 0.68),
         sky_color: (0.30, 0.33, 0.40),
         ground_color: (0.14, 0.13, 0.12),
+        horizon: Some((0.34, 0.31, 0.30)),
     ),
 )

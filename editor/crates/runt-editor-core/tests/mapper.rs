@@ -56,6 +56,9 @@ fn terrain() -> GeneratorSpec {
         gain: 0.5,
         base_segments: 64,
         color: Some(Vec3::new(0.17, 0.21, 0.18)),
+        // Carried, not edited: `TerrainParamsDef` marks `tint` `#[reflect(ignore)]`,
+        // so it does not appear in the widget tree asserted below.
+        tint: None,
     })
 }
 

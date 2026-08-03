@@ -137,6 +137,14 @@ pub struct TerrainParamsDef {
     pub base_segments: u32,
     #[reflect(remote = OptVec3Def, @FieldRange::new(0.0, 1.0))]
     pub color: Option<glam::Vec3>,
+    // Declared (a remote wrapper must be field-for-field identical) but not
+    // reflected. Exposing it would want two more remote definitions —
+    // `TerrainTint` and `Option<TerrainTint>` — and a widget mapper that can
+    // walk a *struct* nested inside an enum variant, which the panel builder has
+    // never been asked to do. Same call the `Vec4` fields above make: declared,
+    // hashed and serialized correctly; simply not editable from a slider yet.
+    #[reflect(ignore)]
+    pub tint: Option<runt_mesh::TerrainTint>,
 }
 
 // ---------------------------------------------------------------------------

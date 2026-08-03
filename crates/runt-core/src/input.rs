@@ -170,6 +170,11 @@ pub use keyset::KeySet;
 
 /// One host input event. This is the *entire* engine input vocabulary; a replay
 /// trace is a `Vec<(tick, InputEvent)>` — see [`crate::trace`].
+///
+/// Postcard encodes a variant as its **index**, so new events are appended here
+/// rather than inserted: a trace file recorded before `TouchDrive` and
+/// `FocusLost` existed still reads back correctly. (The reverse does not hold,
+/// and a trace remains a debugging artifact rather than a save format.)
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum InputEvent {
     KeyDown(Key),
@@ -181,6 +186,25 @@ pub enum InputEvent {
     MouseButton { button: u8, pressed: bool },
     /// Wheel notches (positive = scroll up / zoom in).
     Wheel { dy: f32 },
+    /// Analog drive stick: `x` = right, `y` = forward, magnitude `0..=1`. What a
+    /// touch host's virtual stick produces (and what a gamepad would, later).
+    ///
+    /// **A level, not an edge.** Unlike every other event here it does not
+    /// describe a change; it sets a value that persists across ticks until
+    /// something sets it again, exactly as a physical stick's position does.
+    /// A host sends one when the value moves and a zero when the finger lifts.
+    /// See [`Input::drive`].
+    TouchDrive { dir: Vec2 },
+    /// The window stopped receiving input (alt-tab, a phone call, a browser tab
+    /// going to the background).
+    ///
+    /// It is an *event* rather than a method on [`Input`] so that everything a
+    /// run depends on arrives through one channel: a host that calls a method
+    /// out of band would produce runs a trace cannot describe. The engine's
+    /// response is [`Input::release_all`] — every held key and button is
+    /// released and the drive stick is zeroed, because the release the host
+    /// would otherwise deliver is never coming.
+    FocusLost,
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +226,8 @@ pub struct Input {
     buttons_released: u8,
     mouse_delta: Vec2,
     wheel: f32,
+    drive: Vec2,
+    drive_changed: bool,
 }
 
 impl Input {
@@ -215,13 +241,16 @@ impl Input {
             buttons_released: 0,
             mouse_delta: Vec2::ZERO,
             wheel: 0.0,
+            drive: Vec2::ZERO,
+            drive_changed: false,
         }
     }
 
     /// Apply one tick's worth of buffered events.
     ///
-    /// `held` persists across ticks; the edge sets and the analog accumulators
-    /// are per-tick and reset here. Called once per tick, by the tick loop only.
+    /// `held` and `drive` persist across ticks; the edge sets, the analog
+    /// accumulators and the drive's change flag are per-tick and reset here.
+    /// Called once per tick, by the tick loop only.
     pub fn begin_tick(&mut self, events: impl IntoIterator<Item = InputEvent>) {
         self.just_pressed.clear();
         self.just_released.clear();
@@ -229,6 +258,7 @@ impl Input {
         self.buttons_released = 0;
         self.mouse_delta = Vec2::ZERO;
         self.wheel = 0.0;
+        self.drive_changed = false;
 
         for ev in events {
             match ev {
@@ -263,12 +293,16 @@ impl Input {
                     }
                 }
                 InputEvent::Wheel { dy } => self.wheel += dy,
+                // Level, not edge: the last value in the tick is the value, and
+                // it stands until something replaces it.
+                InputEvent::TouchDrive { dir } => self.set_drive(dir),
+                InputEvent::FocusLost => self.release_all(),
             }
         }
     }
 
-    /// Drop every held key/button — for focus loss, where the host will never
-    /// deliver the matching release.
+    /// Drop every held key/button and centre the drive stick — for focus loss,
+    /// where the host will never deliver the matching release.
     pub fn release_all(&mut self) {
         for k in self.held.iter().collect::<Vec<_>>() {
             self.just_released.insert(k);
@@ -276,6 +310,27 @@ impl Input {
         self.held.clear();
         self.buttons_released |= self.buttons_held;
         self.buttons_held = 0;
+        self.set_drive(Vec2::ZERO);
+    }
+
+    /// Set the analog drive, normalising what a host sent.
+    ///
+    /// Anything non-finite becomes zero and anything past the unit circle is
+    /// pulled back onto it, so a sloppy host cannot inject a stick that pushes
+    /// harder than the keyboard — and the value a trace records is the value the
+    /// sim saw, already sanitised.
+    fn set_drive(&mut self, dir: Vec2) {
+        let dir = if !dir.is_finite() {
+            Vec2::ZERO
+        } else if dir.length_squared() > 1.0 {
+            dir.normalize()
+        } else {
+            dir
+        };
+        if dir != self.drive {
+            self.drive = dir;
+            self.drive_changed = true;
+        }
     }
 
     #[inline]
@@ -334,6 +389,23 @@ impl Input {
     #[inline]
     pub fn wheel(&self) -> f32 {
         self.wheel
+    }
+
+    /// The analog drive stick: `x` right, `y` forward, magnitude `0..=1`.
+    ///
+    /// Level state, like [`held`](Input::held) and unlike
+    /// [`mouse_delta`](Input::mouse_delta): it survives a tick with no events and
+    /// only changes when a [`InputEvent::TouchDrive`] says so.
+    #[inline]
+    pub fn drive(&self) -> Vec2 {
+        self.drive
+    }
+
+    /// Whether [`drive`](Input::drive) took a new value *this tick* — what the
+    /// trace recorder keys on, so a stick held still costs nothing per tick.
+    #[inline]
+    pub fn drive_changed(&self) -> bool {
+        self.drive_changed
     }
 }
 
@@ -427,5 +499,68 @@ mod tests {
         assert!(input.just_released(Key::D));
         assert!(!input.button_held(1));
         assert!(input.button_just_released(1));
+    }
+
+    #[test]
+    fn the_drive_stick_is_a_level_that_persists_across_ticks() {
+        let mut input = Input::new();
+        assert_eq!(input.drive(), Vec2::ZERO);
+
+        input.begin_tick([InputEvent::TouchDrive { dir: Vec2::new(0.5, -0.25) }]);
+        assert_eq!(input.drive(), Vec2::new(0.5, -0.25));
+        assert!(input.drive_changed());
+
+        // No events at all: unlike the mouse delta, the stick stays where it was.
+        input.begin_tick([]);
+        assert_eq!(input.drive(), Vec2::new(0.5, -0.25));
+        assert!(!input.drive_changed(), "nothing moved it, so nothing changed");
+
+        // Several in one tick: the last one wins.
+        input.begin_tick([
+            InputEvent::TouchDrive { dir: Vec2::new(0.1, 0.1) },
+            InputEvent::TouchDrive { dir: Vec2::new(0.0, 1.0) },
+        ]);
+        assert_eq!(input.drive(), Vec2::new(0.0, 1.0));
+
+        // Setting it to what it already was is not a change.
+        input.begin_tick([InputEvent::TouchDrive { dir: Vec2::new(0.0, 1.0) }]);
+        assert!(!input.drive_changed());
+
+        input.begin_tick([InputEvent::TouchDrive { dir: Vec2::ZERO }]);
+        assert_eq!(input.drive(), Vec2::ZERO);
+        assert!(input.drive_changed());
+    }
+
+    #[test]
+    fn a_sloppy_stick_is_clamped_rather_than_trusted() {
+        let mut input = Input::new();
+        input.begin_tick([InputEvent::TouchDrive { dir: Vec2::new(3.0, 4.0) }]);
+        assert!((input.drive().length() - 1.0).abs() < 1e-6, "{:?}", input.drive());
+
+        input.begin_tick([InputEvent::TouchDrive { dir: Vec2::new(f32::NAN, 0.0) }]);
+        assert_eq!(input.drive(), Vec2::ZERO);
+    }
+
+    #[test]
+    fn focus_loss_releases_everything_including_the_stick() {
+        let mut input = Input::new();
+        input.begin_tick([
+            InputEvent::KeyDown(Key::W),
+            InputEvent::MouseButton { button: 0, pressed: true },
+            InputEvent::TouchDrive { dir: Vec2::new(0.0, 1.0) },
+        ]);
+        assert!(input.held(Key::W));
+
+        input.begin_tick([InputEvent::FocusLost]);
+        assert!(!input.held(Key::W), "a key held across a focus loss would stick");
+        assert!(input.just_released(Key::W));
+        assert!(!input.button_held(0));
+        assert_eq!(input.drive(), Vec2::ZERO);
+        assert!(input.drive_changed());
+
+        // And the release is not re-announced on the tick after.
+        input.begin_tick([]);
+        assert!(!input.just_released(Key::W));
+        assert!(!input.drive_changed());
     }
 }

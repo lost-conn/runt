@@ -31,7 +31,26 @@
                 lacunarity: 2.0,
                 gain: 0.5,
                 base_segments: 96,
-                color: Some((0.16, 0.22, 0.17)),
+                // Height and slope drive the vertex colour, replacing the flat
+                // green this patch used to be. Both inputs come from the
+                // analytic field, so the colouring is quality-independent for
+                // the same reason the collision is (DESIGN §9) — a low tier
+                // draws fewer triangles of the *same* coloured surface.
+                //
+                // Tuned to keep the gold rings readable: hollows stay deep green
+                // (rings pop), crests go dry and sandy (which is where the map
+                // reads as having relief at all), and anything falling away goes
+                // grey-brown. The steepest slope anywhere on this seed is under
+                // 30° (see the seed note above), so the 18°→34° band means real
+                // rock shows on the walls without any part of the map turning
+                // uniformly stony.
+                tint: Some((
+                    low_color: (0.13, 0.22, 0.14),
+                    high_color: (0.46, 0.44, 0.31),
+                    steep_color: (0.30, 0.27, 0.24),
+                    steep_start_deg: 18.0,
+                    steep_full_deg: 34.0,
+                )),
             )),
         ),
         (
@@ -105,8 +124,10 @@
         // --- pickups: 12 rings, each 0.9 m above its own patch of ground ----
         //
         // `trigger: true` means the overlap is reported and nothing is pushed
-        // out — the ball rolls straight through and `collect_pickups` despawns
-        // it. The 0.7 collider is a little wider than the torus (0.5 + 0.18) so
+        // out — the ball rolls straight through and `collect_pickups` takes it
+        // (parking it out of sight rather than despawning it, so R can bring it
+        // back; see `Pickup::collected`). The 0.7 collider is a little wider
+        // than the torus (0.5 + 0.18) so
         // the take feels generous rather than pixel-perfect. `spin` also implies
         // an `Interpolated`, which the bob then rides.
         (
@@ -276,10 +297,23 @@
 
     // Late-afternoon key from the front-left, a cool sky ambient and a warm
     // bounce, so the gold pickups read against the green ground from any angle.
+    //
+    // The same three colours are the background gradient (DESIGN §5): cool blue
+    // overhead, falling to `horizon` where the view ray is level.
+    //
+    // The horizon stop is doing nearly all the work here and is authored on that
+    // basis. A follow camera sits *above* the ball looking slightly down, so the
+    // top of the frame is only ~25° above horizontal and the zenith colour is
+    // never actually on screen — the visible sky is the first quarter of the
+    // gradient. Left to the default (the sky/ground midpoint, ~0.24/0.26/0.29)
+    // that band comes out darker than the sunlit terrain, and the map's edge
+    // disappears into it. A pale warm haze is both what the eye expects at a
+    // horizon and what makes the silhouette of the far hills read.
     lighting: (
         key_dir: (0.45, 0.85, 0.35),
         key_color: (0.95, 0.88, 0.74),
         sky_color: (0.32, 0.38, 0.46),
         ground_color: (0.16, 0.14, 0.11),
+        horizon: Some((0.60, 0.58, 0.55)),
     ),
 )

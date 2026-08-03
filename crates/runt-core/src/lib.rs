@@ -29,14 +29,19 @@ pub mod reflect;
 pub mod registry;
 pub mod scene;
 pub mod sim;
+pub mod sky;
 pub mod trace;
+
+/// The background pass's WGSL. Standalone (no feature consts), unlike
+/// [`material::BASE_SHADER`].
+pub const SKY_SHADER: &str = include_str!("sky.wgsl");
 
 pub use cache::{CacheStats, CacheStore, GenCache, NoopCache};
 pub use camera::{Camera, FollowCamera};
 pub use draw::{DrawItem, FrameParams};
 pub use ecs::{
-    DemoScene, FixedSim, GeneratorRef, GlobalTransform, Interpolated, Lighting, MeshRef, PostSim,
-    QualityTier, Spin, Startup, StatusLine, TerrainSurface, TickCount, Transform,
+    default_horizon, DemoScene, FixedSim, GeneratorRef, GlobalTransform, Interpolated, Lighting,
+    MeshRef, PostSim, QualityTier, Spin, Startup, StatusLine, TerrainSurface, TickCount, Transform,
 };
 pub use engine::Engine;
 pub use gen::{GeneratorSpec, Shading};
@@ -47,13 +52,27 @@ pub use physics::{
     Velocity,
 };
 pub use registry::{GpuMesh, MeshHandle, MeshLibrary, MeshRegistry};
-pub use runt_mesh::{HeightField, MeshData as Mesh, Quality, TerrainParams};
+pub use runt_mesh::{HeightField, MeshData as Mesh, Quality, TerrainParams, TerrainTint};
 pub use scene::{load_scene, save_scene, SceneDesc, SceneError};
 pub use sim::{Sim, SimConfig, MAX_ACCUMULATED, TICK_DT};
 pub use trace::{InputTrace, TickEvent};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use cache::NativeDiskCache;
+
+/// The default `env_logger` filter every runt binary installs.
+///
+/// `info` for our own crates, and everything below wgpu turned down: `wgpu_hal`
+/// and `wgpu_core` narrate every Vulkan loader probe and every resource
+/// creation at `info`, `naga` announces each module it parses, and `calloop`
+/// (winit's Linux event loop) logs at `info` per iteration. A hundred lines of
+/// that before the first frame is how a real warning gets missed.
+///
+/// It is only a *default*: `RUST_LOG` still overrides it wholesale, so
+/// `RUST_LOG=wgpu_core=debug` gets the noise back when it is what you want.
+/// Validation layers are deliberately left on in debug builds — the filter
+/// silences the loader's chatter, not the checks.
+pub const DEFAULT_LOG_FILTER: &str = "info,wgpu_hal=warn,wgpu_core=warn,naga=warn,calloop=error";
 
 // ---------------------------------------------------------------------------
 // GPU vertex layout
@@ -100,16 +119,26 @@ pub fn interleave(mesh: &MeshData) -> Vec<Vertex> {
 // ---------------------------------------------------------------------------
 
 /// `@group(0)`: constants for the whole frame — camera and light rig.
+///
+/// Field order is duplicated in `shader.wgsl` and `sky.wgsl`; both restate this
+/// block verbatim.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct FrameUniform {
     pub view_proj: [[f32; 4]; 4],
+    /// The inverse, so the sky pass can rebuild a world-space view ray from a
+    /// pixel (see [`sky`]). Inverted once per frame on the CPU rather than per
+    /// pixel on the GPU — WGSL has no matrix inverse, and a hand-written one in
+    /// the fragment shader would be the most expensive thing in it.
+    pub inv_view_proj: [[f32; 4]; 4],
     /// `xyz`: direction towards the key light. `w`: padding (std140 wants the
     /// vec3 padded to 16 bytes anyway, so it may as well be explicit).
     pub light_dir: [f32; 4],
     pub light_color: [f32; 4],
     pub sky_color: [f32; 4],
     pub ground_color: [f32; 4],
+    /// The resolved [`Lighting::horizon`] — the sky's middle stop.
+    pub horizon_color: [f32; 4],
 }
 
 /// `@group(1)`: one slot per drawn entity, addressed with a dynamic offset.
@@ -131,6 +160,11 @@ const INITIAL_INSTANCE_CAPACITY: u32 = 32;
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// The color the frame is cleared to before the opaque pass.
+///
+/// Since the sky gradient (§5, [`sky`]) covers every pixel at the head of the
+/// pass, this is no longer what an empty frame looks like — it is the value the
+/// attachment is initialised to, and nothing but a broken sky pipeline can leave
+/// it visible.
 pub const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     r: 0.05,
     g: 0.06,
@@ -162,6 +196,11 @@ pub struct Renderer {
 
     frame_buffer: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
+
+    /// The background gradient's pipeline: one fullscreen triangle, `@group(0)`
+    /// only, no depth. Not in `pipelines` because it is not a material variant —
+    /// there is exactly one sky and it has no key to look up.
+    sky_pipeline: wgpu::RenderPipeline,
 
     /// One uniform buffer for every entity drawn this frame, indexed with
     /// dynamic offsets. `instance_stride` is the device's minimum uniform offset
@@ -251,6 +290,8 @@ impl Renderer {
             INITIAL_INSTANCE_CAPACITY,
         );
 
+        let sky_pipeline = create_sky_pipeline(&device, &frame_layout, target_format);
+
         Renderer {
             device,
             queue,
@@ -260,6 +301,7 @@ impl Renderer {
             instance_layout,
             frame_buffer,
             frame_bind_group,
+            sky_pipeline,
             instance_buffer,
             instance_bind_group,
             instance_stride,
@@ -384,8 +426,8 @@ impl Renderer {
     ///
     /// Frame anatomy: upload any newly-referenced geometry → write the frame
     /// uniform → write one instance slot per draw → compile any missing variant
-    /// → clear → walk the sorted list, changing pipeline and vertex buffers only
-    /// when the sort key says they changed.
+    /// → clear → paint the sky → walk the sorted list, changing pipeline and
+    /// vertex buffers only when the sort key says they changed.
     pub fn render(
         &mut self,
         view: &wgpu::TextureView,
@@ -434,6 +476,16 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.frame_bind_group, &[]);
+
+            // The sky goes first, with the depth test off, rather than last at
+            // the far plane. Drawing it last would save the one fullscreen
+            // overdraw that geometry then covers — but only in a frame that is
+            // mostly covered, and it would make the background depend on the
+            // depth attachment's clear value and on `LessEqual` semantics for
+            // correctness. The frame is being cleared anyway; one guaranteed
+            // fullscreen write is the cheap, unconditional version.
+            pass.set_pipeline(&self.sky_pipeline);
+            pass.draw(0..3, 0..1);
 
             let mut bound_variant: Option<MaterialVariant> = None;
             let mut bound_mesh: Option<MeshHandle> = None;
@@ -492,10 +544,12 @@ impl Renderer {
         let light = frame.lighting;
         let uniform = FrameUniform {
             view_proj: frame.view_proj.to_cols_array_2d(),
+            inv_view_proj: frame.view_proj.inverse().to_cols_array_2d(),
             light_dir: light.key_dir.extend(0.0).to_array(),
             light_color: light.key_color.extend(0.0).to_array(),
             sky_color: light.sky_color.extend(0.0).to_array(),
             ground_color: light.ground_color.extend(0.0).to_array(),
+            horizon_color: light.horizon().extend(0.0).to_array(),
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -570,6 +624,67 @@ impl Renderer {
             self.depth = Some((width, height, view));
         }
     }
+}
+
+/// Compile the background-gradient pipeline (DESIGN §5; see [`sky`]).
+///
+/// Its own layout, holding `@group(0)` alone: the sky has no material and no
+/// per-entity slot, and borrowing the opaque pass's two-group layout would mean
+/// binding an instance slot it never reads just to satisfy validation.
+fn create_sky_pipeline(
+    device: &wgpu::Device,
+    frame_layout: &wgpu::BindGroupLayout,
+    target_format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("sky pipeline layout"),
+        bind_group_layouts: &[Some(frame_layout)],
+        immediate_size: 0,
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("sky"),
+        source: wgpu::ShaderSource::Wgsl(SKY_SHADER.into()),
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sky gradient"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_sky"),
+            // No vertex buffer at all: the triangle comes from `vertex_index`.
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_sky"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            // The oversized triangle's winding is whatever the vertex_index
+            // trick produces; there is nothing to cull on a fullscreen pass.
+            cull_mode: None,
+            ..Default::default()
+        },
+        // The attachment is shared with the opaque pass, so the format has to
+        // match — but the sky neither tests nor writes depth.
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 /// Round `value` up to a multiple of `align`.

@@ -5,8 +5,33 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>runt ball</title>
     <style>
-      html, body { margin: 0; height: 100%; background: #0d1014; overflow: hidden; }
-      canvas { display: block; width: 100vw; height: 100vh; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: #0d1014;
+        overflow: hidden;
+        /* Phones treat a drag on the page as a scroll and a double tap as a
+           zoom, and they do it by *withholding* the touch events until the
+           gesture is disambiguated. `none` opts the whole page out, so every
+           touch reaches the canvas immediately and the virtual stick (see
+           `runt_app::input::VirtualStick`) is not fighting the browser for
+           the same finger. `overscroll-behavior` stops the pull-to-refresh
+           that survives `touch-action` on some Androids. */
+        touch-action: none;
+        overscroll-behavior: none;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+        touch-action: none;
+        /* No blue flash on tap, and no long-press "copy image" menu over a
+           control surface. */
+        -webkit-tap-highlight-color: transparent;
+        -webkit-touch-callout: none;
+      }
 
       /* The HUD. DESIGN §13 leaves text rendering open and says the cheapest
          candidate on web is a DOM overlay — so this is it, and the engine keeps
@@ -24,8 +49,13 @@
         color: #f0ece2;
         font: 500 14px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         letter-spacing: 0.02em;
-        /* Never eat a click meant for the canvas. */
+        /* Never eat a click — or a *touch* — meant for the canvas. The HUD sits
+           in the top-left corner, which is exactly where a left-handed player
+           plants a thumb, so `pointer-events: none` is load-bearing on a phone
+           rather than a nicety. `touch-action` is belt and braces for browsers
+           that route touches before hit-testing pointer-events. */
         pointer-events: none;
+        touch-action: none;
         user-select: none;
       }
       #runt-help {
@@ -36,6 +66,7 @@
         color: rgba(240, 236, 226, 0.45);
         font: 400 12px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         pointer-events: none;
+        touch-action: none;
         user-select: none;
       }
     </style>
@@ -43,6 +74,6 @@
   </head>
   <body>
     <div id="runt-status">runt ball</div>
-    <div id="runt-help">WASD / arrows to roll &middot; collect all 12 rings &middot; don't fall off</div>
+    <div id="runt-help">WASD / arrows or drag to roll &middot; R to restart &middot; collect all 12 rings &middot; don't fall off</div>
   </body>
 </html>

@@ -4,8 +4,9 @@
 //! host-side is what lets the editor (rinch `SurfaceEvent`s) and the player
 //! (winit) feed an engine that cannot tell them apart (DESIGN §2, §10).
 
+use glam::Vec2;
 use runt_core::Key;
-use winit::event::MouseButton;
+use winit::event::{MouseButton, TouchPhase};
 use winit::keyboard::KeyCode;
 
 /// Map a winit physical key code onto the engine's key vocabulary.
@@ -86,6 +87,138 @@ pub fn translate_button(button: MouseButton) -> u8 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Touch → virtual stick
+// ---------------------------------------------------------------------------
+
+/// Logical pixels of drag that read as full deflection.
+///
+/// 60 is about a thumb's comfortable travel without lifting: far enough that a
+/// deliberate half-push is reachable, near enough that a full push does not need
+/// the wrist. It is *logical*, not physical, so a 3× phone screen and a laptop
+/// touchpad feel the same.
+pub const STICK_RADIUS: f32 = 60.0;
+
+/// Logical pixels of slop before the stick reads at all. A finger resting on
+/// glass drifts a pixel or two; without this the ball creeps.
+pub const STICK_DEADZONE: f32 = 6.0;
+
+/// Smallest change worth sending to the engine.
+///
+/// A drag produces a touch event per frame, and most of them move the stick by
+/// less than a pixel. 1/64 of full deflection is finer than anything a player can
+/// aim and keeps a slow drag from writing an event into the trace every tick.
+pub const STICK_EPSILON: f32 = 1.0 / 64.0;
+
+/// A touch screen as an analog stick: the first finger down anchors the centre,
+/// and dragging away from that anchor deflects it.
+///
+/// This is the *whole* touch story, and it lives here — on the host side, next
+/// to the winit key table — because DESIGN §2 says a host translates events and
+/// does nothing else. The engine receives
+/// [`InputEvent::TouchDrive`](runt_core::InputEvent::TouchDrive) and cannot tell
+/// a finger from a gamepad.
+///
+/// **Multi-touch, v1:** the first finger down is the stick and every other one
+/// is ignored until it lifts. A second thumb for a camera or a jump is a
+/// deliberate addition later, not something to fall out of the id bookkeeping by
+/// accident.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VirtualStick {
+    /// `(finger id, anchor x, anchor y)` in logical pixels.
+    anchor: Option<(u64, f32, f32)>,
+    value: Vec2,
+}
+
+impl VirtualStick {
+    pub fn new() -> VirtualStick {
+        VirtualStick::default()
+    }
+
+    /// The deflection last sent, `x` right and `y` forward.
+    pub fn value(&self) -> Vec2 {
+        self.value
+    }
+
+    /// Whether a finger currently owns the stick.
+    pub fn is_active(&self) -> bool {
+        self.anchor.is_some()
+    }
+
+    /// Feed one winit touch. Returns the deflection to push at the engine, or
+    /// `None` when nothing moved enough to be worth an event.
+    ///
+    /// `x`/`y` are **logical** pixels with `y` growing downwards, as every
+    /// windowing system reports them; the returned `y` grows *forwards*, which
+    /// is why the sign flips below.
+    pub fn touch(&mut self, id: u64, phase: TouchPhase, x: f32, y: f32) -> Option<Vec2> {
+        match phase {
+            TouchPhase::Started => {
+                if self.anchor.is_none() {
+                    self.anchor = Some((id, x, y));
+                    // A fresh anchor is a centred stick. Report it only if the
+                    // engine is not already holding zero.
+                    return self.emit(Vec2::ZERO);
+                }
+                None // Someone else's finger; v1 ignores it.
+            }
+            TouchPhase::Moved => {
+                let (anchor, ax, ay) = self.anchor?;
+                if anchor != id {
+                    return None;
+                }
+                self.emit(deflection(x - ax, ay - y))
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                let (anchor, _, _) = self.anchor?;
+                if anchor != id {
+                    return None;
+                }
+                self.anchor = None;
+                self.emit(Vec2::ZERO)
+            }
+        }
+    }
+
+    /// Forget the finger and centre the stick — for focus loss, where the
+    /// `Ended` that would otherwise arrive never does.
+    ///
+    /// Returns nothing to push: the engine zeroes its own drive when it is told
+    /// the window lost focus (see
+    /// [`InputEvent::FocusLost`](runt_core::InputEvent::FocusLost)), and sending
+    /// a redundant `TouchDrive` alongside it would put a second event in every
+    /// trace for no gain.
+    pub fn reset(&mut self) {
+        self.anchor = None;
+        self.value = Vec2::ZERO;
+    }
+
+    fn emit(&mut self, next: Vec2) -> Option<Vec2> {
+        if (next - self.value).length() < STICK_EPSILON && next != Vec2::ZERO {
+            return None;
+        }
+        if next == self.value {
+            return None;
+        }
+        self.value = next;
+        Some(next)
+    }
+}
+
+/// Drag offset (right, forward) in logical pixels → stick deflection.
+///
+/// The dead zone is *subtracted* rather than clipped, so the stick starts from
+/// zero the moment it engages instead of jumping to `deadzone/radius`.
+fn deflection(right: f32, forward: f32) -> Vec2 {
+    let raw = Vec2::new(right, forward);
+    let length = raw.length();
+    if !length.is_finite() || length <= STICK_DEADZONE {
+        return Vec2::ZERO;
+    }
+    let travel = (length - STICK_DEADZONE) / (STICK_RADIUS - STICK_DEADZONE);
+    raw / length * travel.min(1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +248,106 @@ mod tests {
         assert_eq!(translate_button(MouseButton::Left), 0);
         assert_eq!(translate_button(MouseButton::Right), 1);
         assert_eq!(translate_button(MouseButton::Middle), 2);
+    }
+
+    // -- the virtual stick --------------------------------------------------
+
+    #[test]
+    fn a_drag_deflects_the_stick_from_where_it_started() {
+        let mut stick = VirtualStick::new();
+        // Anchoring does not move anything, and the engine is already at zero.
+        assert_eq!(stick.touch(1, TouchPhase::Started, 200.0, 400.0), None);
+        assert!(stick.is_active());
+
+        // Dragging up is *forward*, whatever the screen's y axis thinks.
+        let up = stick
+            .touch(1, TouchPhase::Moved, 200.0, 400.0 - STICK_RADIUS)
+            .expect("a full-radius drag is a change");
+        assert!((up.y - 1.0).abs() < 1e-5 && up.x.abs() < 1e-5, "{up:?}");
+
+        // Right is +x, and past the radius it saturates instead of overshooting.
+        let right = stick
+            .touch(1, TouchPhase::Moved, 200.0 + STICK_RADIUS * 4.0, 400.0)
+            .expect("change");
+        assert!((right.x - 1.0).abs() < 1e-5 && right.y.abs() < 1e-5, "{right:?}");
+        assert!(right.length() <= 1.0 + 1e-6);
+
+        // Lifting centres it.
+        let released = stick
+            .touch(1, TouchPhase::Ended, 200.0 + STICK_RADIUS * 4.0, 400.0)
+            .expect("a release must reach the engine");
+        assert_eq!(released, Vec2::ZERO);
+        assert!(!stick.is_active());
+    }
+
+    #[test]
+    fn the_dead_zone_holds_the_stick_still_and_then_starts_from_zero() {
+        let mut stick = VirtualStick::new();
+        stick.touch(7, TouchPhase::Started, 0.0, 0.0);
+        assert_eq!(
+            stick.touch(7, TouchPhase::Moved, STICK_DEADZONE * 0.5, 0.0),
+            None,
+            "a resting thumb must not drive the ball"
+        );
+        // Just past the dead zone the deflection is near zero, not a jump to
+        // deadzone/radius.
+        let nudge = stick
+            .touch(7, TouchPhase::Moved, STICK_DEADZONE + 1.0, 0.0)
+            .expect("change");
+        assert!(nudge.x > 0.0 && nudge.x < 0.05, "{nudge:?}");
+    }
+
+    #[test]
+    fn only_the_first_finger_drives() {
+        let mut stick = VirtualStick::new();
+        stick.touch(1, TouchPhase::Started, 100.0, 100.0);
+        let driven = stick.touch(1, TouchPhase::Moved, 100.0, 40.0).expect("change");
+
+        // A second finger anywhere, doing anything, changes nothing.
+        assert_eq!(stick.touch(2, TouchPhase::Started, 500.0, 500.0), None);
+        assert_eq!(stick.touch(2, TouchPhase::Moved, 500.0, 100.0), None);
+        assert_eq!(stick.touch(2, TouchPhase::Ended, 500.0, 100.0), None);
+        assert_eq!(stick.value(), driven, "the second finger moved the stick");
+
+        // …and the first one still owns it.
+        assert!(stick.touch(1, TouchPhase::Moved, 160.0, 100.0).is_some());
+    }
+
+    #[test]
+    fn a_cancelled_touch_centres_the_stick() {
+        let mut stick = VirtualStick::new();
+        stick.touch(3, TouchPhase::Started, 0.0, 0.0);
+        stick.touch(3, TouchPhase::Moved, 0.0, -STICK_RADIUS);
+        assert_eq!(
+            stick.touch(3, TouchPhase::Cancelled, 0.0, -STICK_RADIUS),
+            Some(Vec2::ZERO),
+            "a cancelled finger must not leave the ball driving forever"
+        );
+        assert!(!stick.is_active());
+    }
+
+    #[test]
+    fn a_sub_pixel_drag_does_not_write_an_event_per_frame() {
+        let mut stick = VirtualStick::new();
+        stick.touch(1, TouchPhase::Started, 0.0, 0.0);
+        stick.touch(1, TouchPhase::Moved, 30.0, 0.0).expect("change");
+        // A tenth of a pixel further: below `STICK_EPSILON` of deflection.
+        assert_eq!(stick.touch(1, TouchPhase::Moved, 30.1, 0.0), None);
+        // A whole radius further is not.
+        assert!(stick.touch(1, TouchPhase::Moved, 60.0, 0.0).is_some());
+    }
+
+    #[test]
+    fn reset_centres_without_emitting() {
+        // The engine zeroes its own drive on `FocusLost`, so the host has
+        // nothing to send — but it must not keep the stale anchor either.
+        let mut stick = VirtualStick::new();
+        stick.touch(1, TouchPhase::Started, 0.0, 0.0);
+        stick.touch(1, TouchPhase::Moved, 0.0, -STICK_RADIUS);
+        stick.reset();
+        assert!(!stick.is_active());
+        assert_eq!(stick.value(), Vec2::ZERO);
+        // A new finger starts clean rather than resuming the old deflection.
+        assert_eq!(stick.touch(2, TouchPhase::Started, 9.0, 9.0), None);
     }
 }

@@ -32,7 +32,11 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
-mod input;
+/// winit → engine translation: the key table, the button indices and the touch
+/// virtual stick. Public because it is the host's *interface* to the engine's
+/// input vocabulary — another host (or a test) may legitimately want the same
+/// mapping without going through [`run_with`].
+pub mod input;
 
 // ---------------------------------------------------------------------------
 // What to run
@@ -134,6 +138,9 @@ struct Host {
     start: web_time::Instant,
     /// winit reports absolute cursor positions; the engine wants deltas.
     last_cursor: Option<(f64, f64)>,
+    /// Touch screens as an analog stick (see [`input::VirtualStick`]). One per
+    /// window, because the anchor is a property of the surface being touched.
+    stick: input::VirtualStick,
     /// What the program is called when it has nothing to say.
     title: String,
     /// The last [`StatusLine`](runt_core::StatusLine) painted, so an unchanged
@@ -217,6 +224,7 @@ impl Host {
             engine,
             start: web_time::Instant::now(),
             last_cursor: None,
+            stick: input::VirtualStick::new(),
             title: run.title,
             shown_status: String::new(),
         };
@@ -362,9 +370,53 @@ impl Host {
                 self.engine.push_input(InputEvent::Wheel { dy });
                 true
             }
+            // Touch → virtual stick. winit delivers these on Android, iOS, Web
+            // and Windows touch screens, and the translation is identical on all
+            // of them because it happens in logical pixels.
+            WindowEvent::Touch(touch) => {
+                let scale = self.window.scale_factor().max(f64::MIN_POSITIVE);
+                let x = (touch.location.x / scale) as f32;
+                let y = (touch.location.y / scale) as f32;
+                if let Some(dir) = self.stick.touch(touch.id, touch.phase, x, y) {
+                    self.engine.push_input(InputEvent::TouchDrive { dir });
+                }
+                true
+            }
+            // Alt-tab, a backgrounded tab, a phone call: the key-up that would
+            // normally arrive never will, so tell the engine to let go of
+            // everything rather than leaving the ball rolling into the sunset.
+            WindowEvent::Focused(false) => {
+                self.stick.reset();
+                self.engine.push_input(InputEvent::FocusLost);
+                true
+            }
             _ => false,
         }
     }
+}
+
+/// Whether this event is the native quit gesture: Escape, pressed, not a repeat.
+///
+/// Native only, and checked *after* the event has been pushed at the engine, so
+/// a recording still contains the keystroke that ended it.
+///
+/// On the web there is nothing to exit — a page is closed, not quit — and
+/// browsers already give Escape a meaning (leaving fullscreen). So the wasm
+/// build simply lets the key through as an ordinary [`Key::Escape`].
+#[cfg(not(target_arch = "wasm32"))]
+fn quit_requested(event: &WindowEvent) -> bool {
+    matches!(
+        event,
+        WindowEvent::KeyboardInput {
+            event: winit::event::KeyEvent {
+                physical_key: PhysicalKey::Code(winit::keyboard::KeyCode::Escape),
+                state: ElementState::Pressed,
+                repeat: false,
+                ..
+            },
+            ..
+        }
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -458,7 +510,19 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(h) = self.host.as_mut() else {
             return;
         };
-        if h.handle_input(&event) {
+        let handled = h.handle_input(&event);
+        // Escape quits, natively. Deliberately after `handle_input`, so the
+        // engine has already seen the keystroke: `--record` writes its trace
+        // from `on_exit`, and a run that ends on a key the trace does not
+        // contain is a run that does not replay. This is also what closes the
+        // gap where the only way out was the window's close button.
+        #[cfg(not(target_arch = "wasm32"))]
+        if quit_requested(&event) {
+            log::info!("escape pressed; exiting");
+            event_loop.exit();
+            return;
+        }
+        if handled {
             return;
         }
         match event {

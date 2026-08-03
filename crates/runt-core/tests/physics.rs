@@ -495,6 +495,110 @@ fn a_diagonal_is_not_faster_than_a_straight_line() {
 }
 
 #[test]
+fn a_touch_stick_drives_the_ball_on_the_same_axes_as_the_keys() {
+    // The stick is camera-relative in exactly the way WASD is — it goes through
+    // the same `input_direction` and the same basis — so a host that translates
+    // a drag into `TouchDrive` needs no engine-side special case.
+    let entity = r#"(name: Some("ball"), generator: "marble",
+            transform: (translation: (0.0, 0.5, 0.0)),
+            ball: Some((radius: 0.5)),
+            ball_controller: Some((accel: 22.0)))"#;
+
+    // Full forward on the stick is full forward on W, to the bit.
+    let drive = |events: Vec<InputEvent>| {
+        let mut sim = sim_with(&scene_ron(0.0, entity));
+        let ball = ball_of(&sim);
+        // Sent once, not per tick: the stick is a level and holds itself.
+        for event in events {
+            sim.push_input(event);
+        }
+        run(&mut sim, 15);
+        velocity(&sim, ball)
+    };
+
+    let keyed = drive(vec![InputEvent::KeyDown(Key::W)]);
+    let stuck = drive(vec![InputEvent::TouchDrive {
+        dir: Vec2::new(0.0, 1.0),
+    }]);
+    assert_eq!(
+        vec3_bits(stuck),
+        vec3_bits(keyed),
+        "a full stick and a held W must be the same request"
+    );
+
+    // Half deflection is half the acceleration — the analog part actually being
+    // analog, which a key cannot express.
+    let half = drive(vec![InputEvent::TouchDrive {
+        dir: Vec2::new(0.0, 0.5),
+    }]);
+    let (fast, slow) = (
+        Vec3::new(keyed.x, 0.0, keyed.z).length(),
+        Vec3::new(half.x, 0.0, half.z).length(),
+    );
+    assert!(
+        (slow / fast - 0.5).abs() < 0.02,
+        "half a stick gave {slow} against a full {fast}"
+    );
+
+    // +x on the stick is the camera's right, matching Key::D.
+    let right = drive(vec![InputEvent::TouchDrive {
+        dir: Vec2::new(1.0, 0.0),
+    }]);
+    assert!(Vec3::new(right.x, 0.0, right.z).normalize().dot(Vec3::X) > 0.999);
+
+    // And the two sources add without ever out-accelerating either one: pushing
+    // the stick forward while holding W is one request, not two.
+    let both = drive(vec![
+        InputEvent::KeyDown(Key::W),
+        InputEvent::TouchDrive {
+            dir: Vec2::new(0.0, 1.0),
+        },
+    ]);
+    assert_eq!(vec3_bits(both), vec3_bits(keyed));
+}
+
+#[test]
+fn losing_focus_stops_the_ball_instead_of_leaving_it_driving() {
+    // The bug this exists to prevent: alt-tab with W held, the key-up is
+    // delivered to whatever took focus, and the ball keeps accelerating into the
+    // distance for as long as the window is in the background.
+    let entity = r#"(name: Some("ball"), generator: "marble",
+            transform: (translation: (0.0, 0.5, 0.0)),
+            ball: Some((radius: 0.5, rolling_friction: 0.0, air_damping: 0.0)),
+            ball_controller: Some((accel: 22.0)))"#;
+    let mut sim = sim_with(&scene_ron(0.0, entity));
+    let ball = ball_of(&sim);
+
+    sim.push_input(InputEvent::KeyDown(Key::W));
+    sim.push_input(InputEvent::TouchDrive {
+        dir: Vec2::new(1.0, 0.0),
+    });
+    run(&mut sim, 20);
+    let moving = velocity(&sim, ball);
+    assert!(moving.length() > 1.0, "the ball never got going: {moving:?}");
+
+    // Focus goes; the host never gets to send the KeyUp.
+    sim.push_input(InputEvent::FocusLost);
+    sim.tick();
+    assert!(
+        !sim.input().held(Key::W),
+        "the key is still held one tick after the focus loss"
+    );
+    assert_eq!(sim.input().drive(), Vec2::ZERO);
+
+    // A frictionless ball keeps its momentum — that is physics, not input — but
+    // it must stop *gaining* speed. Its horizontal speed has to stay flat.
+    let coasting = Vec3::new(velocity(&sim, ball).x, 0.0, velocity(&sim, ball).z).length();
+    run(&mut sim, 60);
+    let later = velocity(&sim, ball);
+    let now = Vec3::new(later.x, 0.0, later.z).length();
+    assert!(
+        (now - coasting).abs() < 1e-3,
+        "the ball is still being driven: {coasting} → {now}"
+    );
+}
+
+#[test]
 fn input_does_nothing_without_a_camera() {
     // Documented behaviour: the control basis is camera-relative, so a world
     // with no camera has no basis and the input term is exactly zero. The ball

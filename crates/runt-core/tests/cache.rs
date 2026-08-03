@@ -67,6 +67,7 @@ fn specs() -> Vec<GeneratorSpec> {
             gain: 0.5,
             base_segments: 32,
             color: Some(Vec3::new(0.17, 0.21, 0.18)),
+            tint: None,
         }),
     ]
 }

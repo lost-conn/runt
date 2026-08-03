@@ -18,7 +18,7 @@ pub mod primitives;
 pub mod terrain;
 
 pub use primitives::*;
-pub use terrain::{terrain, HeightField, TerrainParams};
+pub use terrain::{terrain, HeightField, TerrainParams, TerrainTint};
 
 #[cfg(test)]
 mod tests;

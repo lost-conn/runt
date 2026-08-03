@@ -213,6 +213,11 @@ impl TerrainSurface {
 /// The scene's light rig, uploaded verbatim into the per-frame uniform
 /// (DESIGN §5): one directional key light plus a sky/ground hemisphere ambient.
 ///
+/// The same three ambient colors are also what the background gradient is drawn
+/// from (see [`crate::sky`]), so a scene has one set of numbers describing its
+/// environment rather than two that can drift apart: brighten the sky ambient
+/// and the sky itself brightens with it.
+///
 /// A resource, not a component, because v1 has exactly one rig; when a scene
 /// wants more it becomes a component on a light entity and this stays as the
 /// fallback.
@@ -221,10 +226,15 @@ pub struct Lighting {
     /// Direction *towards* the key light. Normalized in the shader.
     pub key_dir: Vec3,
     pub key_color: Vec3,
-    /// Ambient seen by upward-facing normals.
+    /// Ambient seen by upward-facing normals, and the background at the zenith.
     pub sky_color: Vec3,
-    /// Ambient seen by downward-facing normals.
+    /// Ambient seen by downward-facing normals, and the background at the nadir.
     pub ground_color: Vec3,
+    /// The background color where the view ray is horizontal. `None` — the
+    /// default, and what every scene file written before the sky existed parses
+    /// to — is the midpoint of sky and ground, so an old rig gains a background
+    /// without gaining a decision. See [`Lighting::horizon`].
+    pub horizon: Option<Vec3>,
 }
 
 impl Default for Lighting {
@@ -237,8 +247,29 @@ impl Default for Lighting {
             key_color: Vec3::new(0.74, 0.72, 0.68),
             sky_color: Vec3::new(0.30, 0.33, 0.40),
             ground_color: Vec3::new(0.14, 0.13, 0.12),
+            horizon: None,
         }
     }
+}
+
+impl Lighting {
+    /// The resolved horizon color: whatever the rig says, or the sky/ground
+    /// midpoint when it says nothing.
+    #[inline]
+    pub fn horizon(&self) -> Vec3 {
+        self.horizon.unwrap_or_else(|| default_horizon(self.sky_color, self.ground_color))
+    }
+}
+
+/// The horizon color an unspecified [`Lighting::horizon`] resolves to.
+///
+/// A plain midpoint: it cannot be brighter than the brightest ambient (so no rig
+/// acquires a glow it did not ask for) and it is a pure function of two numbers
+/// the scene already had, which is what makes adding the field a non-event for
+/// existing files.
+#[inline]
+pub fn default_horizon(sky: Vec3, ground: Vec3) -> Vec3 {
+    (sky + ground) * 0.5
 }
 
 // ---------------------------------------------------------------------------

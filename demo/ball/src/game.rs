@@ -10,13 +10,13 @@
 //!
 //! ```text
 //! FixedSim (engine)                    …then (game, chained)
-//! update_overlap_messages              collect_pickups   trigger overlap → score
-//! spin                                 kill_plane        fell off → back to spawn
-//! integrate_balls                      game_clock        tick the timer
-//! resolve_overlaps  ──────────────┐    win_check         all collected → Won
-//! roll_spin                       └──▶ pickup_bob        cosmetic float
-//! follow_camera  ◀────────────────┐    update_status     the "HUD"
-//! propagate_transforms            └── (game runs in here)
+//! update_overlap_messages              restart_run       R → back to tick zero
+//! spin                                 collect_pickups   trigger overlap → score
+//! integrate_balls                      kill_plane        fell off → back to spawn
+//! resolve_overlaps  ──────────────┐    game_clock        tick the timer
+//! roll_spin                       ├──▶ win_check         all collected → Won
+//! follow_camera  ◀────────────────┤    pickup_bob        cosmetic float
+//! propagate_transforms            └──  update_status     the "HUD"
 //! advance_tick_count
 //! ```
 //!
@@ -52,7 +52,7 @@ use glam::Vec3;
 use runt_core::ecs::{FixedTick, TerrainSurface, TickCount};
 use runt_core::physics::{self, Ball, OverlapEvent, Velocity};
 use runt_core::scene::LoadedScene;
-use runt_core::{camera, Sim, StatusLine, Transform};
+use runt_core::{camera, Input, Key, Sim, StatusLine, Transform};
 
 /// The scene generator whose entities are collectibles. The one piece of shared
 /// vocabulary between `level1.ron` and this file.
@@ -79,6 +79,16 @@ pub const BOB_AMPLITUDE: f32 = 0.12;
 /// Bob angular rate, rad/s.
 pub const BOB_RATE: f32 = 2.2;
 
+/// Where a collected pickup is parked (see [`Pickup::collected`]).
+///
+/// Far enough below the map that nothing can reach it — the kill plane catches
+/// the ball a few metres under the terrain, and no collider is anywhere near
+/// here — and finite, so nothing downstream has to handle an infinity.
+pub const HIDDEN_Y: f32 = -1000.0;
+
+/// The key that starts the run over.
+pub const RESTART_KEY: Key = Key::R;
+
 // ---------------------------------------------------------------------------
 // Components and resources
 // ---------------------------------------------------------------------------
@@ -93,6 +103,26 @@ pub struct Pickup {
     /// Phase offset, radians. Derived from spawn index so twelve pickups do not
     /// pulse in unison.
     pub phase: f32,
+    /// Taken. The entity stays in the world, parked at [`HIDDEN_Y`].
+    ///
+    /// ## Why hidden rather than despawned
+    ///
+    /// Collecting used to `despawn` the pickup, which is tidier right up until
+    /// something wants it back — and [`restart_run`] does. A despawned entity is
+    /// *gone*: restoring it would mean re-spawning from the scene description,
+    /// which mints new `Entity` ids that [`LoadedScene::spawned`], the follow
+    /// camera and `GameState::player` all still hold the old values of. The
+    /// engine has a `Visibility` component reserved for exactly this (DESIGN §3)
+    /// but nothing implements it yet, so the cheapest correct thing is a flag
+    /// plus a park: the three systems that care ([`collect_pickups`],
+    /// [`pickup_bob`], [`restart_run`]) check it, and everything else sees an
+    /// ordinary entity that happens to be a kilometre underground.
+    ///
+    /// The cost is honest and small: twelve extra draws of a torus nobody can
+    /// see, and twelve extra sphere tests in the overlap pass. Both vanish the
+    /// day `Visibility` lands, and neither is a correctness risk — a parked
+    /// pickup is skipped by `collect_pickups` on the flag, not on its distance.
+    pub collected: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -213,6 +243,7 @@ pub fn setup(sim: &mut Sim) {
         sim.world_mut().entity_mut(entity).insert(Pickup {
             base_y,
             phase: index as f32 * 2.399_963_2,
+            collected: false,
         });
     }
 
@@ -236,6 +267,7 @@ pub fn setup(sim: &mut Sim) {
     // See the module docs for why the chain sits exactly here.
     sim.fixed_sim_mut().add_systems(
         (
+            restart_run,
             collect_pickups,
             kill_plane,
             game_clock,
@@ -289,25 +321,73 @@ fn terrain_floor(sim: &mut Sim) -> f32 {
 // Systems
 // ---------------------------------------------------------------------------
 
-/// `FixedSim`: a trigger overlap with a [`Pickup`] scores it and removes it.
+/// `FixedSim`: a trigger overlap with a [`Pickup`] scores it and hides it.
 ///
 /// Reads `MessageReader<OverlapEvent>` rather than
 /// [`Sim::overlaps`](runt_core::Sim::overlaps) because this is *in* the tick:
-/// the reader's cursor guarantees each overlap is seen exactly once, so a
-/// pickup cannot be scored twice even if the despawn had not already made that
-/// impossible.
+/// the reader's cursor guarantees each overlap is seen exactly once. The
+/// `collected` flag is the second guard, and the load-bearing one now that the
+/// entity survives being taken — see [`Pickup::collected`] for why it does.
 pub fn collect_pickups(
     mut reader: MessageReader<OverlapEvent>,
-    pickups: Query<(), With<Pickup>>,
+    mut pickups: Query<(&mut Pickup, &mut Transform)>,
     mut state: ResMut<GameState>,
-    mut commands: Commands,
 ) {
     for event in reader.read() {
-        if !event.trigger || pickups.get(event.other).is_err() {
+        if !event.trigger {
             continue; // A post, a wall, a bounce — not a collectible.
         }
+        let Ok((mut pickup, mut transform)) = pickups.get_mut(event.other) else {
+            continue;
+        };
+        if pickup.collected {
+            continue; // Already taken; a parked ring cannot be scored twice.
+        }
+        pickup.collected = true;
+        transform.translation.y = HIDDEN_Y;
         state.score += 1;
-        commands.entity(event.other).despawn();
+    }
+}
+
+/// `FixedSim` (head of the game chain): R starts the run over.
+///
+/// Everything the run accumulated lives in exactly two places — [`GameState`]
+/// and the pickups' `collected` flags — which is what makes this six lines
+/// rather than a reload. The ball goes back to the spawn with no velocity (a
+/// restart that kept it would fire the ball off the map, the same reason
+/// [`kill_plane`] zeroes it), every ring comes back to its authored height, and
+/// the clock returns to zero.
+///
+/// Chained *first*, so a restart on the same tick as an overlap resets before
+/// the overlap is scored rather than after it. It reads `just_pressed`, so
+/// holding R restarts once rather than sixty times a second, and it goes through
+/// the ordinary [`Input`] resource — which means a trace replays a restart like
+/// any other keystroke.
+pub fn restart_run(
+    input: Res<Input>,
+    mut state: ResMut<GameState>,
+    mut pickups: Query<(&mut Pickup, &mut Transform), Without<Ball>>,
+    mut balls: Query<(&mut Transform, &mut Velocity), With<Ball>>,
+) {
+    if !input.just_pressed(RESTART_KEY) {
+        return;
+    }
+
+    state.score = 0;
+    state.elapsed_ticks = 0;
+    state.resets = 0;
+    state.phase = Phase::Playing;
+
+    if let Ok((mut transform, mut velocity)) = balls.get_mut(state.player) {
+        transform.translation = state.spawn_point;
+        velocity.0 = Vec3::ZERO;
+    }
+
+    for (mut pickup, mut transform) in &mut pickups {
+        pickup.collected = false;
+        // `pickup_bob` will overwrite this on the same tick; setting it here
+        // means the restart is complete even if the bob is ever removed.
+        transform.translation.y = pickup.base_y;
     }
 }
 
@@ -363,6 +443,9 @@ pub fn pickup_bob(
 ) {
     let t = tick.0 as f32 * fixed.dt_secs;
     for (pickup, mut transform) in &mut pickups {
+        if pickup.collected {
+            continue; // Parked at HIDDEN_Y; bobbing it would float it back up.
+        }
         transform.translation.y = pickup.base_y + BOB_AMPLITUDE * (t * BOB_RATE + pickup.phase).sin();
     }
 }

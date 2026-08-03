@@ -299,7 +299,9 @@ pub fn update_overlap_messages(mut messages: ResMut<Messages<OverlapEvent>>) {
 ///
 /// **Input is camera-relative and therefore meaningless without a camera.**
 /// W/Up pushes along the camera's forward axis projected onto the XZ plane;
-/// A/D and Left/Right push along its right axis. With no camera entity in the
+/// A/D and Left/Right push along its right axis, and a touch host's virtual
+/// stick ([`Input::drive`]) pushes along the same two ([`input_direction`]
+/// combines them). With no camera entity in the
 /// world the input term is simply zero and the ball still falls, rolls and
 /// bounces — a headless physics test needs no camera, a playable scene does.
 ///
@@ -477,18 +479,33 @@ fn flatten(v: Vec3) -> Option<Vec3> {
     Vec3::new(v.x, 0.0, v.z).try_normalize()
 }
 
-/// WASD/arrows as `(right, forward)` in `[-1, 1]²`, normalized so a diagonal is
-/// not faster than a straight line.
-fn input_direction(input: &Input) -> glam::Vec2 {
+/// The drive request as `(right, forward)`, magnitude `0..=1`.
+///
+/// Two sources, one axis. WASD/arrows are digital, so a pressed key is *full*
+/// deflection and a diagonal is normalized (or it would be 1.41× as fast as a
+/// straight line). [`Input::drive`] — a touch host's virtual stick — is already
+/// analog and arrives clamped. They **add**, which is the behaviour a player
+/// expects when both are available: pushing the stick while holding W is not an
+/// error to arbitrate, it is one input, and the sum is pulled back onto the unit
+/// circle so the pair can never out-accelerate either one alone.
+pub fn input_direction(input: &Input) -> glam::Vec2 {
     let axis = |neg: [Key; 2], pos: [Key; 2]| {
         let held = |ks: [Key; 2]| ks.into_iter().any(|k| input.held(k));
         held(pos) as i32 as f32 - held(neg) as i32 as f32
     };
-    let raw = glam::Vec2::new(
+    let keys = glam::Vec2::new(
         axis([Key::A, Key::Left], [Key::D, Key::Right]),
         axis([Key::S, Key::Down], [Key::W, Key::Up]),
-    );
-    raw.try_normalize().unwrap_or(glam::Vec2::ZERO)
+    )
+    .try_normalize()
+    .unwrap_or(glam::Vec2::ZERO);
+
+    let combined = keys + input.drive();
+    if combined.length_squared() > 1.0 {
+        combined.normalize()
+    } else {
+        combined
+    }
 }
 
 // ---------------------------------------------------------------------------

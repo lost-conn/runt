@@ -122,6 +122,7 @@ fn walking_terrain_yields_the_expected_widget_tree() {
         gain: 0.5,
         base_segments: 64,
         color: Some(Vec3::new(0.17, 0.21, 0.18)),
+        tint: None,
     });
 
     let e: &dyn Enum = &spec;
@@ -145,6 +146,12 @@ fn walking_terrain_yields_the_expected_widget_tree() {
             "gain",
             "base_segments",
             "color",
+            // …and *not* `tint`. It carries `#[reflect(ignore)]` in
+            // `TerrainParamsDef`: reflecting an `Option<struct>` would want two
+            // more remote definitions and a widget mapper that can walk a struct
+            // nested in an enum variant. Serialization, hashing and the scene
+            // file all carry it; only the panel does not, yet. If that changes,
+            // this list is the thing that has to change with it.
         ]
     );
 

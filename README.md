@@ -58,6 +58,16 @@ cargo test --workspace
 
 WASD or the arrow keys roll the ball, camera-relative. Collect all twelve rings.
 Falling off the edge puts you back at the start; it costs time and nothing else.
+**R** starts the run over. **Esc** quits (native only — a web page is closed, not
+exited, and the browser already owns that key).
+
+On a touch screen, the first finger down anchors a **virtual stick**: drag away
+from where you touched and the ball rolls that way, analog, up to 60 logical
+pixels of travel for full tilt. It arrives at the engine as one
+`InputEvent::TouchDrive` per change and is combined with the keys, so a trace
+records a phone run exactly as it records a keyboard one. The translation lives
+in `runt_app::input::VirtualStick` and the engine cannot tell a finger from a
+gamepad.
 
 Score, elapsed time and the win are shown **without a text renderer** — DESIGN
 §13 leaves HUD text open, so the game writes a `StatusLine` resource and the host

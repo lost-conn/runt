@@ -473,6 +473,13 @@ pub struct LightingDesc {
     pub sky_color: Vec3,
     #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def))]
     pub ground_color: Vec3,
+    /// The background gradient's middle stop (DESIGN §5, [`crate::sky`]).
+    /// Absent — which is what every file written before the sky existed says —
+    /// means the sky/ground midpoint, so those files keep rendering the same
+    /// world with a background added and nothing else changed.
+    #[serde(default)]
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::OptVec3Def))]
+    pub horizon: Option<Vec3>,
 }
 
 impl Default for LightingDesc {
@@ -488,6 +495,7 @@ impl From<Lighting> for LightingDesc {
             key_color: l.key_color,
             sky_color: l.sky_color,
             ground_color: l.ground_color,
+            horizon: l.horizon,
         }
     }
 }
@@ -499,6 +507,7 @@ impl LightingDesc {
             key_color: self.key_color,
             sky_color: self.sky_color,
             ground_color: self.ground_color,
+            horizon: self.horizon,
         }
     }
 }

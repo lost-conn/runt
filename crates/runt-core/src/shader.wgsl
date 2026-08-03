@@ -5,13 +5,20 @@
 // prepended per variant by `runt_core::material::variant_source`. They are
 // `const bool`, so every disabled branch folds away at compile time.
 
+// Field order must match `runt_core::FrameUniform`, and `sky.wgsl` restates the
+// same block for the background pass.
 struct Frame {
     view_proj: mat4x4<f32>,
+    // Only the sky pass reads this one; it lives in the shared block because
+    // there is exactly one frame uniform and splitting it to save 64 bytes
+    // would cost a second bind group.
+    inv_view_proj: mat4x4<f32>,
     // xyz: direction *towards* the key light, world space. w: unused.
     light_dir: vec4<f32>,
     light_color: vec4<f32>,
     sky_color: vec4<f32>,
     ground_color: vec4<f32>,
+    horizon_color: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> frame: Frame;
 

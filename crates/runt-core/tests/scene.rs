@@ -490,6 +490,65 @@ fn loading_twice_replaces_rather_than_accumulates() {
 }
 
 #[test]
+fn a_lighting_rig_without_a_horizon_still_loads_and_gets_one() {
+    // The compatibility claim for the sky (DESIGN §5): the field is new, every
+    // scene file predating it omits it, and those files must keep working — with
+    // a background that resolves to the sky/ground midpoint rather than to
+    // black, a panic, or a parse error.
+    let mut sim = sim_with(
+        r#"(
+            generators: [(name: "b", spec: Cube(size: 1.0))],
+            entities: [(generator: "b")],
+            lighting: (
+                key_dir: (0.4, 1.0, 0.6),
+                key_color: (0.7, 0.7, 0.7),
+                sky_color: (0.3, 0.4, 0.5),
+                ground_color: (0.1, 0.1, 0.1),
+            ),
+        )"#,
+    );
+    let light = sim.lighting();
+    assert_eq!(light.horizon, None, "the file said nothing, so neither do we");
+    assert!(
+        light.horizon().abs_diff_eq(Vec3::new(0.2, 0.25, 0.3), 1e-6),
+        "resolved to {:?}",
+        light.horizon()
+    );
+    assert_eq!(
+        light.horizon(),
+        runt_core::default_horizon(light.sky_color, light.ground_color)
+    );
+    // And the value the renderer would use reaches the frame block.
+    let frame = sim.frame_params(1.0).expect("a camera");
+    assert_eq!(frame.lighting.horizon(), light.horizon());
+
+    // An explicit horizon is obeyed and survives a save/load round trip
+    // untouched — no rewriting a hand-authored colour into a computed one, and
+    // no inventing one where the author declined to.
+    let with_horizon = sim_with(
+        r#"(
+            generators: [(name: "b", spec: Cube(size: 1.0))],
+            entities: [(generator: "b")],
+            lighting: (
+                key_dir: (0.4, 1.0, 0.6),
+                key_color: (0.7, 0.7, 0.7),
+                sky_color: (0.3, 0.4, 0.5),
+                ground_color: (0.1, 0.1, 0.1),
+                horizon: Some((0.9, 0.6, 0.4)),
+            ),
+        )"#,
+    );
+    assert_eq!(with_horizon.lighting().horizon(), Vec3::new(0.9, 0.6, 0.4));
+
+    for sim in [&sim, &with_horizon] {
+        let saved = save_scene(sim.world()).expect("save");
+        let reparsed = scene::parse_scene(&saved).expect("re-parse");
+        assert_eq!(reparsed.lighting.horizon, sim.lighting().horizon);
+        assert_eq!(reparsed.lighting.to_lighting(), sim.lighting());
+    }
+}
+
+#[test]
 fn a_scene_ron_is_readable_when_written_back() {
     // Not a formatting shrine — just a guard that `save_scene` keeps producing
     // something a person would be willing to edit.

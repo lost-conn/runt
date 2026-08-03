@@ -18,7 +18,12 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // See `runt_core::DEFAULT_LOG_FILTER`: our own crates at info, wgpu's
+    // startup narration turned down. `RUST_LOG` overrides it.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(runt_core::DEFAULT_LOG_FILTER),
+    )
+    .init();
 
     if let Err(e) = native::run() {
         eprintln!("runt-ball: {e}\n{}", native::USAGE);

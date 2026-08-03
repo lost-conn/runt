@@ -14,7 +14,7 @@ use bevy_ecs::prelude::*;
 use glam::Vec3;
 
 use runt_ball::game::{GameState, Phase, Pickup};
-use runt_core::{Sim, StatusLine, Transform, Velocity};
+use runt_core::{InputEvent, Key, Sim, StatusLine, Transform, Velocity};
 
 fn state(sim: &Sim) -> GameState {
     sim.world().resource::<GameState>().clone()
@@ -30,6 +30,15 @@ fn pickups(sim: &mut Sim) -> Vec<Entity> {
     let mut found: Vec<Entity> = q.iter(sim.world()).collect();
     found.sort_unstable();
     found
+}
+
+/// Tap R and run the tick it lands on. Goes through the host's own input path
+/// (`push_input` → tick boundary), not through the resource, so what is under
+/// test is what a player's keyboard reaches.
+fn press_restart(sim: &mut Sim) {
+    sim.push_input(InputEvent::KeyDown(Key::R));
+    sim.tick();
+    sim.push_input(InputEvent::KeyUp(Key::R));
 }
 
 /// Put the ball on `target` and run one tick — the tick the overlap happens on,
@@ -68,10 +77,15 @@ fn collecting_every_pickup_wins_and_stops_the_clock() {
         assert!(now.score >= previous_score, "score must never go backwards");
         previous_score = now.score;
 
-        // Gone from the world, so it cannot be collected twice.
-        assert!(
-            sim.world().get::<Transform>(*pickup).is_none(),
-            "a collected pickup must be despawned"
+        // Out of play, so it cannot be collected twice. It is *hidden*, not
+        // despawned, so that `restart_run` has something to bring back — see
+        // `Pickup::collected` for the trade.
+        let taken = sim.world().get::<Pickup>(*pickup).expect("still an entity");
+        assert!(taken.collected, "a collected pickup must be flagged");
+        assert_eq!(
+            position(&sim, *pickup).y,
+            runt_ball::game::HIDDEN_Y,
+            "a collected pickup must be parked out of sight"
         );
 
         if now.won() && win_tick.is_none() {
@@ -229,6 +243,101 @@ fn the_bob_floats_the_pickups_without_moving_them() {
     let spread = offsets.iter().cloned().fold(f32::MIN, f32::max)
         - offsets.iter().cloned().fold(f32::MAX, f32::min);
     assert!(spread > amp, "all twelve pickups bob in unison (spread {spread})");
+}
+
+#[test]
+fn r_puts_the_run_back_to_tick_zero() {
+    // The restart has to undo *everything* a run accumulates, and the only two
+    // places a run accumulates anything are `GameState` and the pickups. So the
+    // test scores, falls, wins — and then demands the world it gets back is
+    // indistinguishable from a fresh one.
+    let mut sim = runt_ball::headless_sim();
+    let GameState {
+        player,
+        spawn_point,
+        kill_y,
+        total,
+        ..
+    } = state(&sim);
+    let all = pickups(&mut sim);
+    let bases: Vec<Vec3> = all.iter().map(|e| position(&sim, *e)).collect();
+
+    // A run with something to undo: three rings and a fall.
+    for pickup in all.iter().take(3) {
+        let target = position(&sim, *pickup);
+        take(&mut sim, player, target);
+    }
+    sim.world_mut()
+        .get_mut::<Transform>(player)
+        .expect("Transform")
+        .translation = Vec3::new(40.0, kill_y - 1.0, 40.0);
+    sim.tick();
+    for _ in 0..30 {
+        sim.tick();
+    }
+    let before = state(&sim);
+    assert_eq!(before.score, 3);
+    assert_eq!(before.resets, 1);
+    assert!(before.elapsed_ticks > 30);
+
+    press_restart(&mut sim);
+
+    let after = state(&sim);
+    assert_eq!(after.score, 0, "the score survived a restart");
+    assert_eq!(after.resets, 0, "the falls survived a restart");
+    assert_eq!(after.phase, Phase::Playing);
+    // The clock is reset by `restart_run` and then ticked once by `game_clock`,
+    // which is chained after it — one tick of play, exactly as at the start.
+    assert_eq!(after.elapsed_ticks, 1);
+    assert_eq!(after.total, total, "the ring count is level data, not run state");
+    assert_eq!(after.spawn_point, spawn_point);
+
+    assert_eq!(position(&sim, player), spawn_point, "the ball went home");
+    assert_eq!(
+        sim.world().get::<Velocity>(player).expect("Velocity").0,
+        Vec3::ZERO,
+        "a restart that kept the fall's velocity would fire the ball off the map"
+    );
+
+    // Every ring is back, at its own (x, z) and within a bob of its base.
+    for (i, entity) in all.iter().enumerate() {
+        let pickup = *sim.world().get::<Pickup>(*entity).expect("Pickup");
+        assert!(!pickup.collected, "ring {i} stayed collected");
+        let p = position(&sim, *entity);
+        assert_eq!((p.x, p.z), (bases[i].x, bases[i].z));
+        assert!(
+            (p.y - pickup.base_y).abs() <= runt_ball::game::BOB_AMPLITUDE + 1e-6,
+            "ring {i} came back at {p:?}, not near {}",
+            pickup.base_y
+        );
+    }
+
+    // And the restarted run is playable: the same twelve rings win it again.
+    for pickup in &all {
+        let target = position(&sim, *pickup);
+        take(&mut sim, player, target);
+    }
+    assert_eq!(state(&sim).phase, Phase::Won);
+    assert_eq!(state(&sim).score, total);
+
+    // Even from the win screen.
+    press_restart(&mut sim);
+    assert_eq!(state(&sim).phase, Phase::Playing);
+    assert_eq!(state(&sim).score, 0);
+}
+
+#[test]
+fn holding_r_restarts_once_rather_than_every_tick() {
+    // `just_pressed`, not `held`: an auto-repeating key must not pin the clock
+    // at zero for as long as a finger rests on it.
+    let mut sim = runt_ball::headless_sim();
+    sim.push_input(InputEvent::KeyDown(Key::R));
+    sim.tick();
+    assert_eq!(state(&sim).elapsed_ticks, 1);
+    for expected in 2..=5 {
+        sim.tick(); // R is still held, and no fresh press arrives.
+        assert_eq!(state(&sim).elapsed_ticks, expected, "the clock stalled");
+    }
 }
 
 #[test]

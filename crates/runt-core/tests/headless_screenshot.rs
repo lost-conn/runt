@@ -24,11 +24,26 @@
 //! captured at alpha ≈ 0 and the pose matches what the pre-ECS renderer drew
 //! from a raw time value.
 //!
+//! ## What "drawn" means now that there is a sky
+//!
+//! This test used to count pixels differing from `CLEAR_COLOR` and demand ≥5%.
+//! Since the background gradient (DESIGN §5, `runt_core::sky`) covers every
+//! pixel at the head of the pass, that measure now reads ~100% on any frame at
+//! all — including a frame with no geometry in it, which is exactly the failure
+//! it existed to catch. So the reference moved: a pixel counts as *geometry*
+//! when it differs from the sky this camera would paint at that pixel,
+//! computed on the CPU by [`runt_core::sky::color_at`].
+//!
+//! That makes the coverage check strictly stronger than the old one (a black
+//! screen and a sky-only screen both fail it), and it pays for itself twice: a
+//! second assertion holds real sky pixels against the same model, so the WGSL
+//! and its Rust twin cannot drift apart without a red test.
+//!
 //! Set `RUNT_SCREENSHOT_DUMP=/path/frame.rgba` to write the raw
 //! `SIZE × SIZE × 4` pixels for eyeballing.
 
-use glam::{Mat4, Vec3};
-use runt_core::Engine;
+use glam::{Mat4, Vec2, Vec3};
+use runt_core::{Engine, Lighting};
 
 const SIZE: u32 = 512;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -48,10 +63,34 @@ fn align_256(n: u32) -> u32 {
     n.div_ceil(256) * 256
 }
 
-/// One rendered frame: pixels plus the camera matrix they were drawn with.
+/// One rendered frame: pixels plus the camera matrix and light rig they were
+/// drawn with — everything needed to say what each pixel *should* be.
 struct Frame {
     pixels: Vec<u8>,
     view_proj: Mat4,
+    lighting: Lighting,
+}
+
+impl Frame {
+    /// The RGB at a pixel, `0..=1`.
+    fn pixel(&self, x: u32, y: u32) -> [f32; 3] {
+        let i = (y as usize * SIZE as usize + x as usize) * 4;
+        [
+            self.pixels[i] as f32 / 255.0,
+            self.pixels[i + 1] as f32 / 255.0,
+            self.pixels[i + 2] as f32 / 255.0,
+        ]
+    }
+
+    /// The background color the sky pass should have painted at a pixel — the
+    /// CPU twin of `sky.wgsl`, evaluated at the pixel centre.
+    fn sky_at(&self, x: u32, y: u32) -> [f32; 3] {
+        let ndc = Vec2::new(
+            (x as f32 + 0.5) / SIZE as f32 * 2.0 - 1.0,
+            1.0 - (y as f32 + 0.5) / SIZE as f32 * 2.0,
+        );
+        runt_core::sky::color_at(&self.lighting, self.view_proj.inverse(), ndc).to_array()
+    }
 }
 
 impl Frame {
@@ -139,11 +178,11 @@ fn render_headless() -> Option<Frame> {
     );
     // The same camera the frame is about to be drawn with — the probes below
     // must not be allowed to disagree with the renderer about where things are.
-    let view_proj = engine
+    let frame_params = engine
         .sim_mut()
         .frame_params(1.0)
-        .expect("the demo spawns a camera")
-        .view_proj;
+        .expect("the demo spawns a camera");
+    let (view_proj, lighting) = (frame_params.view_proj, frame_params.lighting);
     engine.render(&view, SIZE, SIZE);
 
     let unpadded_row = SIZE * 4;
@@ -199,7 +238,11 @@ fn render_headless() -> Option<Frame> {
         println!("wrote {SIZE}x{SIZE} RGBA8 to {path}");
     }
 
-    Some(Frame { pixels, view_proj })
+    Some(Frame {
+        pixels,
+        view_proj,
+        lighting,
+    })
 }
 
 #[test]
@@ -213,18 +256,55 @@ fn headless_render_draws_geometry() {
 
     assert_eq!(pixels.len(), (SIZE * SIZE * 4) as usize, "full frame read back");
 
-    // runt_core::CLEAR_COLOR in 8-bit, the value every untouched pixel holds.
+    // -- the sky is there, and it is the gradient we think it is -------------
+    //
+    // The demo camera looks slightly down at the origin, so the top rows of the
+    // frame are clear of every prop and of the terrain patch: whatever is there
+    // is the background. It must match the CPU model — which fails loudly if the
+    // sky pass did not run (the pixels would be CLEAR_COLOR), if the frame
+    // uniform's inverse matrix is wrong (the gradient would not line up), or if
+    // `sky.wgsl` and `sky.rs` ever stop agreeing.
     let clear = [
-        (runt_core::CLEAR_COLOR.r * 255.0).round() as u8,
-        (runt_core::CLEAR_COLOR.g * 255.0).round() as u8,
-        (runt_core::CLEAR_COLOR.b * 255.0).round() as u8,
+        runt_core::CLEAR_COLOR.r as f32,
+        runt_core::CLEAR_COLOR.g as f32,
+        runt_core::CLEAR_COLOR.b as f32,
     ];
-    let tolerance = 2i32;
+    let mut worst = 0f32;
+    for x in (0..SIZE).step_by(8) {
+        for y in [1u32, 5, 12] {
+            let got = frame.pixel(x, y);
+            let want = frame.sky_at(x, y);
+            let error = (0..3)
+                .map(|c| (got[c] - want[c]).abs())
+                .fold(0.0f32, f32::max);
+            worst = worst.max(error);
+        }
+    }
+    println!("sky vs. model: worst channel error {worst:.4}");
+    assert!(
+        worst <= 2.0 / 255.0,
+        "the rendered sky drifted from `runt_core::sky` by {worst} (>1 LSB of RGBA8)"
+    );
+    let corner = frame.pixel(2, 2);
+    assert!(
+        (0..3).any(|c| (corner[c] - clear[c]).abs() > 2.0 / 255.0),
+        "the top of the frame is still CLEAR_COLOR, so nothing painted the sky"
+    );
+
+    // -- geometry covers a real part of the frame ----------------------------
+    //
+    // "Not the clear color" is worthless now that the sky fills every pixel;
+    // "not the *sky* at this pixel" is the same claim the old test was making,
+    // measured against a background that is no longer flat.
+    let tolerance = 3.0 / 255.0;
     let mut drawn = 0usize;
-    for px in pixels.chunks_exact(4) {
-        let differs = (0..3).any(|c| (px[c] as i32 - clear[c] as i32).abs() > tolerance);
-        if differs {
-            drawn += 1;
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let got = frame.pixel(x, y);
+            let want = frame.sky_at(x, y);
+            if (0..3).any(|c| (got[c] - want[c]).abs() > tolerance) {
+                drawn += 1;
+            }
         }
     }
 
@@ -238,11 +318,17 @@ fn headless_render_draws_geometry() {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    println!("headless frame {SIZE}x{SIZE} t={TIME}: {drawn}/{total} non-clear pixels ({:.1}%), fnv1a=0x{hash:016x}", frac * 100.0);
+    println!("headless frame {SIZE}x{SIZE} t={TIME}: {drawn}/{total} non-sky pixels ({:.1}%), fnv1a=0x{hash:016x}", frac * 100.0);
 
     assert!(
         frac >= 0.05,
         "expected geometry to cover >=5% of the frame, got {:.2}% ({drawn}/{total})",
+        frac * 100.0
+    );
+    assert!(
+        frac <= 0.98,
+        "the whole frame counts as geometry ({:.2}%), which means the sky model \
+         and the rendered background disagree everywhere",
         frac * 100.0
     );
 

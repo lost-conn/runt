@@ -217,6 +217,7 @@ fn demo_params() -> TerrainParams {
         gain: f.gain,
         base_segments: 64,
         color: Some(Vec3::new(0.17, 0.21, 0.18)),
+        tint: None,
     }
 }
 
@@ -407,6 +408,110 @@ fn terrain_quality_scales_segments_with_a_floor() {
     // DESIGN §11: scale down, never fail. An absurd tier still meshes.
     assert_eq!(params.segments(Quality(0.0)), 1);
     assert!(!terrain(&params, Quality(0.0)).is_empty());
+}
+
+// --- tints (DESIGN §5's vertex-color × albedo look) ------------------------
+
+fn demo_tint() -> TerrainTint {
+    TerrainTint {
+        low_color: Vec3::new(0.20, 0.40, 0.18),
+        high_color: Vec3::new(0.70, 0.62, 0.44),
+        steep_color: Vec3::new(0.40, 0.36, 0.32),
+        steep_start_deg: 20.0,
+        steep_full_deg: 42.0,
+    }
+}
+
+#[test]
+fn an_absent_tint_generates_the_mesh_byte_for_byte() {
+    // The compatibility claim in one assertion: every scene written before tints
+    // existed parses to `tint: None` and must produce the *same* geometry, down
+    // to the content hash the mesh registry and the on-disk cache are keyed on.
+    let plain = demo_params();
+    assert_eq!(plain.tint, None, "the default really is None");
+    let a = terrain(&plain, Quality::FULL);
+    let b = terrain(&TerrainParams { ..plain }, Quality::FULL);
+    assert_eq!(a, b);
+    assert_eq!(a.content_hash(), b.content_hash());
+    // The flat `color` is still exactly what lands on every vertex.
+    for c in &a.colors {
+        assert_eq!(*c, Vec3::new(0.17, 0.21, 0.18));
+    }
+
+    // …and a tint really does change it, so the above is not vacuous.
+    let tinted = terrain(
+        &TerrainParams { tint: Some(demo_tint()), ..plain },
+        Quality::FULL,
+    );
+    assert_eq!(tinted.positions, a.positions, "a tint is colour, not shape");
+    assert_ne!(tinted.colors, a.colors);
+    assert_ne!(tinted.content_hash(), a.content_hash());
+}
+
+#[test]
+fn a_tint_is_a_property_of_the_field_not_the_tessellation() {
+    // The same rule DESIGN §9 puts on collision, applied to colour: a vertex at
+    // a given (x, z) is the same colour whichever quality meshed it. Segment
+    // counts of 8 and 32 share every 4th lattice line, so the coarse mesh's
+    // vertices all reappear in the fine one.
+    let params = TerrainParams {
+        base_segments: 32,
+        tint: Some(demo_tint()),
+        ..demo_params()
+    };
+    let coarse = terrain(&params, Quality(0.25));
+    let fine = terrain(&params, Quality(1.0));
+    assert_eq!(coarse.positions.len(), 9 * 9);
+    assert_eq!(fine.positions.len(), 33 * 33);
+
+    let mut matched = 0;
+    for (p, c) in coarse.positions.iter().zip(&coarse.colors) {
+        let (q, d) = fine
+            .positions
+            .iter()
+            .zip(&fine.colors)
+            .find(|(q, _)| q.x == p.x && q.z == p.z)
+            .expect("every coarse lattice point is also a fine one");
+        assert_eq!(q.y.to_bits(), p.y.to_bits());
+        assert_eq!(d.to_array(), c.to_array(), "colour drifted with quality at {p:?}");
+        matched += 1;
+    }
+    assert_eq!(matched, 81, "the coarse lattice was not fully covered");
+}
+
+#[test]
+fn a_tint_reads_height_then_slope() {
+    let tint = demo_tint();
+    let amplitude = 2.0;
+    let flat = Vec2::ZERO;
+
+    // Height band: the ends of the amplitude are the authored colours exactly,
+    // and it is monotonic in between.
+    assert!(tint.sample(-amplitude, flat, amplitude).abs_diff_eq(tint.low_color, 1e-6));
+    assert!(tint.sample(amplitude, flat, amplitude).abs_diff_eq(tint.high_color, 1e-6));
+    let mid = tint.sample(0.0, flat, amplitude);
+    assert!(mid.abs_diff_eq((tint.low_color + tint.high_color) * 0.5, 1e-6));
+
+    // Past the amplitude the band clamps rather than extrapolating past the
+    // authored colours.
+    assert!(tint
+        .sample(10.0 * amplitude, flat, amplitude)
+        .abs_diff_eq(tint.high_color, 1e-6));
+
+    // Slope band: flat ground is untouched, a wall is fully `steep_color`, and
+    // an angle inside the band is somewhere between the two.
+    let wall = Vec2::new((60f32).to_radians().tan(), 0.0);
+    assert!(tint.sample(0.0, wall, amplitude).abs_diff_eq(tint.steep_color, 1e-6));
+    let leaning = Vec2::new((31f32).to_radians().tan(), 0.0);
+    let partial = tint.sample(0.0, leaning, amplitude);
+    assert!(partial.distance(mid) > 1e-3 && partial.distance(tint.steep_color) > 1e-3);
+
+    // The slope is read from |∇h|, so which way the hill faces cannot matter.
+    let mirrored = tint.sample(0.0, Vec2::new(0.0, -leaning.x), amplitude);
+    assert!(partial.abs_diff_eq(mirrored, 1e-6));
+
+    // A zero-amplitude field has no band; it must not divide by zero.
+    assert!(tint.sample(0.0, flat, 0.0).is_finite());
 }
 
 #[test]

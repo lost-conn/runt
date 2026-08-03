@@ -202,6 +202,98 @@ pub fn normal_from_gradient(grad: Vec2) -> Vec3 {
     Vec3::new(-grad.x, 1.0, -grad.y).normalize()
 }
 
+/// Height- and slope-driven vertex color for a terrain patch.
+///
+/// Every input is read from the **analytic field** — the height and the gradient
+/// at one `(x, z)` — so the color of a point is a property of the surface, not of
+/// the tessellation that happened to sample it. That is the same rule DESIGN §9
+/// imposes on collision, applied to shading: two quality tiers that both put a
+/// vertex at the same `(x, z)` give it the same color.
+///
+/// ## Why the height band is the amplitude, not the patch's min/max
+///
+/// The obvious normalisation — "lerp between the lowest and highest vertex in
+/// this mesh" — is a trap. The extremes of a *sampled* lattice move when the
+/// lattice does, so `Quality(0.3)` and `Quality(1.0)` would disagree about what
+/// counts as "high" and the same hill would change colour with the LOD. The
+/// field's own [`amplitude`](HeightField::amplitude) is resolution-independent
+/// and is what this normalises by instead. It is a bound rather than a tight
+/// range (the octave weights keep real terrain well inside it), so a tint that
+/// wants strong contrast should push `low_color`/`high_color` further apart than
+/// it looks like it needs to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct TerrainTint {
+    /// Colour at the bottom of the amplitude band (`h = −amplitude`).
+    pub low_color: Vec3,
+    /// Colour at the top of the amplitude band (`h = +amplitude`).
+    pub high_color: Vec3,
+    /// Colour a fully steep face takes, whatever its height.
+    pub steep_color: Vec3,
+    /// Slope, in degrees from horizontal, where `steep_color` begins to show.
+    #[cfg_attr(feature = "serde", serde(default = "default_steep_start"))]
+    pub steep_start_deg: f32,
+    /// Slope, in degrees, at which `steep_color` has fully taken over.
+    #[cfg_attr(feature = "serde", serde(default = "default_steep_full"))]
+    pub steep_full_deg: f32,
+}
+
+#[cfg(feature = "serde")]
+fn default_steep_start() -> f32 {
+    25.0
+}
+
+#[cfg(feature = "serde")]
+fn default_steep_full() -> f32 {
+    45.0
+}
+
+impl Default for TerrainTint {
+    fn default() -> TerrainTint {
+        TerrainTint {
+            low_color: Vec3::new(0.24, 0.34, 0.20),
+            high_color: Vec3::new(0.62, 0.58, 0.44),
+            steep_color: Vec3::new(0.38, 0.35, 0.32),
+            steep_start_deg: 25.0,
+            steep_full_deg: 45.0,
+        }
+    }
+}
+
+impl TerrainTint {
+    /// The vertex colour for one sample of the field: `h` picks a point on the
+    /// low→high band, then the slope implied by `gradient` fades towards
+    /// `steep_color`.
+    ///
+    /// Pure, and a function of `(height, gradient, amplitude)` only — see the
+    /// type docs for why that last argument is the field's amplitude and not the
+    /// mesh's measured extremes.
+    pub fn sample(&self, height: f32, gradient: Vec2, amplitude: f32) -> Vec3 {
+        let t = if amplitude > 0.0 {
+            (0.5 + 0.5 * height / amplitude).clamp(0.0, 1.0)
+        } else {
+            // A flat field has no band to place anything on; take the midpoint
+            // rather than divide by zero.
+            0.5
+        };
+        let base = self.low_color.lerp(self.high_color, t);
+
+        // |∇h| is rise over run, so its arctangent is the slope angle exactly —
+        // no need to build the normal first.
+        let degrees = gradient.length().atan().to_degrees();
+        let span = self.steep_full_deg - self.steep_start_deg;
+        let raw = if span > 0.0 {
+            ((degrees - self.steep_start_deg) / span).clamp(0.0, 1.0)
+        } else {
+            // Degenerate band: a hard step at `steep_full_deg`.
+            (degrees >= self.steep_full_deg) as i32 as f32
+        };
+        // Smoothstep, so the rock band has no contour line running through it.
+        let steep = raw * raw * (3.0 - 2.0 * raw);
+        base.lerp(self.steep_color, steep)
+    }
+}
+
 /// Generator params for [`terrain`] — the serialized, hashed, scene-file form
 /// (DESIGN §6). The field-relevant subset is extracted by [`TerrainParams::field`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -220,6 +312,11 @@ pub struct TerrainParams {
     /// Flat vertex color for the whole patch. `None` leaves it white.
     #[cfg_attr(feature = "serde", serde(default))]
     pub color: Option<Vec3>,
+    /// Height/slope-driven vertex color. Supersedes [`color`](Self::color) where
+    /// it is present; `None` — the default, so every scene written before this
+    /// existed still generates byte-identical geometry — falls back to it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tint: Option<TerrainTint>,
 }
 
 impl Default for TerrainParams {
@@ -234,6 +331,7 @@ impl Default for TerrainParams {
             gain: 0.5,
             base_segments: 64,
             color: None,
+            tint: None,
         }
     }
 }
@@ -259,7 +357,8 @@ impl TerrainParams {
 }
 
 /// Mesh a terrain patch: a grid over `params.size`, centered on the origin,
-/// displaced by `h` and shaded by the field gradient.
+/// displaced by `h`, shaded by the field gradient and (optionally) tinted by
+/// height and slope — see [`TerrainTint`].
 ///
 /// Winding and UV convention match [`plane`](super::plane) exactly, so swapping a
 /// flat ground plane for terrain changes nothing downstream. Segment count is the
@@ -289,7 +388,12 @@ pub fn terrain(params: &TerrainParams, quality: Quality) -> MeshData {
             m.positions.push(Vec3::new(x, h, z));
             m.normals.push(normal_from_gradient(grad));
             m.uvs.push(Vec2::new(fx, fz));
-            m.colors.push(color);
+            // No tint is the exact expression this line used before tints
+            // existed, so an untinted patch is byte-identical to what it was.
+            m.colors.push(match params.tint {
+                Some(tint) => tint.sample(h, grad, params.amplitude),
+                None => color,
+            });
         }
     }
 

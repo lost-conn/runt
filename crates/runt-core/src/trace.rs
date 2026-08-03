@@ -163,6 +163,14 @@ impl std::error::Error for TraceError {}
 /// fresh press. Emitting them in one fixed order would replay one of the two
 /// cases into the wrong held state and quietly desynchronise everything after
 /// it — `tests/trace.rs` covers both.
+///
+/// ## What a focus loss looks like in a trace
+///
+/// [`InputEvent::FocusLost`] is never written out, because by the time this runs
+/// it has already become ordinary state: the keys it dropped appear as `KeyUp`s
+/// and the stick it centred as a `TouchDrive` of zero. Replaying those
+/// reproduces the tick exactly, which is the property that matters — the trace
+/// records what the tick *saw*, not what the window manager did.
 pub fn record(mut trace: ResMut<InputTrace>, tick: Res<TickCount>, input: Res<Input>) {
     let now = tick.0;
     for key in crate::input::Key::ALL {
@@ -220,6 +228,12 @@ pub fn record(mut trace: ResMut<InputTrace>, tick: Res<TickCount>, input: Res<In
     }
     if input.wheel() != 0.0 {
         trace.push(now, InputEvent::Wheel { dy: input.wheel() });
+    }
+    // The stick is a *level* (see [`InputEvent::TouchDrive`]), so what a trace
+    // has to carry is the ticks it moved on — a value that has not changed is
+    // already in the replayed `Input` from the tick that set it.
+    if input.drive_changed() {
+        trace.push(now, InputEvent::TouchDrive { dir: input.drive() });
     }
 }
 

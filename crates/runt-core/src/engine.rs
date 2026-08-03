@@ -116,7 +116,9 @@ impl Engine {
                 log::warn!("no camera entity in the world; nothing will be drawn");
                 self.warned_no_camera = true;
             }
-            // Still clear, so a host sees a blank frame rather than garbage.
+            // Still render, so a host sees an empty sky rather than garbage.
+            // With no camera there is no view ray to speak of, so the gradient
+            // resolves to a flat horizon-colored frame.
             self.renderer.render(
                 view,
                 width,

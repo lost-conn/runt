@@ -340,7 +340,15 @@ fn app() -> NodeHandle {
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // `runt_core::DEFAULT_LOG_FILTER` rather than a bare "info": debug builds
+    // keep wgpu's Vulkan validation layers on (they are worth having), but the
+    // loader and `wgpu_core` narrate every probe and every resource at info,
+    // which buries the scene-load lines and the warnings that matter. `RUST_LOG`
+    // still overrides the whole thing.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(runt_core::DEFAULT_LOG_FILTER),
+    )
+    .init();
 
     let theme = ThemeProviderProps {
         primary_color: Some("blue".into()),
