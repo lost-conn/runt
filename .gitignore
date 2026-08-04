@@ -5,3 +5,4 @@
 /dist
 demo/*/dist
 /.playwright-mcp
+/.claude/
