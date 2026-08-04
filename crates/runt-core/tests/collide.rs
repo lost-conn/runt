@@ -33,6 +33,11 @@ use runt_core::{Sim, SimConfig, Transform};
 
 const DT: f32 = 1.0 / 60.0;
 const GRAVITY: f32 = 32.65; // PORT_SPEC's g_down.
+/// PORT_SPEC's `max_speed / deceleration_time` — 8 m/s shed in 0.305 s, which is
+/// 0.44 m/s of braking a tick. Comfortably more than the downhill velocity one
+/// tick of gravity projects onto a 30° face, which is why the creep this module
+/// now stops was never a friction problem.
+const DECELERATION: f32 = 8.0 / 0.305;
 
 // ---------------------------------------------------------------------------
 // Geometry helpers
@@ -375,6 +380,315 @@ fn a_ceiling_is_a_ceiling_only_within_the_max_floor_angle_of_down() {
         }
     }
     assert!(saw_ceiling, "the capsule never hit the lid");
+}
+
+// ---------------------------------------------------------------------------
+// Stop on slope
+// ---------------------------------------------------------------------------
+
+/// A single wide slab pitched by `degrees` — one face of PORT_SPEC's slope
+/// battery, big enough that nothing here ever reaches an edge.
+fn slope_level(pitch: f32) -> CollisionWorld {
+    let mut level = Level::new();
+    ramp(
+        &mut level,
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(8.0, 1.0, 8.0),
+        pitch,
+    );
+    level.snapshot()
+}
+
+/// One tick of the port's Idle state, reduced to the two lines that produce the
+/// bug: gravity applied *every* tick, grounded or not (`idle_state.gd` does not
+/// ask), and a deceleration that takes the horizontal velocity to exactly zero.
+/// What reaches the solver is therefore gravity and nothing else — which is the
+/// whole of Godot's `floor_stop_on_slope` condition.
+fn idle_step(
+    geometry: &CollisionWorld,
+    body: &mut CharacterBody,
+    position: &mut Vec3,
+    velocity: &mut Vec3,
+) -> MoveResult {
+    velocity.y -= GRAVITY * DT;
+    let horizontal = Vec3::new(velocity.x, 0.0, velocity.z);
+    let brake = DECELERATION * DT;
+    let braked = if horizontal.length() <= brake {
+        Vec3::ZERO
+    } else {
+        horizontal - horizontal.normalize() * brake
+    };
+    velocity.x = braked.x;
+    velocity.z = braked.z;
+    let result = move_and_slide(geometry, body, *position, *velocity, DT);
+    *position = result.position;
+    *velocity = result.velocity;
+    result
+}
+
+/// The same tick with the stick held: a constant `wish` on the horizontal axes,
+/// which is what a state machine's acceleration converges to.
+fn walk_step(
+    geometry: &CollisionWorld,
+    body: &mut CharacterBody,
+    position: &mut Vec3,
+    velocity: &mut Vec3,
+    wish: Vec3,
+) -> MoveResult {
+    velocity.y -= GRAVITY * DT;
+    velocity.x = wish.x;
+    velocity.z = wish.z;
+    let result = move_and_slide(geometry, body, *position, *velocity, DT);
+    *position = result.position;
+    *velocity = result.velocity;
+    result
+}
+
+/// A body standing on `pitch`, already settled.
+fn standing_on_slope(pitch: f32) -> (CollisionWorld, CharacterBody, Vec3, Vec3) {
+    let geometry = slope_level(pitch);
+    let mut body = standing().with_snap_length(0.5);
+    body.on_floor = true;
+    let mut p = on_ramp(&geometry, 0.0);
+    let mut v = Vec3::ZERO;
+    for _ in 0..10 {
+        idle_step(&geometry, &mut body, &mut p, &mut v);
+    }
+    (geometry, body, p, v)
+}
+
+#[test]
+fn a_body_under_gravity_alone_does_not_slide_down_a_walkable_slope() {
+    // The bug: `move_and_slide` projects velocity onto the slope plane, so the
+    // tick's gravity comes back as a downhill tangential velocity that the
+    // caller's friction is left fighting. Before this flag existed the 15° face
+    // walked the body 0.73 m downhill in five seconds and the 30° one 1.59 m,
+    // with the stick untouched. Godot cancels the motion outright, and so does
+    // this — the body does not move by one bit.
+    for pitch in [15.0f32, 30.0] {
+        let (geometry, mut body, mut p, mut v) = standing_on_slope(pitch);
+        let settled = p;
+        assert!(body.on_floor, "{pitch}°: the body is not standing on it");
+        assert_eq!(v, Vec3::ZERO, "{pitch}°: a standing body kept a velocity");
+
+        for tick in 0..300 {
+            let result = idle_step(&geometry, &mut body, &mut p, &mut v);
+            assert_eq!(p, settled, "{pitch}°: crept on tick {tick}");
+            assert_eq!(v, Vec3::ZERO, "{pitch}°: gained a velocity on tick {tick}");
+            assert!(result.on_floor, "{pitch}°: left the floor on tick {tick}");
+            assert!(
+                result.stopped_on_slope,
+                "{pitch}°: tick {tick} did not stop"
+            );
+            assert!(
+                (degrees(result.floor_angle) - pitch).abs() < 0.05,
+                "{pitch}°: floor angle became {}",
+                degrees(result.floor_angle)
+            );
+        }
+    }
+}
+
+#[test]
+fn the_same_slope_is_walked_normally_when_there_is_input() {
+    // The stop is not a freeze. A body with somewhere to go fails the direction
+    // test — its velocity is nowhere near straight down — and moves exactly as
+    // it did before the flag existed.
+    for pitch in [15.0f32, 30.0] {
+        let (geometry, mut body, mut p, mut v) = standing_on_slope(pitch);
+        let start = p;
+
+        // Straight down the fall line: the ramp descends towards +Z.
+        let wish = Vec3::new(0.0, 0.0, 4.0);
+        for tick in 0..60 {
+            let result = walk_step(&geometry, &mut body, &mut p, &mut v, wish);
+            assert!(result.on_floor, "{pitch}°: airborne on tick {tick}");
+            assert!(
+                !result.stopped_on_slope,
+                "{pitch}°: the stop fired on tick {tick} with the stick held"
+            );
+        }
+        // A second at 4 m/s covers 4 m of ground, plus whatever the descent adds
+        // back — the body follows the surface rather than the horizontal.
+        let travelled = p.z - start.z;
+        assert!(
+            (3.5..5.0).contains(&travelled),
+            "{pitch}°: covered {travelled} m of +Z in a second at 4 m/s"
+        );
+        // And it is still on the face, not floating over it or ploughing in: the
+        // drop is the ground it covered times the slope.
+        let expected_drop = travelled * pitch.to_radians().tan();
+        assert!(
+            (start.y - p.y - expected_drop).abs() < 0.1,
+            "{pitch}°: descended {} m over {travelled} m, expected {expected_drop}",
+            start.y - p.y
+        );
+
+        // Across the fall line moves too, and the stop still keeps out of it.
+        let sideways = Vec3::new(4.0, 0.0, 0.0);
+        let before = p;
+        for _ in 0..60 {
+            walk_step(&geometry, &mut body, &mut p, &mut v, sideways);
+        }
+        assert!(
+            (p.x - before.x - 4.0).abs() < 0.1,
+            "{pitch}°: covered {} m of +X in a second at 4 m/s",
+            p.x - before.x
+        );
+    }
+}
+
+#[test]
+fn a_face_too_steep_to_stand_on_still_slides() {
+    // The stop is gated on the contact being *floor*. PORT_SPEC's 40° SteepSlope
+    // read against a 35° max is a wall, walls never stop the body, and a body on
+    // one keeps sliding — which is what feeds the port's Roll.
+    let geometry = slope_level(40.0);
+    let mut body = standing()
+        .with_max_floor_degrees(35.0)
+        .with_snap_length(0.5);
+    body.on_floor = true;
+    let mut p = on_ramp(&geometry, -2.0);
+    let mut v = Vec3::ZERO;
+    let start = p;
+
+    for tick in 0..300 {
+        let result = idle_step(&geometry, &mut body, &mut p, &mut v);
+        assert!(
+            !result.stopped_on_slope,
+            "tick {tick}: a wall stopped the body"
+        );
+        assert!(
+            !result.on_floor,
+            "tick {tick}: a 40° face read as floor at 35°"
+        );
+    }
+    assert!(
+        p.z - start.z > 0.25,
+        "the body only slid {} m down a face it cannot stand on",
+        p.z - start.z
+    );
+}
+
+#[test]
+fn floor_stop_on_slope_false_is_the_behaviour_the_flag_replaced() {
+    // Godot's own escape hatch, and the regression guard: turning it off gives
+    // back the projection, downhill velocity and all.
+    let geometry = slope_level(15.0);
+    let mut body = standing()
+        .with_snap_length(0.5)
+        .with_floor_stop_on_slope(false);
+    body.on_floor = true;
+    let mut p = on_ramp(&geometry, 0.0);
+    let mut v = Vec3::ZERO;
+    let start = p;
+
+    for _ in 0..300 {
+        let result = idle_step(&geometry, &mut body, &mut p, &mut v);
+        assert!(!result.stopped_on_slope, "the flag is off");
+        assert!(result.on_floor);
+    }
+    assert!(
+        p.z - start.z > 0.5,
+        "with the flag off the body should still creep; it moved {} m",
+        p.z - start.z
+    );
+    assert!(
+        v.z > 0.05,
+        "with the flag off the projection should still hand back a downhill \
+         velocity; it was {}",
+        v.z
+    );
+}
+
+#[test]
+fn walking_down_a_slope_and_letting_go_comes_to_rest_without_creeping() {
+    // The case the port actually plays: run down the 15° face, release the
+    // stick, and stop. The stop has to engage the moment the decel has taken the
+    // horizontal velocity away — not one tick later and not never.
+    let geometry = slope_level(15.0);
+    let mut body = standing().with_snap_length(0.5);
+    body.on_floor = true;
+    let mut p = on_ramp(&geometry, -4.0);
+    let mut v = Vec3::ZERO;
+    let start = p;
+
+    for _ in 0..60 {
+        walk_step(
+            &geometry,
+            &mut body,
+            &mut p,
+            &mut v,
+            Vec3::new(0.0, 0.0, 6.0),
+        );
+    }
+    assert!(p.z - start.z > 5.0, "the run never happened");
+
+    // Let go. Within a handful of ticks the decel has won and the body is stopped.
+    let mut stop_tick = None;
+    for tick in 0..60 {
+        let result = idle_step(&geometry, &mut body, &mut p, &mut v);
+        if result.stopped_on_slope && stop_tick.is_none() {
+            stop_tick = Some(tick);
+        }
+    }
+    let stop_tick = stop_tick.expect("the body never came to rest on the slope");
+    assert!(
+        stop_tick < 30,
+        "it took {stop_tick} ticks to stop; the decel needs 15"
+    );
+
+    // And it stays stopped, to the bit, for five seconds.
+    let rest = p;
+    for tick in 0..300 {
+        idle_step(&geometry, &mut body, &mut p, &mut v);
+        assert_eq!(p, rest, "crept on tick {tick} after coming to rest");
+    }
+    assert!(body.on_floor);
+}
+
+#[test]
+fn coming_to_rest_on_a_slope_is_ragged_host_independent() {
+    // DESIGN §4, applied to the new branch: the stop is a function of the tick's
+    // velocity and the snapshot, never of how the host chopped wall time up.
+    let geometry = slope_level(30.0);
+    let script = |chunks: &[usize]| -> Vec<(Vec3, Vec3, bool)> {
+        let mut body = standing().with_snap_length(0.5);
+        body.on_floor = true;
+        // A short drop onto the face, a run down it, then a release: an airborne
+        // landing, a walk and a stop in one trace.
+        let mut p = on_ramp(&geometry, -4.0) + Vec3::Y * 0.5;
+        let mut v = Vec3::ZERO;
+        let mut trace = Vec::new();
+        let mut tick = 0u32;
+        for chunk in chunks {
+            for _ in 0..*chunk {
+                if (30..120).contains(&tick) {
+                    walk_step(
+                        &geometry,
+                        &mut body,
+                        &mut p,
+                        &mut v,
+                        Vec3::new(0.0, 0.0, 5.0),
+                    );
+                } else {
+                    idle_step(&geometry, &mut body, &mut p, &mut v);
+                }
+                trace.push((p, v, body.on_floor));
+                tick += 1;
+            }
+        }
+        trace
+    };
+
+    let uniform = script(&[240]);
+    let ragged = script(&[7, 1, 13, 2, 40, 1, 1, 60, 5, 110]);
+    assert_eq!(uniform.len(), 240);
+    assert_eq!(ragged, uniform, "a ragged host produced a different run");
+    assert!(
+        uniform.last().unwrap().1 == Vec3::ZERO,
+        "the trace never reached the resting case it is meant to cover"
+    );
 }
 
 // ---------------------------------------------------------------------------

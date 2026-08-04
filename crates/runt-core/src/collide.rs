@@ -138,6 +138,16 @@ pub const CONTACT_MARGIN: f32 = 1e-3;
 /// reported and still projects velocity).
 const PUSH_EPSILON: f32 = 1e-6;
 
+/// How far a velocity may tilt away from straight *down* and still count as
+/// "gravity only" for [`CharacterBody::floor_stop_on_slope`].
+///
+/// Godot's literal, from `character_body_3d.cpp`:
+/// `(velocity.normalized() + up_direction).length() < 0.01`. The unit velocity
+/// has to land within `0.01` of `-up`, which is 0.57° of tilt — a body with any
+/// real horizontal intent fails it, and a body being pushed only by gravity
+/// passes it exactly.
+pub const STOP_ON_SLOPE_TILT: f32 = 0.01;
+
 /// Largest translation one sub-step may attempt, as a fraction of the moving
 /// shape's radius.
 ///
@@ -387,6 +397,23 @@ pub struct CharacterBody {
     pub max_floor_angle: f32,
     /// Godot's `floor_snap_length`, metres. `0` disables snapping.
     pub snap_length: f32,
+    /// Godot's `floor_stop_on_slope`, **default `true`** as it is there.
+    ///
+    /// A body standing on a slope it is allowed to stand on must not slide down
+    /// it. Without this, projecting the tick's gravity onto the slope plane
+    /// hands back a downhill tangential velocity every tick, and the caller's
+    /// friction is left fighting a force the solver invented: the body creeps.
+    /// With it, a *gravity-only* motion (see [`STOP_ON_SLOPE_TILT`]) that finds
+    /// floor has its velocity zeroed, and — when the floor absorbed the whole of
+    /// that motion, which is what standing still *is* — its position taken back
+    /// to where the tick started.
+    ///
+    /// Set it to `false` for a body that is *meant* to slide (Godot's own
+    /// escape hatch); the solver then behaves exactly as it did before the flag
+    /// existed. It says nothing about steep faces: a contact past
+    /// `max_floor_angle` is a wall, walls never stop the body, and a body on one
+    /// still slides.
+    pub floor_stop_on_slope: bool,
     /// The layers this body collides with (`mask`) and belongs to
     /// (`memberships`, unread here — see the module docs).
     pub layers: CollisionLayers,
@@ -405,6 +432,7 @@ impl Default for CharacterBody {
             shape: CharacterShape::default(),
             max_floor_angle: std::f32::consts::FRAC_PI_4,
             snap_length: 0.5,
+            floor_stop_on_slope: true,
             layers: CollisionLayers::DEFAULT,
             up: Vec3::Y,
             on_floor: false,
@@ -425,6 +453,11 @@ impl CharacterBody {
 
     pub fn with_snap_length(mut self, snap_length: f32) -> CharacterBody {
         self.snap_length = snap_length;
+        self
+    }
+
+    pub fn with_floor_stop_on_slope(mut self, stop: bool) -> CharacterBody {
+        self.floor_stop_on_slope = stop;
         self
     }
 
@@ -497,6 +530,9 @@ pub struct MoveResult {
     pub sub_steps: u32,
     /// Whether floor snap is what produced `on_floor`.
     pub snapped: bool,
+    /// Whether [`CharacterBody::floor_stop_on_slope`] cancelled this tick's
+    /// gravity. When it is set, `velocity` is `Vec3::ZERO` by construction.
+    pub stopped_on_slope: bool,
 }
 
 impl MoveResult {
@@ -514,6 +550,7 @@ impl MoveResult {
             contacts: Vec::new(),
             sub_steps: 1,
             snapped: false,
+            stopped_on_slope: false,
         }
     }
 
@@ -1061,6 +1098,8 @@ fn collect_contacts(
 ///   for ≤ SLIDE_ITERATIONS:
 ///     collect      every contact at p, layer-filtered, Entity-sorted
 ///     record       merge into the result set (deepest per entity)
+///     stop         floor contact + gravity-only v → v = 0, and undo the drop
+///                  when the floor absorbed the whole of it
 ///     project      for each contact in Entity order: v -= n·min(v·n, 0)
 ///     push out     p += n_deepest · depth_deepest      (deepest wins, ties → lowest Entity)
 ///     stop         when nothing is penetrating by more than PUSH_EPSILON
@@ -1074,6 +1113,23 @@ fn collect_contacts(
 /// is projected against *every* contact in the iteration, though — a body in a
 /// corner cannot move into either wall, and projecting only the deepest would
 /// let it creep into the other.
+///
+/// ## Stop on slope
+///
+/// Projecting velocity onto the floor plane is right for a body that is *going*
+/// somewhere and wrong for one that is not: the tick's gravity comes back as a
+/// downhill tangential velocity, and a body standing still on a slope it is
+/// allowed to stand on creeps down it. Godot's `floor_stop_on_slope` (default
+/// true, and default true here) is the answer, and the condition is narrow —
+/// on floor, and the velocity is *gravity only*, straight down within
+/// [`STOP_ON_SLOPE_TILT`]. The velocity then goes, and the motion with it when
+/// the floor absorbed the whole sub-step — see [`slope_stop`] for when it does
+/// not, and why that case has to be left alone.
+///
+/// The narrowness is what makes it safe. A body with any horizontal intent —
+/// walking, running, sliding after a landing — fails the direction test and
+/// moves exactly as it did before. A contact past `max_floor_angle` is a wall,
+/// never floor, so a body on a face too steep to stand on still slides down it.
 ///
 /// ## Floor snap
 ///
@@ -1135,8 +1191,10 @@ pub fn move_and_slide(
     let mut v = velocity;
     let mut found: Vec<RawContact> = Vec::new();
     let mut merged: Vec<RawContact> = Vec::new();
+    let mut stopped_on_slope = false;
 
-    for _ in 0..sub_steps {
+    'sub_steps: for _ in 0..sub_steps {
+        let step_start = p;
         p += v * sub_dt;
         for _ in 0..SLIDE_ITERATIONS {
             collect_contacts(world, body.shape, up, p, mask, true, &mut found);
@@ -1144,6 +1202,30 @@ pub fn move_and_slide(
                 break;
             }
             merge_contacts(&mut merged, &found);
+
+            // Stop on slope, before the projection that would create the slide.
+            if body.floor_stop_on_slope && gravity_only(v, up) {
+                match slope_stop(&found, up, cos_max, step_start, p) {
+                    SlopeStop::Sliding => {}
+                    SlopeStop::Cancelled(rest) => {
+                        // Godot's `break` out of the whole slide loop, and for
+                        // the same reason: there is nothing left to resolve once
+                        // the motion that caused the contact has been taken back.
+                        p = rest;
+                        v = Vec3::ZERO;
+                        stopped_on_slope = true;
+                        break 'sub_steps;
+                    }
+                    SlopeStop::Settling => {
+                        // The velocity goes, the position is left to the ordinary
+                        // push-out below. `v` is zero from here, so the projection
+                        // is a no-op and the sub-step resolves exactly as it did
+                        // before this flag existed.
+                        v = Vec3::ZERO;
+                        stopped_on_slope = true;
+                    }
+                }
+            }
 
             // Velocity first, against every contact, in Entity order.
             for contact in &found {
@@ -1171,9 +1253,15 @@ pub fn move_and_slide(
             .iter()
             .any(|c| classify(c.normal, up, cos_max) == ContactKind::Floor)
     {
+        // A body that walked off a crest and is now falling straight down is the
+        // same gravity-only case the sub-step loop stops: the floor the probe
+        // finds is a floor it was standing on, so the snap must put it back on
+        // that floor at rest rather than hand back the tangential remainder.
+        let stopping = body.floor_stop_on_slope && gravity_only(v, up);
         if let Some((snap_p, snap_v)) = snap_to_floor(world, body, up, cos_max, p, v, &mut found) {
             p = snap_p;
-            v = snap_v;
+            v = if stopping { Vec3::ZERO } else { snap_v };
+            stopped_on_slope |= stopping;
             snapped = true;
             collect_contacts(world, body.shape, up, p, mask, true, &mut found);
             merge_contacts(&mut merged, &found);
@@ -1186,6 +1274,7 @@ pub fn move_and_slide(
     let mut result = MoveResult::empty(p, v);
     result.sub_steps = sub_steps;
     result.snapped = snapped;
+    result.stopped_on_slope = stopped_on_slope;
 
     let mut best_floor_dot = f32::NEG_INFINITY;
     let mut deepest_wall = f32::NEG_INFINITY;
@@ -1250,6 +1339,96 @@ fn classify(normal: Vec3, up: Vec3, cos_max: f32) -> ContactKind {
         ContactKind::Ceiling
     } else {
         ContactKind::Wall
+    }
+}
+
+/// Is this velocity nothing but the tick's gravity — pointing straight *down*,
+/// within [`STOP_ON_SLOPE_TILT`]?
+///
+/// Godot spells it `(velocity.normalized() + up_direction).length() < 0.01`, and
+/// the degenerate case matters: a zero velocity normalises to zero, so the sum
+/// is `up`, whose length is 1, and a body that is already at rest never takes
+/// the stop path. Nothing to cancel, so nothing is cancelled.
+#[inline]
+fn gravity_only(velocity: Vec3, up: Vec3) -> bool {
+    (velocity.normalize_or_zero() + up).length_squared() < STOP_ON_SLOPE_TILT * STOP_ON_SLOPE_TILT
+}
+
+/// What [`CharacterBody::floor_stop_on_slope`] does with a sub-step that ran the
+/// body into something under gravity alone.
+enum SlopeStop {
+    /// Nothing floor-classified was hit. Steep faces are walls, walls do not
+    /// stop a body, and this one keeps sliding.
+    Sliding,
+    /// The floor absorbed the whole sub-step: the body had nowhere to go. Both
+    /// the motion and the velocity are taken back, and the position carried is
+    /// the one the sub-step started from — *exactly*, which is what makes a
+    /// standing body bit-stable tick after tick.
+    Cancelled(Vec3),
+    /// The body did go somewhere — it fell onto the floor, or it began the
+    /// sub-step penetrating and is still coming out. Only the velocity is
+    /// cancelled; where the body ends up is left to the ordinary push-out.
+    Settling,
+}
+
+/// Read a sub-step against Godot's stop-on-slope rule.
+///
+/// Godot's own line is
+/// `if (result.travel.length() <= margin) gt.origin -= result.travel;` — undo
+/// the move when the swept solve found the body had nowhere to go, and otherwise
+/// keep the travel, which for a straight-down sweep means resting on the surface
+/// just reached. A teleport-then-push-out solver has no sweep, so the same
+/// reading is reconstructed from the contact:
+///
+/// - `lift` is how far back along `up` the deepest floor contact has to be
+///   undone to stop penetrating — the analytic un-drop [`snap_to_floor`] uses,
+///   exact for a plane. Along `up` rather than along the contact normal is the
+///   whole point: a normal-directed push-out walks a body sideways up the slope,
+///   one drop's worth of `sin θ · cos θ` every tick.
+/// - `descent − lift` is therefore the travel that actually happened, the same
+///   quantity Godot compares against its margin.
+///
+/// The lower bound on that comparison is what keeps this honest. A *negative*
+/// gap means the body was already penetrating before the sub-step, and cancelling
+/// back to there would freeze the overlap in place for good — a body resting on
+/// the floor would read as inside it, and every query built on that (the port's
+/// phase guard, for one) would be wrong forever. Those sub-steps settle through
+/// the ordinary push-out instead, which converges in a tick or two, and the
+/// cancel then holds a position the solver had already produced on its own.
+fn slope_stop(
+    found: &[RawContact],
+    up: Vec3,
+    cos_max: f32,
+    step_start: Vec3,
+    p: Vec3,
+) -> SlopeStop {
+    let descent = (step_start - p).dot(up);
+    if descent <= 0.0 {
+        return SlopeStop::Sliding;
+    }
+
+    let mut lift = f32::NEG_INFINITY;
+    for c in found {
+        if classify(c.normal, up, cos_max) != ContactKind::Floor {
+            continue;
+        }
+        // A floor whose normal is perpendicular to `up` (only reachable at
+        // max_floor_angle = 180°) gives no purchase to lift back along `up`.
+        let n_up = c.normal.dot(up);
+        if n_up <= 1e-3 {
+            continue;
+        }
+        lift = lift.max(c.depth / n_up);
+    }
+    if lift == f32::NEG_INFINITY {
+        return SlopeStop::Sliding;
+    }
+
+    let gap = descent - lift;
+    if (0.0..CONTACT_MARGIN).contains(&gap) {
+        SlopeStop::Cancelled(step_start)
+    } else {
+        SlopeStop::Settling
     }
 }
 

@@ -275,6 +275,18 @@ demo's pinned 240-tick fingerprint is unchanged.
   per-body `max_floor_angle` (45° standing, 89° slam, 180° rolling), and Godot's
   floor snap is reproduced: probe down `snap_length`, land straight along `up`,
   keep horizontal velocity.
+- **`CharacterBody::floor_stop_on_slope`, default `true`** — Godot's flag, and
+  its condition: on floor, and the velocity is gravity and nothing else
+  (`(v.normalized() + up).length() < 0.01`, their literal). Projecting velocity
+  onto the floor plane is right for a body going somewhere and wrong for one
+  standing still — the tick's gravity comes back as downhill tangential velocity
+  and the caller's friction is left fighting a force the solver invented, which
+  walked the port's Idle 0.73 m down its 15° slope in five seconds. The stop
+  cancels that motion and zeroes the velocity, so a standing body is bit-stable.
+  It cancels *only* the sub-step the floor absorbed whole; a body that genuinely
+  fell, or one still coming out of a penetration, keeps the ordinary push-out, so
+  the stop can never freeze an overlap in place. Steep faces are walls, walls
+  never stop a body, and `false` restores the old behaviour exactly.
 - **`ObbCollider { half_extents, rotation: Quat }`** — full rotation, not the
   yaw-only box originally planned. The contact solve happens in the box's own
   frame, where orientation has already been divided out, so a pitched ramp costs
