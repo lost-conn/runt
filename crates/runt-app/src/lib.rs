@@ -38,6 +38,15 @@ use winit::window::{Window, WindowId};
 /// mapping without going through [`run_with`].
 pub mod input;
 
+/// Gamepads. Nobody delivers a pad as events, so the host polls it once a frame
+/// and diffs the result into the same [`InputEvent`]s a keyboard produces —
+/// still translation and nothing else (DESIGN §2).
+pub mod gamepad;
+
+/// A string key-value store: `localStorage` on web, a file under the config
+/// directory natively. Player state, deliberately not sim state.
+pub mod storage;
+
 /// The audio pump (DESIGN §8): a cpal stream natively, an `AudioWorklet` on web,
 /// and silence when a game does not ask for either.
 pub mod audio;
@@ -165,6 +174,12 @@ struct Host {
     /// Touch screens as an analog stick (see [`input::VirtualStick`]). One per
     /// window, because the anchor is a property of the surface being touched.
     stick: input::VirtualStick,
+    /// Gamepads, or `None` where the platform has none to give (see
+    /// [`gamepad::Pads`]). Polled once a frame in [`Host::render`].
+    pads: Option<gamepad::Pads>,
+    /// Turns the polled pad state into events. Lives beside the poller rather
+    /// than inside it so both platforms share one definition of "changed".
+    pad_diff: gamepad::PadDiffer,
     /// What the program is called when it has nothing to say.
     title: String,
     /// The last [`StatusLine`](runt_core::StatusLine) painted, so an unchanged
@@ -261,6 +276,8 @@ impl Host {
             start: web_time::Instant::now(),
             last_cursor: None,
             stick: input::VirtualStick::new(),
+            pads: gamepad::Pads::new(),
+            pad_diff: gamepad::PadDiffer::new(),
             title: run.title,
             shown_status: String::new(),
             audio,
@@ -342,6 +359,12 @@ impl Host {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // The pad has no event stream to sit in `handle_input` with the keyboard,
+        // so it is read here — *before* `update`, so whatever the player is
+        // holding right now lands in the buffer this frame's ticks will consume
+        // rather than the next one's.
+        self.poll_pads();
+
         // The host owns the clock; the engine is handed wall time and does its
         // own fixed-tick accounting (DESIGN §4).
         self.engine.update(self.start.elapsed().as_secs_f64());
@@ -356,6 +379,19 @@ impl Host {
 
         self.engine.queue().present(frame);
         self.sync_status();
+    }
+
+    /// Read every connected pad and push whatever moved since the last frame.
+    ///
+    /// Cheap and silent when nothing happened: the poll is a state read, and
+    /// [`gamepad::PadDiffer`] emits nothing for a pad at rest.
+    fn poll_pads(&mut self) {
+        let Some(pads) = self.pads.as_mut() else {
+            return;
+        };
+        let snapshot = pads.poll();
+        let engine = &mut self.engine;
+        self.pad_diff.diff(snapshot, |event| engine.push_input(event));
     }
 
     /// Translate one winit window event into engine input. Returns `true` if it
@@ -430,6 +466,12 @@ impl Host {
             // everything rather than leaving the ball rolling into the sunset.
             WindowEvent::Focused(false) => {
                 self.stick.reset();
+                // `FocusLost` already drops every held pad button, centres both
+                // sticks and releases both triggers engine-side, so the differ
+                // only has to agree that it did — pushing the releases as well
+                // would double every one of them into the trace. Exactly the
+                // stance `VirtualStick::reset` takes.
+                self.pad_diff.forget();
                 self.engine.push_input(InputEvent::FocusLost);
                 true
             }

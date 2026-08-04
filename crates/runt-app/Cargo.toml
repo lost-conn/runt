@@ -38,6 +38,11 @@ pollster.workspace = true
 env_logger = "0.11"
 runt-audio = { workspace = true, features = ["dsp"] }
 cpal.workspace = true
+# Gamepads, native side (DESIGN §2 — host-side event translation). The web side
+# is `navigator.getGamepads()` through web-sys below; gilrs does have a wasm
+# backend, but it is the same browser API behind a second abstraction and a
+# second copy of the mapping database in the wasm blob.
+gilrs = "0.11"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # The WebGL2 fallback lives with the host: it is a backend/presentation
@@ -47,7 +52,22 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
 console_log = "1"
-web-sys = { version = "0.3", features = ["Document", "Window", "Element", "HtmlElement", "Node"] }
+web-sys = { version = "0.3", features = [
+    "Document",
+    "Window",
+    "Element",
+    "HtmlElement",
+    "Node",
+    # Gamepads (see `src/gamepad.rs`): the array comes off `Navigator`, the
+    # mapping check needs the enum, and the buttons are objects rather than
+    # numbers because they are analog.
+    "Gamepad",
+    "GamepadButton",
+    "GamepadMappingType",
+    "Navigator",
+    # `src/storage.rs`.
+    "Storage",
+] }
 # The audio backend calls two functions on `window.runtAudio` (see
 # `web/runt-audio.js`). That needs `Reflect` and `Uint8Array` and nothing else —
 # no `AudioContext` bindings, because the browser plumbing is JavaScript.
