@@ -96,6 +96,28 @@ pub const MAX_RESOLUTION: u32 = 2048;
 /// Low-tier device's terrain visibly *flatter* rather than merely coarser, and
 /// DESIGN §11's contract is that a gate picks data, never a different look. A
 /// fixed reference step makes the normal map resolution-independent.
+///
+/// # It is *not* tile-independent
+///
+/// The step the bake actually uses is `base_span / NORMAL_REFERENCE_TEXELS`, in
+/// units of octave-0 cells — which is one texel of a 1024² bake *of this tile*,
+/// so in world metres it is `tile_meters / 1024`. Shrink the tile and the step
+/// shrinks with it, the field rises less across it, and the whole normal map
+/// flattens in proportion.
+///
+/// So [`world_scale`] is free to tune for the albedo and **not** free for the
+/// normal: halving the tile halves the relief unless
+/// [`NormalSpec::strength`] doubles. What is invariant — and what a material
+/// re-tiling itself has to hold fixed — is the product
+/// `strength × octave_plan()[0].span`; `rock`'s comment works an example, and
+/// `the_normal_amplitude_survived_the_density_retune` pins it.
+///
+/// Making the step a fixed fraction of a *cell* instead would drop the coupling
+/// entirely and is the better formulation, but it re-scales `strength` for every
+/// material ever authored against this one — a decision worth taking on its own
+/// rather than as a side effect of a tiling change.
+///
+/// [`world_scale`]: TextureSpec::world_scale
 pub const NORMAL_REFERENCE_TEXELS: f32 = 1024.0;
 
 // ---------------------------------------------------------------------------
@@ -255,12 +277,34 @@ pub struct TextureSpec {
     /// World units → tile units: one tile spans `1 / world_scale` world units.
     /// The `noise_scale` of the Godot fallback material, same meaning.
     ///
-    /// **Authoring note.** This is the knob that decides how cleanly the tile
-    /// quantizes: `frequency / world_scale` is the cell span across the tile
-    /// and wants to land near an even integer (see
-    /// [`lacunarity_error`](TextureSpec::lacunarity_error)). It does *not*
-    /// change feature size — a cell is `1 / frequency` world units across
-    /// whatever this says — so it is free to tune.
+    /// **Authoring note.** This one knob is pulled by two forces:
+    ///
+    /// * **Quantization.** `frequency / world_scale` is the cell span across
+    ///   the tile and wants to land near an even integer, or the whole
+    ///   lacunarity chain rounds (see
+    ///   [`lacunarity_error`](TextureSpec::lacunarity_error)). Bigger tiles
+    ///   quantize more cheaply, because rounding to an even number is a smaller
+    ///   *relative* step the more cells there are.
+    /// * **Texel density.** A tile is one bake, so a bigger tile spreads the
+    ///   same texels over more metres (see
+    ///   [`texel_density`](TextureSpec::texel_density)). Past a point the
+    ///   surface is simply blurred up close and no sampler can undo it.
+    ///
+    /// They pull in opposite directions and density wins, because quantization
+    /// error is a few percent on cell sizes nobody measures while density is
+    /// the sharpness of every pixel. Repetition — the third cost of a small
+    /// tile — is the one with a real fix: [`anti_tiling`].
+    ///
+    /// It does *not* change feature size — a cell is `1 / frequency` world
+    /// units across whatever this says, up to the quantization above.
+    ///
+    /// It *does* change the normal map's amplitude, which is the one
+    /// non-obvious coupling in this struct: see
+    /// [`NORMAL_REFERENCE_TEXELS`]. Retiling a material means scaling
+    /// [`NormalSpec::strength`] inversely with the base span, or the surface
+    /// comes out flatter.
+    ///
+    /// [`anti_tiling`]: TextureSpec::anti_tiling
     #[serde(default = "default_world_scale")]
     pub world_scale: f32,
     /// Triplanar blend exponent. Higher is a harder switch between planes.
@@ -372,6 +416,27 @@ impl TextureSpec {
     }
 
     // -- resolution ---------------------------------------------------------
+
+    /// How many world metres one tile spans.
+    pub fn tile_meters(&self) -> f32 {
+        1.0 / self.world_scale.max(1e-6)
+    }
+
+    /// Baked texels per world metre at `resolution`.
+    ///
+    /// The number that decides whether a surface reads sharp or smeared when
+    /// the camera is close to it: a fragment covering less than one texel is
+    /// magnifying the bake, and no amount of resolution *ceiling* helps if the
+    /// tile is authored large enough to spend that resolution on empty metres.
+    /// Roughly 25 px/m is where a surface stops looking soft at arm's length in
+    /// this engine's framing; below ~10 it is visibly blurred.
+    ///
+    /// Mipmaps fix the *other* end (minification shimmer) and are free of this
+    /// — but they also make it safe to author a small tile, because the
+    /// repetition a small tile brings is what the anti-tiling sampler is for.
+    pub fn texel_density(&self, resolution: u32) -> f32 {
+        resolution as f32 * self.world_scale
+    }
 
     /// Bake resolution for a quality tier: `base × quality`, clamped to
     /// `[MIN_RESOLUTION, MAX_RESOLUTION]` and rounded to a power of two.
@@ -693,7 +758,9 @@ pub fn grass() -> TextureSpec {
             edge_width: 0.52,
             strength: 5.106,
         }),
-        // 27.8 m tile, 5.83 → 6 cells across it: a 2.9% frequency nudge.
+        // 27.8 m tile, 5.83 → 6 cells across it: a 2.9% frequency nudge, and
+        // 36.9 texels per metre at 1024² — comfortably sharp, so this one never
+        // needed the retune `rock` did.
         world_scale: 0.036,
         triplanar_sharpness: 4.0,
         base_resolution: 1024,
@@ -721,13 +788,49 @@ pub fn rock() -> TextureSpec {
         normal: Some(NormalSpec {
             mode: NormalMode::ToEdge,
             edge_width: 0.351,
-            strength: 5.921,
+            // The Godot material says 5.921. This is `5.921 × 10 / 2` — the
+            // exact compensation for the tile shrinking below, not a restyling.
+            //
+            // The bake differentiates the field over `base_span / 1024` cells
+            // (see NORMAL_REFERENCE_TEXELS), so the packed normal's tilt is
+            // proportional to `strength × base_span` and to nothing else in
+            // this struct. The base span went 10 → 2 with the retune, so
+            // leaving 5.921 alone would have shipped a rock five times flatter
+            // — which is precisely what the first screenshot of the retune
+            // showed: a sharp texture on a surface with no relief left.
+            // 29.605 × 2 = 59.21 = 5.921 × 10, so the normal map the shader
+            // samples is the one Godot's number asked for.
+            strength: 29.605,
         }),
-        // The Godot fallback said 0.01 (a 100 m tile), which puts 4.6 cells
-        // across the tile and would cost a 13% frequency nudge to quantize.
-        // 0.0046 is the nearest value that lands on exactly 10 cells — same
-        // feature size (21.7 m per cell), a bigger tile, no rounding.
-        world_scale: 0.0046,
+        // A 40 m tile: 1024² of bake over 40 m is **25.6 texels per metre**.
+        //
+        // This used to be `0.0046`, chosen because it puts *exactly* ten cells
+        // across the tile and quantizes the whole lacunarity chain for free.
+        // That was optimizing the wrong number. Ten cells of a 21.7 m feature
+        // is a 217 m tile, and 1024² spread over 217 m is 4.7 px/m — a metre of
+        // rock covered by fewer than five texels, which is exactly the blur
+        // that was reported. The clean quantization was bought with an eightyfold
+        // deficit in the thing anyone can actually see.
+        //
+        // Shrinking the tile 5.4× costs quantization instead, and the trade is
+        // lopsided in the other direction (see `lacunarity_error`): the ideal
+        // spans become 1.84 / 6.46 / 22.7 / 79.7 / 280, which round to
+        // 2 / 6 / 22 / 80 / 280 — worst octave 8.7% off, against 2.5% before.
+        // What that 8.7% *means* is that the coarsest cell is 20.0 m instead of
+        // 21.7 m and the second is 6.7 m instead of 6.0 m; the three octaves
+        // that carry the grain anyone reads as "stone" (1.82 m, 0.50 m,
+        // 0.143 m) move by 3.7%, 0.2% and 0.06%. Nobody can see the first pair.
+        // Everybody could see 4.7 px/m.
+        //
+        // The alternative was nudging `lacunarity` off the authored 3.512 to an
+        // integer, which quantizes exactly from a base span of 2 — and moves
+        // the *fine* octaves instead: 4.0 makes the finest grain 0.085 m
+        // (under-resolved again at 25 px/m), 3.0 makes it 0.27 m (visibly
+        // chunkier stone). The authored chain is kept and the tile absorbs the
+        // error; the repetition a 40 m tile brings is hidden by the anti-tiling
+        // sampler, which is what it is for, and the level's rock is on props
+        // 2–7 m across that never show a 40 m period anyway.
+        world_scale: 0.025,
         triplanar_sharpness: 1.0,
         base_resolution: 1024,
         ..TextureSpec::default()
@@ -767,12 +870,47 @@ mod tests {
     }
 
     #[test]
-    fn quantizing_the_lacunarity_chain_stays_cheap() {
-        // The documented price of seamlessness. If this ever fails, the tile is
-        // too small for the frequency, not the rounding rule being wrong.
-        for (name, spec) in [("grass", grass()), ("rock", rock())] {
+    fn quantizing_the_lacunarity_chain_stays_within_its_budget() {
+        // The documented price of seamlessness, per material — one budget for
+        // both would either let `grass` drift or forbid `rock`'s retune.
+        //
+        // `rock` is deliberately the expensive one: its 40 m tile holds under
+        // two cells of a 21.7 m base feature, so the base octave alone rounds
+        // 8.7% (see `rock`'s comment for why that is the right trade against
+        // 4.7 texels per metre). If *this* ever fails the tile has shrunk
+        // further still, and the next lever is `frequency`, not the rounding
+        // rule.
+        for (name, spec, budget) in [("grass", grass(), 0.035), ("rock", rock(), 0.09)] {
             let error = spec.lacunarity_error();
-            assert!(error < 0.05, "{name}: lacunarity quantized by {error}");
+            assert!(
+                error < budget,
+                "{name}: lacunarity quantized by {:.2}%, budget {:.1}%",
+                error * 100.0,
+                budget * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn the_authored_materials_are_dense_enough_to_read_as_sharp() {
+        // The regression this exists for: `rock` shipped a 217 m tile at 1024²
+        // — 4.7 texels per metre, one texel every 21 cm, and a stepping stone
+        // the player stands on covered by nine of them.
+        for (name, spec) in [("grass", grass()), ("rock", rock())] {
+            let density = spec.texel_density(spec.base_resolution);
+            println!(
+                "{name}: {:.1} m tile, {:.1} px/m at {}²",
+                spec.tile_meters(),
+                density,
+                spec.base_resolution
+            );
+            assert!(
+                density >= 25.0,
+                "{name}: {density:.1} texels/m is blurred up close"
+            );
+            // …and the other end: a tile so small the anti-tiling sampler has
+            // to work over a period the eye can take in at a glance.
+            assert!(spec.tile_meters() >= 20.0, "{name}: {} m tile", spec.tile_meters());
         }
     }
 
@@ -842,7 +980,34 @@ mod tests {
         let rn = r.normal.expect("rock has normals");
         assert_eq!(rn.mode, NormalMode::ToEdge);
         assert_eq!(rn.edge_width, 0.351);
-        assert_eq!(rn.strength, 5.921);
+        // `strength` is the one authored number that is *rescaled* rather than
+        // verbatim, because the bake ties normal amplitude to the tile — see
+        // `the_normal_amplitude_survived_the_density_retune`, which holds the
+        // quantity Godot's 5.921 actually meant.
+        assert_eq!(rn.strength, 29.605);
+    }
+
+    #[test]
+    fn the_normal_amplitude_survived_the_density_retune() {
+        // What the bake multiplies the boundary gradient by is
+        // `strength × (base_span / NORMAL_REFERENCE_TEXELS)`, so `strength`
+        // alone says nothing about how steep a material reads — the product
+        // does. Godot authored 5.921 against a tile holding ten cells; any
+        // retiling that keeps `strength × span` at 59.21 keeps the relief.
+        //
+        // Without this the coupling is invisible: the albedo gets sharper, the
+        // surface goes flat, and the two changes look unrelated.
+        let r = rock();
+        let amplitude = r.normal.expect("rock has normals").strength * r.octave_plan()[0].span;
+        assert!(
+            (amplitude - 59.21).abs() < 1e-3,
+            "rock's normal amplitude is {amplitude}, not the authored 59.21"
+        );
+
+        // grass never re-tiled, so its authored number stands unscaled.
+        let g = grass();
+        let g_amp = g.normal.expect("grass has normals").strength * g.octave_plan()[0].span;
+        assert!((g_amp - 5.106 * 6.0).abs() < 1e-3, "{g_amp}");
     }
 
     #[test]

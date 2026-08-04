@@ -368,6 +368,176 @@ fn baking_is_idempotent_per_handle() {
     assert_eq!(renderer.textures().len(), 1, "one bake, not two");
 }
 
+// ---------------------------------------------------------------------------
+// The mip chain
+// ---------------------------------------------------------------------------
+
+/// One texel of a level, as floats.
+fn texel(pixels: &[u8], x: u32, y: u32, size: u32) -> [f32; 4] {
+    let i = (y as usize * size as usize + x as usize) * 4;
+    [
+        pixels[i] as f32 / 255.0,
+        pixels[i + 1] as f32 / 255.0,
+        pixels[i + 2] as f32 / 255.0,
+        pixels[i + 3] as f32 / 255.0,
+    ]
+}
+
+#[test]
+fn a_bake_carries_a_full_chain_down_to_one_texel() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    // 1×1 is one level, and the registry's default white/flat pair depends on
+    // that being true without a special case.
+    assert_eq!(runt_core::bake::mip_level_count(1), 1);
+    assert_eq!(runt_core::bake::mip_level_count(256), 9);
+    assert_eq!(runt_core::bake::mip_level_count(2048), 12);
+    assert_eq!(runt_core::bake::mip_size(256, 3), 32);
+    assert_eq!(runt_core::bake::mip_size(256, 99), 1, "floored, not zero");
+
+    const N: u32 = 256;
+    let spec = TextureSpec {
+        base_resolution: N,
+        ..texture::rock()
+    };
+    let handle = renderer.bake_texture(&spec, N, &NoopCache);
+    let gpu = renderer.textures().get(handle).expect("just baked");
+
+    for texture in [&gpu.albedo, &gpu.normal] {
+        assert_eq!(
+            texture.mip_level_count(),
+            runt_core::bake::mip_level_count(N),
+            "the texture was allocated with the wrong number of levels"
+        );
+        let chain =
+            runt_core::bake::read_chain(renderer.device(), renderer.queue(), texture, N)
+                .expect("read the chain back");
+        assert_eq!(chain.len(), 9);
+        for (level, pixels) in chain.iter().enumerate() {
+            let size = runt_core::bake::mip_size(N, level as u32) as usize;
+            assert_eq!(pixels.len(), size * size * 4, "level {level} is the wrong size");
+        }
+        // The last level is one texel and it is *written* — an unwritten level
+        // reads back as the clear colour, opaque black, which a real average of
+        // this material never is.
+        let last = chain.last().expect("a chain");
+        assert_eq!(last.len(), 4);
+        assert!(
+            last[0] != 0 || last[1] != 0 || last[2] != 0,
+            "the 1×1 level is black, so the chain stopped early"
+        );
+    }
+}
+
+#[test]
+fn every_albedo_mip_is_the_box_average_of_the_level_above() {
+    // The claim that makes a mip a mip: level i+1 texel (x,y) is the mean of
+    // the 2×2 block at (2x,2y) in level i. If the downsample were sampling the
+    // *field* again at half resolution instead of filtering, this would fail —
+    // and the shimmer it is supposed to fix would still be there.
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    const N: u32 = 128;
+    let spec = TextureSpec {
+        base_resolution: N,
+        ..texture::rock()
+    };
+    let handle = renderer.bake_texture(&spec, N, &NoopCache);
+    let gpu = renderer.textures().get(handle).expect("just baked");
+    let chain = runt_core::bake::read_chain(renderer.device(), renderer.queue(), &gpu.albedo, N)
+        .expect("read the chain back");
+
+    let mut worst = 0.0f32;
+    for level in 1..chain.len() {
+        let src_size = runt_core::bake::mip_size(N, level as u32 - 1);
+        let dst_size = runt_core::bake::mip_size(N, level as u32);
+        for y in 0..dst_size {
+            for x in 0..dst_size {
+                let mut want = [0.0f32; 4];
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let s = texel(&chain[level - 1], x * 2 + dx, y * 2 + dy, src_size);
+                    for c in 0..4 {
+                        want[c] += s[c] * 0.25;
+                    }
+                }
+                let got = texel(&chain[level], x, y, dst_size);
+                for c in 0..4 {
+                    worst = worst.max((got[c] - want[c]).abs());
+                }
+            }
+        }
+    }
+    println!(
+        "worst albedo mip deviation from the box average: {worst:.5} ({:.2} LSB)",
+        worst * 255.0
+    );
+    // One LSB of slack and no more: the average of four 8-bit values is exact
+    // in fp32 and the only loss is the round back to 8 bits.
+    assert!(worst <= 1.5 / 255.0, "mip texels are not box averages ({worst})");
+}
+
+#[test]
+fn every_normal_mip_is_a_unit_vector_pointing_the_average_way() {
+    // Two claims, and the second is why the normal chain is a different shader
+    // from the colour chain. (1) Every level is a *unit* normal — averaging
+    // packed normals without renormalizing shortens the vector, and a short
+    // normal unpacks to a flatter surface, so the crinkle would fade with
+    // distance by an amount that varies per texel. (2) It still points where
+    // the four it came from pointed, so the flattening that *should* happen
+    // (four normals that genuinely disagree average toward flat, and then
+    // renormalize to a direction) is not thrown away either.
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    const N: u32 = 128;
+    let spec = TextureSpec {
+        base_resolution: N,
+        ..texture::rock()
+    };
+    let handle = renderer.bake_texture(&spec, N, &NoopCache);
+    let gpu = renderer.textures().get(handle).expect("just baked");
+    let chain = runt_core::bake::read_chain(renderer.device(), renderer.queue(), &gpu.normal, N)
+        .expect("read the chain back");
+
+    let unpack =
+        |t: [f32; 4]| glam::Vec3::new(t[0] * 2.0 - 1.0, t[1] * 2.0 - 1.0, t[2] * 2.0 - 1.0);
+
+    let mut worst_len = 0.0f32;
+    let mut worst_dir = 0.0f32;
+    for level in 1..chain.len() {
+        let src_size = runt_core::bake::mip_size(N, level as u32 - 1);
+        let dst_size = runt_core::bake::mip_size(N, level as u32);
+        for y in 0..dst_size {
+            for x in 0..dst_size {
+                let got = unpack(texel(&chain[level], x, y, dst_size));
+                worst_len = worst_len.max((got.length() - 1.0).abs());
+
+                let mut sum = glam::Vec3::ZERO;
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    sum += unpack(texel(&chain[level - 1], x * 2 + dx, y * 2 + dy, src_size));
+                }
+                if sum.length() > 1e-3 {
+                    worst_dir = worst_dir.max(got.angle_between(sum.normalize()));
+                }
+            }
+        }
+    }
+    println!(
+        "normal mips: worst |n|-1 = {worst_len:.4}, worst angle off the mean = {:.2}°",
+        worst_dir.to_degrees()
+    );
+    // 8-bit packing puts a floor under both: a unit vector quantized to
+    // 1/255 steps is up to ~0.9% off unit length and ~0.5° off direction.
+    assert!(worst_len < 0.02, "a mip normal is not unit length ({worst_len})");
+    assert!(
+        worst_dir.to_degrees() < 1.5,
+        "a mip normal points {:.2}° away from the average of its quad",
+        worst_dir.to_degrees()
+    );
+}
+
 /// Not an assertion so much as a measurement — DESIGN §7 puts the bake at load
 /// time, so what matters is that it is *seconds*, not minutes, at the §11 cap.
 #[test]

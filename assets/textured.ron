@@ -12,11 +12,19 @@
 //
 // The two materials are the authored 3dimenshift terrain params, ported
 // verbatim (see `runt_core::texture::grass` / `rock`, which this file is held
-// against by `tests/textures_scene.rs`). The one number that is not from the
-// original is `world_scale`: the Godot shader evaluated noise in unbounded world
-// space and had no tile, so the tile size is ours to pick, and it is picked so
-// `frequency / world_scale` lands on a whole (even) number of lattice cells —
-// which is what makes the bake seamless. See `TextureSpec::world_scale`.
+// against by `tests/textures_scene.rs`), with two exceptions, both of them the
+// tile rather than the material:
+//
+//   · `world_scale`, which the Godot shader had no equivalent of — it evaluated
+//     noise in unbounded world space and had no tile at all. The tile size is
+//     ours to pick, and it is picked between two forces: `frequency /
+//     world_scale` wants to land on a whole (even) number of lattice cells, or
+//     the bake is not seamless, and the tile wants to be *small*, or the bake's
+//     texels are spread so thin the surface reads as blurred. See
+//     `TextureSpec::world_scale`.
+//   · `rock`'s normal `strength`, which is rescaled by exactly the amount
+//     needed to keep the relief the Godot number asked for once the tile
+//     changed. See `NORMAL_REFERENCE_TEXELS`.
 (
     textures: [
         (
@@ -60,9 +68,13 @@
                 octaves: 5,
                 lacunarity: 3.512,
                 gain: 0.543,
-                // 217 m tile, exactly 10 cells: no rounding at all. The Godot
-                // fallback's 0.01 would have cost 13%.
-                world_scale: 0.0046,
+                // 40 m tile, 25.6 texels per metre at 1024². The old 0.0046
+                // put exactly 10 cells across a 217 m tile — no rounding at
+                // all, and 4.7 px/m, which is what "the rock looks blurred"
+                // was. See `runt_core::texture::rock` for the full trade: the
+                // chain now rounds 8.7% on its coarsest octave and the grain
+                // octaves move under 4%.
+                world_scale: 0.025,
                 triplanar_sharpness: 1.0,
                 ramp: [
                     (0.12, (0.23, 0.1909, 0.20719166)),
@@ -72,7 +84,12 @@
                 normal: Some((
                     mode: ToEdge,
                     edge_width: 0.351,
-                    strength: 5.921,
+                    // Godot says 5.921; this is 5.921 * 10 / 2, the exact
+                    // compensation for the tile going from 10 base cells to 2.
+                    // The bake differentiates over `base_span / 1024` cells, so
+                    // relief tracks `strength * base_span` — see
+                    // `runt_core::texture::NORMAL_REFERENCE_TEXELS`.
+                    strength: 29.605,
                 )),
                 base_resolution: 1024,
             ),

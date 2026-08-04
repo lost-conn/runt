@@ -191,3 +191,66 @@ fn fs_normal(in: BakeOut) -> @location(0) vec4<f32> {
     // shader unpacks with `* 2 - 1`.
     return vec4<f32>(v * 0.5 + vec3<f32>(0.5), 1.0);
 }
+
+// ---------------------------------------------------------------------------
+// The mip chain
+// ---------------------------------------------------------------------------
+//
+// Level `i+1` is a render pass with level `i` bound as a texture — a downsample
+// *chain*, not a compute dispatch, because DESIGN §11's baseline is WebGL2 and
+// WebGL2 has neither compute nor storage textures. It is the same shape the
+// bake itself uses (one oversized triangle, one colour attachment), pointed at
+// a mip view instead of the whole texture.
+//
+// The filter is an exact 2×2 box: four `textureLoad`s of the source texels the
+// destination texel covers, averaged. `textureLoad` (`texelFetch` in GLSL ES
+// 3.00, core there) rather than one bilinear tap because a bilinear "box" is
+// only as exact as the sampler's filter arithmetic — on a downlevel part that
+// is not necessarily fp32 — while four integer fetches are exactly the average
+// the CPU can predict, which is what `tests/texture_bake.rs` holds mip 1 to.
+//
+// A *separate binding* from the bake uniform (`@group(0) @binding(1)`) rather
+// than a second shader module: a WGSL module has one global scope, the mip
+// pipelines are built against their own bind-group layout, and wgpu validates
+// bindings per entry point — so `fs_albedo` never sees this and `fs_mip_*`
+// never sees the uniform.
+@group(0) @binding(1) var mip_src: texture_2d<f32>;
+
+// The four source texels under one destination texel. `in.clip.xy` is the
+// destination fragment centre, and the attachment is the destination mip, so
+// truncating it gives the destination texel index directly.
+fn mip_quad_origin(clip: vec2<f32>) -> vec2<i32> {
+    return vec2<i32>(clip) * 2;
+}
+
+@fragment
+fn fs_mip_color(in: BakeOut) -> @location(0) vec4<f32> {
+    let o = mip_quad_origin(in.clip.xy);
+    let a = textureLoad(mip_src, o + vec2<i32>(0, 0), 0);
+    let b = textureLoad(mip_src, o + vec2<i32>(1, 0), 0);
+    let c = textureLoad(mip_src, o + vec2<i32>(0, 1), 0);
+    let d = textureLoad(mip_src, o + vec2<i32>(1, 1), 0);
+    return (a + b + c + d) * 0.25;
+}
+
+@fragment
+fn fs_mip_normal(in: BakeOut) -> @location(0) vec4<f32> {
+    let o = mip_quad_origin(in.clip.xy);
+    var sum = vec3<f32>(0.0);
+    for (var i = 0; i < 4; i = i + 1) {
+        let t = o + vec2<i32>(i & 1, i >> 1u);
+        sum = sum + (textureLoad(mip_src, t, 0).xyz * 2.0 - vec3<f32>(1.0));
+    }
+    // Averaging *packed* normals and storing that is the classic bug: four unit
+    // vectors that disagree average to something shorter than unit, and once
+    // the material shader unpacks it the surface reads as flatter — by a
+    // different amount per texel, so the crinkle fades unevenly with distance
+    // rather than smoothly. Renormalizing keeps every level a unit normal,
+    // which is what the whiteout blend in `shader.wgsl` assumes.
+    let len = length(sum);
+    var n = vec3<f32>(0.0, 0.0, 1.0);
+    if (len > 1.0e-6) {
+        n = sum / len;
+    }
+    return vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0);
+}

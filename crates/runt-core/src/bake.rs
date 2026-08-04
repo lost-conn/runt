@@ -8,14 +8,33 @@
 //!
 //! ```text
 //!   TextureSpec ──► vs_bake (fullscreen triangle)
-//!                     ├─ fs_albedo ─► RGBA8, ramp-mapped colour
-//!                     └─ fs_normal ─► RGBA8, packed Voronoi-boundary normal
+//!                     ├─ fs_albedo ─► RGBA8, ramp-mapped colour ─┐
+//!                     └─ fs_normal ─► RGBA8, packed normal ──────┤
+//!                                                                │
+//!                     ┌──────────── mip chain ───────────────────┘
+//!                     ├─ fs_mip_color  ─► level i+1 from level i (2×2 box)
+//!                     └─ fs_mip_normal ─► same, unpacked → averaged →
+//!                                          renormalized → repacked
 //! ```
 //!
 //! Two single-target passes rather than one MRT pass: two colour attachments
 //! would also fit `downlevel_webgl2_defaults`, but a single attachment is the
 //! shape every backend agrees on without thinking about it, and this is
 //! load-time work the content cache mostly skips.
+//!
+//! ## Mipmaps (DESIGN §7, §11)
+//!
+//! Every baked target carries a full chain down to 1×1, generated at bake time
+//! by a render-pass downsample — no compute, no storage textures, nothing
+//! WebGL2 lacks. Without it every sample reads level 0 regardless of how many
+//! world metres a pixel covers, which shows up as *shimmer* at distance (the
+//! texture is minified and point-picked out of a field it is under-sampling)
+//! and, indirectly, as *blur* up close, because the only way to fight the
+//! shimmer was to author a tile so large that its texel density collapsed.
+//!
+//! The chain costs 1/3 more memory and 1/3 more cached bytes, and roughly
+//! `2·log2(resolution)` extra render passes over targets that halve each time —
+//! a few percent of a bake.
 //!
 //! ## Caching (DESIGN §6's invariant, applied one level down)
 //!
@@ -28,11 +47,12 @@
 //!        └─ persistent → CacheStore::load_texture: handle → raw RGBA8 bytes
 //! ```
 //!
-//! A store entry is untrusted: it carries the `postcard` bytes of the spec it
-//! was baked from and its resolution, and anything that does not match exactly
-//! — wrong size, stale layout, key collision, hostile file — is discarded and
-//! rebaked. `tests/texture_cache.rs` runs cold, warm and deleted-mid-run and
-//! demands byte-identical pixels from all three.
+//! A store entry is untrusted: it carries a format version, the `postcard`
+//! bytes of the spec it was baked from and its resolution, and anything that
+//! does not match exactly — wrong version, wrong size, stale layout, key
+//! collision, hostile file — is discarded and rebaked.
+//! `tests/texture_cache.rs` runs cold, warm and deleted-mid-run and demands
+//! byte-identical pixels from all three.
 //!
 //! Reading pixels back off the GPU needs a blocking device poll, which is not
 //! available on the web. Stores therefore opt in with
@@ -164,6 +184,33 @@ impl BakeUniform {
 // The persisted form
 // ---------------------------------------------------------------------------
 
+/// The layout version of a stored bake.
+///
+/// Bumped whenever the *shape* of what a bake produces changes, so that an
+/// entry written by an older engine is refused rather than reinterpreted.
+/// Version 2 added the mip chain: v1 stored a single level per map, and a v1
+/// blob decoded as a v2 one would hand the renderer a texture whose upper
+/// levels are whatever the last session's allocator had lying around.
+///
+/// This is belt and braces — the spec bytes and the per-level lengths would
+/// each already reject a v1 entry — but a version field states the intent
+/// where a length check only implies it, and it is the field a future change
+/// can lean on when the sizes happen to line up.
+pub const TEXTURE_DATA_VERSION: u32 = 2;
+
+/// Mip levels a square `resolution` texture carries: the full chain to 1×1.
+///
+/// `1` for a 1×1 texture (the registry's default white/flat pair), so the
+/// no-texture path needs no special case.
+pub fn mip_level_count(resolution: u32) -> u32 {
+    u32::BITS - resolution.max(1).leading_zeros()
+}
+
+/// The edge length of `level` of a `resolution` texture, floored at 1.
+pub fn mip_size(resolution: u32, level: u32) -> u32 {
+    (resolution >> level.min(31)).max(1)
+}
+
 /// One baked texture's raw pixels, as the persistent cache stores them.
 ///
 /// `spec` is the `postcard` encoding of the [`TextureSpec`] this came from, not
@@ -172,21 +219,34 @@ impl BakeUniform {
 /// entry fail loudly instead of quietly painting the wrong terrain.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextureData {
+    /// [`TEXTURE_DATA_VERSION`] at the time of writing.
+    pub version: u32,
     pub resolution: u32,
     pub spec: Vec<u8>,
-    /// `resolution² × 4` bytes, RGBA8, row-major from the top.
-    pub albedo: Vec<u8>,
+    /// The albedo mip chain, level 0 first, each level `size² × 4` bytes of
+    /// RGBA8 row-major from the top. Storing the chain rather than
+    /// regenerating it on load keeps the cache's contract exact — a warm start
+    /// gets the same texels in every level, not merely the same level 0.
+    pub albedo: Vec<Vec<u8>>,
     /// Same shape, packed tangent-space normals.
-    pub normal: Vec<u8>,
+    pub normal: Vec<Vec<u8>>,
 }
 
 impl TextureData {
     /// Whether this entry really is a bake of `spec` at `resolution`.
     pub fn matches(&self, spec: &TextureSpec, resolution: u32) -> bool {
-        let expected = (resolution as usize) * (resolution as usize) * 4;
-        self.resolution == resolution
-            && self.albedo.len() == expected
-            && self.normal.len() == expected
+        let levels = mip_level_count(resolution) as usize;
+        let chain_ok = |chain: &Vec<Vec<u8>>| {
+            chain.len() == levels
+                && chain.iter().enumerate().all(|(level, pixels)| {
+                    let size = mip_size(resolution, level as u32) as usize;
+                    pixels.len() == size * size * 4
+                })
+        };
+        self.version == TEXTURE_DATA_VERSION
+            && self.resolution == resolution
+            && chain_ok(&self.albedo)
+            && chain_ok(&self.normal)
             && postcard::to_stdvec(spec).map(|b| b == self.spec).unwrap_or(false)
     }
 }
@@ -203,6 +263,11 @@ impl TextureData {
 pub struct TextureBaker {
     albedo: wgpu::RenderPipeline,
     normal: wgpu::RenderPipeline,
+    /// Level `i+1` from level `i`: a plain 2×2 box.
+    mip_color: wgpu::RenderPipeline,
+    /// Same, but unpacking, averaging, renormalizing and repacking.
+    mip_normal: wgpu::RenderPipeline,
+    mip_layout: wgpu::BindGroupLayout,
     buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
@@ -244,15 +309,39 @@ impl TextureBaker {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
+
+        // The downsample's own group 0: the level above, and nothing else. It
+        // shares `binding: 1` with nothing the bake pass uses, and wgpu checks
+        // bindings per entry point, so the two pipelines coexist in one module.
+        // No sampler — `fs_mip_*` fetches texels by integer index.
+        let mip_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mip source layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let mip_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mip pipeline layout"),
+            bind_group_layouts: &[Some(&mip_layout)],
+            immediate_size: 0,
+        });
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("texture bake"),
             source: wgpu::ShaderSource::Wgsl(bake_shader_source().into()),
         });
 
-        let make = |entry: &str, label: &str| {
+        let make_with = |entry: &str, label: &str, pipeline_layout: &wgpu::PipelineLayout| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&pipeline_layout),
+                layout: Some(pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_bake"),
@@ -280,16 +369,21 @@ impl TextureBaker {
                 cache: None,
             })
         };
+        let make = |entry: &str, label: &str| make_with(entry, label, &pipeline_layout);
 
         TextureBaker {
             albedo: make("fs_albedo", "bake albedo"),
             normal: make("fs_normal", "bake normal"),
+            mip_color: make_with("fs_mip_color", "mip color", &mip_pipeline_layout),
+            mip_normal: make_with("fs_mip_normal", "mip normal", &mip_pipeline_layout),
+            mip_layout,
             buffer,
             bind_group,
         }
     }
 
-    /// Render `spec` to a fresh (albedo, normal) pair at `resolution`.
+    /// Render `spec` to a fresh (albedo, normal) pair at `resolution`, each with
+    /// a full mip chain.
     pub fn bake(
         &self,
         device: &wgpu::Device,
@@ -312,7 +406,12 @@ impl TextureBaker {
             (&albedo, &self.albedo, "bake albedo pass"),
             (&normal, &self.normal, "bake normal pass"),
         ] {
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            // Level 0 only: the chain below it is filtered from this, not
+            // re-evaluated at a lower resolution. Point-sampling the field
+            // again at half the density would alias exactly as badly as having
+            // no mips at all — the whole job of a mip is to *average* the
+            // detail it can no longer resolve.
+            let view = mip_view(texture, 0);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -335,10 +434,82 @@ impl TextureBaker {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+
+        self.generate_mips(device, &mut encoder, &albedo, resolution, &self.mip_color);
+        self.generate_mips(device, &mut encoder, &normal, resolution, &self.mip_normal);
+
         queue.submit(Some(encoder.finish()));
 
         (albedo, normal)
     }
+
+    /// Fill levels `1..n` of `texture` from level 0, one render pass each.
+    ///
+    /// Public so the cache-hit path can rebuild a chain it did not bake, and so
+    /// the tests can drive the two filters against a texture they uploaded
+    /// themselves.
+    pub fn generate_mips(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+        resolution: u32,
+        pipeline: &wgpu::RenderPipeline,
+    ) {
+        for level in 1..mip_level_count(resolution) {
+            let source = mip_view(texture, level - 1);
+            let target = mip_view(texture, level);
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mip source"),
+                layout: &self.mip_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&source),
+                }],
+            });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("mip downsample"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    /// The albedo chain's filter: a plain 2×2 box.
+    pub fn mip_color_pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.mip_color
+    }
+
+    /// The normal chain's filter: 2×2 box in *unpacked* space, renormalized.
+    pub fn mip_normal_pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.mip_normal
+    }
+}
+
+/// A view of exactly one mip level — what a downsample reads and what it
+/// writes. A default view spans the whole chain, which is right for sampling
+/// and wrong for both ends of this pass.
+fn mip_view(texture: &wgpu::Texture, level: u32) -> wgpu::TextureView {
+    texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("mip level"),
+        base_mip_level: level,
+        mip_level_count: Some(1),
+        ..Default::default()
+    })
 }
 
 fn create_target(device: &wgpu::Device, resolution: u32, label: &str) -> wgpu::Texture {
@@ -349,11 +520,11 @@ fn create_target(device: &wgpu::Device, resolution: u32, label: &str) -> wgpu::T
             height: resolution,
             depth_or_array_layers: 1,
         },
-        // One level. Mipmaps would want a downsample chain and the anti-tiling
-        // sampler would want `textureSampleGrad` to keep them correct; both are
-        // future work, and the material samples at an explicit LOD 0 so nothing
-        // silently reads a level that is not there.
-        mip_level_count: 1,
+        // The full chain to 1×1. Every level is a render target (it is filled
+        // by a downsample pass) as well as a sampled texture, which is why the
+        // usage below carries `RENDER_ATTACHMENT` for the whole texture rather
+        // than only for level 0.
+        mip_level_count: mip_level_count(resolution),
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: BAKE_FORMAT,
@@ -365,50 +536,64 @@ fn create_target(device: &wgpu::Device, resolution: u32, label: &str) -> wgpu::T
     })
 }
 
-/// Upload already-baked pixels — the cache-hit path, which must land on exactly
-/// the texture a cold bake would have produced.
+/// Upload an already-baked mip chain — the cache-hit path, which must land on
+/// exactly the texture a cold bake would have produced, *including* the levels
+/// a cold bake filtered rather than rendered.
+///
+/// `levels` is level 0 first. Levels beyond the chain are ignored and missing
+/// ones are left undefined, so callers hand over a chain that
+/// [`TextureData::matches`] has already vetted.
 pub fn upload_target(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     resolution: u32,
-    pixels: &[u8],
+    levels: &[Vec<u8>],
     label: &str,
 ) -> wgpu::Texture {
     let texture = create_target(device, resolution, label);
-    queue.write_texture(
-        texture.as_image_copy(),
-        pixels,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(resolution * 4),
-            rows_per_image: Some(resolution),
-        },
-        wgpu::Extent3d {
-            width: resolution,
-            height: resolution,
-            depth_or_array_layers: 1,
-        },
-    );
+    for (level, pixels) in levels.iter().enumerate().take(mip_level_count(resolution) as usize) {
+        let level = level as u32;
+        let size = mip_size(resolution, level);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                mip_level: level,
+                ..texture.as_image_copy()
+            },
+            pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size * 4),
+                rows_per_image: Some(size),
+            },
+            wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
     texture
 }
 
-/// Read an RGBA8 texture back, tightly packed.
+/// Read one RGBA8 mip level back, tightly packed.
 ///
 /// Blocking: it polls the device until the map callback fires. Only ever called
 /// when a [`CacheStore`] said it can persist textures, which the web store does
 /// not (there is no blocking poll in a browser).
-pub fn read_target(
+pub fn read_level(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
     resolution: u32,
+    level: u32,
 ) -> Option<Vec<u8>> {
-    let unpadded = resolution * 4;
+    let size = mip_size(resolution, level);
+    let unpadded = size * 4;
     // `copy_texture_to_buffer` wants rows aligned to 256 bytes.
     let padded = unpadded.div_ceil(256) * 256;
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("bake readback"),
-        size: (padded as u64) * (resolution as u64),
+        size: (padded as u64) * (size as u64),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -417,18 +602,21 @@ pub fn read_target(
         label: Some("bake readback"),
     });
     encoder.copy_texture_to_buffer(
-        texture.as_image_copy(),
+        wgpu::TexelCopyTextureInfo {
+            mip_level: level,
+            ..texture.as_image_copy()
+        },
         wgpu::TexelCopyBufferInfo {
             buffer: &readback,
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(padded),
-                rows_per_image: Some(resolution),
+                rows_per_image: Some(size),
             },
         },
         wgpu::Extent3d {
-            width: resolution,
-            height: resolution,
+            width: size,
+            height: size,
             depth_or_array_layers: 1,
         },
     );
@@ -444,14 +632,37 @@ pub fn read_target(
     rx.recv().ok()?.ok()?;
 
     let mapped = readback.get_mapped_range(..).ok()?;
-    let mut pixels = Vec::with_capacity((unpadded * resolution) as usize);
-    for row in 0..resolution as usize {
+    let mut pixels = Vec::with_capacity((unpadded * size) as usize);
+    for row in 0..size as usize {
         let start = row * padded as usize;
         pixels.extend_from_slice(&mapped[start..start + unpadded as usize]);
     }
     drop(mapped);
     readback.unmap();
     Some(pixels)
+}
+
+/// Read level 0 back — what "the texture" means to everything that does not
+/// care about the chain.
+pub fn read_target(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    resolution: u32,
+) -> Option<Vec<u8>> {
+    read_level(device, queue, texture, resolution, 0)
+}
+
+/// Read the whole mip chain back, level 0 first — what the cache stores.
+pub fn read_chain(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    resolution: u32,
+) -> Option<Vec<Vec<u8>>> {
+    (0..mip_level_count(resolution))
+        .map(|level| read_level(device, queue, texture, resolution, level))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -531,6 +742,19 @@ impl TextureRegistry {
 
         // Repeat, because the bake *is* a tile — a clamped sampler would smear
         // the last texel across a hillside.
+        //
+        // Trilinear: `Linear` between levels as well as within one. `Nearest`
+        // between levels is a visible seam in the middle of a hillside — the
+        // band where the LOD flips is a hard edge in sharpness — and the
+        // difference costs one extra bilinear fetch that every part shipping
+        // since 2005 does in fixed function.
+        //
+        // No anisotropy, deliberately: the anti-tiling sampler already spends
+        // nine taps per plane and three planes per fragment, and multiplying
+        // that by an anisotropic tap count is exactly the fragment cost DESIGN
+        // §7's whole bake-vs-live argument exists to avoid. The cost is some
+        // blur on ground planes at grazing angles, which is the standard
+        // trilinear trade.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("baked texture sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -538,15 +762,28 @@ impl TextureRegistry {
             address_mode_w: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
 
         // 1×1 white albedo and 1×1 flat normal: an untextured material's
         // sampling multiplies by white and perturbs the normal by nothing, so
-        // the bit-unset path is *provably* the pre-texture look.
-        let white = upload_target(device, queue, 1, &[255, 255, 255, 255], "default albedo");
-        let flat = upload_target(device, queue, 1, &[128, 128, 255, 255], "default normal");
+        // the bit-unset path is *provably* the pre-texture look. A 1×1 texture
+        // has exactly one mip level, so the chain needs no special case here.
+        let white = upload_target(
+            device,
+            queue,
+            1,
+            std::slice::from_ref(&vec![255, 255, 255, 255]),
+            "default albedo",
+        );
+        let flat = upload_target(
+            device,
+            queue,
+            1,
+            std::slice::from_ref(&vec![128, 128, 255, 255]),
+            "default normal",
+        );
         let default_params = create_params(device, queue, 1.0, 4.0, false);
         let default_bind_group = create_bind_group(
             device,
@@ -632,12 +869,13 @@ impl TextureRegistry {
                 let (albedo, normal) = baker.bake(device, queue, spec, resolution);
                 if store.caches_textures() {
                     if let (Some(a), Some(n)) = (
-                        read_target(device, queue, &albedo, resolution),
-                        read_target(device, queue, &normal, resolution),
+                        read_chain(device, queue, &albedo, resolution),
+                        read_chain(device, queue, &normal, resolution),
                     ) {
                         store.store_texture(
                             handle.0,
                             &TextureData {
+                                version: TEXTURE_DATA_VERSION,
                                 resolution,
                                 spec: postcard::to_stdvec(spec).unwrap_or_default(),
                                 albedo: a,

@@ -82,15 +82,35 @@ fn vs_main(
 // Baked-texture sampling (DESIGN §7)
 // ---------------------------------------------------------------------------
 //
-// Everything below samples at an explicit LOD 0. The bake writes one mip level,
-// so an implicit-derivative `textureSample` would read exactly the same texels
-// — and an explicit level frees the anti-tiling loop from WGSL's uniform
-// control-flow rule, which the offset taps would otherwise have to argue with.
-// When mipmapped bakes land, this becomes `textureSampleGrad` with the
-// pre-offset derivatives (which is what the Quilez trick wants anyway).
+// Everything below samples with **explicit gradients**, taken once per fragment
+// from the un-offset plane UV and handed to every tap.
+//
+// Three things have to be true at once and only `textureSampleGrad` makes them
+// so. (1) The bake carries a full mip chain now, so a tap has to pick a level
+// or it shimmers. (2) The anti-tiling offsets are a per-virtual-cell hash: two
+// neighbouring pixels of a quad can land in different cells, so the *implicit*
+// derivative of `uv + o` jumps by a whole tile at every cell boundary, and an
+// implicit-LOD `textureSample` would pick the bottom of the chain there —
+// a grid of blurred seams, which is worse than the repetition the trick exists
+// to hide. (3) `dpdx`/`dpdy` are implicit-derivative built-ins and WGSL only
+// allows them in uniform control flow, so they are taken in `fs_main` and
+// passed down rather than computed inside the loop.
+//
+// Downlevel: WGSL `textureSampleGrad` lowers to GLSL `textureGrad`, which is
+// core in GLSL ES 3.00 (so, all of WebGL2) and carries no uniformity
+// requirement of its own — unlike `texture()`, it is well-defined inside the
+// loop. naga's GLSL backend emits it for `SampleLevel::Gradient` and even uses
+// it as its *workaround* for backends where `textureLod` misbehaves, so it is
+// the better-supported of the two paths, not the riskier one.
 
-fn tap(t: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
-    return textureSampleLevel(t, t_sampler, uv, 0.0);
+// One plane's texture-space derivatives, computed before any offset is applied.
+struct Grad {
+    dx: vec2<f32>,
+    dy: vec2<f32>,
+};
+
+fn tap(t: texture_2d<f32>, uv: vec2<f32>, g: Grad) -> vec4<f32> {
+    return textureSampleGrad(t, t_sampler, uv, g.dx, g.dy);
 }
 
 // A 2D integer-style hash for the anti-tiling offsets. The original used
@@ -110,29 +130,32 @@ fn notile_hash2(p_in: vec2<f32>) -> vec2<f32> {
 // The tile itself is exactly seamless (see `runt_core::texture`), so this is
 // solving *repetition*, not *seams* — two different problems that a blended
 // "seamless" texture conflates.
-fn notile(t: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
+fn notile(t: texture_2d<f32>, uv: vec2<f32>, g: Grad) -> vec4<f32> {
     let cell = floor(uv);
     let f = uv - cell;
     var acc = vec4<f32>(0.0);
     var wsum = 0.0;
     for (var j = -1; j <= 1; j = j + 1) {
         for (var i = -1; i <= 1; i = i + 1) {
-            let g = vec2<f32>(f32(i), f32(j));
-            let o = notile_hash2(cell + g);
-            let r = g - f + o;
+            let n = vec2<f32>(f32(i), f32(j));
+            let o = notile_hash2(cell + n);
+            let r = n - f + o;
             let w = exp(-5.0 * dot(r, r));
-            acc = acc + w * tap(t, uv + o);
+            // The *same* gradient for every tap. The offset is a translation in
+            // tile space, so it does not change how fast the texture moves
+            // under the pixel — only where it is read from.
+            acc = acc + w * tap(t, uv + o, g);
             wsum = wsum + w;
         }
     }
     return acc / wsum;
 }
 
-fn plane_tap(t: texture_2d<f32>, uv: vec2<f32>, anti_tiling: bool) -> vec4<f32> {
+fn plane_tap(t: texture_2d<f32>, uv: vec2<f32>, g: Grad, anti_tiling: bool) -> vec4<f32> {
     if (anti_tiling) {
-        return notile(t, uv);
+        return notile(t, uv, g);
     }
-    return tap(t, uv);
+    return tap(t, uv, g);
 }
 
 // Triplanar weights: `pow(abs(N), sharpness)` normalized to sum to 1. The
@@ -161,21 +184,31 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         let sharpness = tex.config.y;
         let anti_tiling = tex.config.z > 0.5;
         let p = in.world_pos * world_scale;
+        // The three planes' derivatives, taken here — at the top of the
+        // fragment, in uniform control flow — because `dpdx`/`dpdy` may not be
+        // called from inside the anti-tiling loop, and because the loop wants
+        // the derivative of the *un-offset* UV anyway. `world_scale` is a
+        // uniform, so this is the world-space derivative scaled once.
+        let g_xy = Grad(dpdx(p.xy), dpdy(p.xy));
+        let g_xz = Grad(dpdx(p.xz), dpdy(p.xz));
+        let g_yz = Grad(dpdx(p.yz), dpdy(p.yz));
         // The weight-to-plane mapping is the original's: the Z-normal weight
         // drives the XY plane, Y drives XZ, X drives YZ.
         let blend = triplanar_blend(n, sharpness);
 
-        let c_xy = plane_tap(t_albedo, p.xy, anti_tiling);
-        let c_xz = plane_tap(t_albedo, p.xz, anti_tiling);
-        let c_yz = plane_tap(t_albedo, p.yz, anti_tiling);
+        let c_xy = plane_tap(t_albedo, p.xy, g_xy, anti_tiling);
+        let c_xz = plane_tap(t_albedo, p.xz, g_xz, anti_tiling);
+        let c_yz = plane_tap(t_albedo, p.yz, g_yz, anti_tiling);
         albedo = albedo * (c_xy.rgb * blend.z + c_xz.rgb * blend.y + c_yz.rgb * blend.x);
 
         if (F_NORMAL_MAP) {
             // Plain taps, no anti-tiling: the crinkle is high-frequency and
             // repetition does not read on it, so it is not worth 3× the taps.
-            let n_xy = tap(t_normal, p.xy).xy * 2.0 - vec2<f32>(1.0);
-            let n_xz = tap(t_normal, p.xz).xy * 2.0 - vec2<f32>(1.0);
-            let n_yz = tap(t_normal, p.yz).xy * 2.0 - vec2<f32>(1.0);
+            // Mip-correct all the same — an unmipped normal map is the loudest
+            // shimmer on screen, because the lighting amplifies it.
+            let n_xy = tap(t_normal, p.xy, g_xy).xy * 2.0 - vec2<f32>(1.0);
+            let n_xz = tap(t_normal, p.xz, g_xz).xy * 2.0 - vec2<f32>(1.0);
+            let n_yz = tap(t_normal, p.yz, g_yz).xy * 2.0 - vec2<f32>(1.0);
             // "Whiteout" triplanar normal blend: each plane's tangent offsets
             // are applied along that plane's world axes and summed onto the
             // geometric normal. Cheap, stable, and it cannot flip a normal
