@@ -33,6 +33,14 @@
 //! | [`ObbCollider`] | box, arbitrary [`Quat`] |
 //! | [`TerrainSurface`] | the analytic height field, sampled — never its mesh |
 //!
+//! …plus one shape that is not convex and not a component: [`Trimesh`], a
+//! **static** triangle soup with a BVH over it, pushed into a snapshot by hand
+//! ([`CollisionWorld::push_collider`]). It is the answer to CSG-baked geometry,
+//! which has no analytic form — DESIGN §9a's 2026-08-04 trimesh amendment. It is
+//! immutable after [`Trimesh::build`] and it never moves; everything downstream
+//! of contact generation (classification, push-out, snap, stop-on-slope) is the
+//! code the convex shapes already went through.
+//!
 //! Everything that *moves* is a swept sphere along a **vertical** segment: a
 //! capsule of `{radius, height}`, or the degenerate zero-length case, a sphere.
 //! One shape family means one contact routine, which is what keeps the sphere
@@ -83,9 +91,12 @@
 //!
 //! - [`CollisionWorld`] sorts its colliders and terrain patches by `Entity` at
 //!   construction; every scan is a `Vec` walk in that order. No hash container
-//!   is iterated anywhere in this file.
+//!   is iterated anywhere in this file. ([`Trimesh::build`] *looks up* in a
+//!   `HashMap` while welding, and never iterates it — the output order is the
+//!   input's.)
 //! - Contact selection picks the greatest `depth`; an exact tie goes to the
-//!   lowest `Entity`. Velocity is projected against contacts in `Entity` order.
+//!   lowest `Entity`, and within one [`Trimesh`] to the lowest triangle index.
+//!   Velocity is projected against contacts in `Entity` order.
 //! - Every iteration count is a compile-time constant
 //!   ([`SLIDE_ITERATIONS`], [`MAX_SUBSTEPS`], [`SEGMENT_SEARCH_ITERATIONS`],
 //!   [`RAY_BISECTIONS`], [`RAY_MAX_STEPS`]). Nothing loops until an error
@@ -108,8 +119,12 @@
 //!
 //! ## What this is not
 //!
-//! No swept CCD (see [`MAX_SUBSTEPS`] for what is done instead), no trimesh or
-//! BVH, no dynamic-dynamic response, no joints. See DESIGN §9.
+//! No swept CCD (see [`MAX_SUBSTEPS`] for what is done instead), no *dynamic*
+//! trimesh, no convex decomposition, no mesh-vs-mesh, no dynamic-dynamic
+//! response, no joints. See DESIGN §9 and §9a.
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use bevy_ecs::prelude::*;
 use glam::{Quat, Vec3};
@@ -575,19 +590,920 @@ struct RawContact {
 }
 
 // ---------------------------------------------------------------------------
+// Static trimeshes (DESIGN §9a, 2026-08-04)
+// ---------------------------------------------------------------------------
+
+/// Grid the welder snaps positions onto, in metres.
+///
+/// 0.1 mm: two vertices a CSG bake emitted separately for the same corner land
+/// on the same key, and two vertices a level author *meant* to keep apart never
+/// do. The quantised key is what the lookup is on; the vertex kept is the
+/// **first occurrence's exact position**, so welding never moves geometry by up
+/// to half a cell — it only ever discards duplicates.
+pub const WELD_GRID: f32 = 1.0e-4;
+
+/// Squared cross-product length below which a triangle is dropped as
+/// degenerate. Same threshold and the same reasoning as `runt_mesh`'s
+/// `DEGENERATE_AREA_SQ` (which is crate-private there): a real triangle's raw
+/// cross is ~1e-4 squared, a float sliver's is ~1e-17.
+pub const DEGENERATE_AREA_SQ: f32 = 1.0e-12;
+
+/// Triangles per BVH leaf. Eight is the point where the leaf's linear scan is
+/// cheaper than another level of node tests, and it caps the number of contacts
+/// one leaf can contribute.
+pub const BVH_LEAF_TRIS: usize = 8;
+
+/// Depth of the fixed traversal stack. The build splits at the **median index**,
+/// so the tree is balanced by construction and depth is `ceil(log2(n/8)) + 1` —
+/// 64 covers 2^66 triangles, i.e. it cannot be reached. It is a fixed-size array
+/// rather than a `Vec` so traversal allocates nothing and its bound is a
+/// compile-time constant (DESIGN §9a).
+pub const BVH_STACK_DEPTH: usize = 64;
+
+/// One node of a [`Trimesh`]'s BVH.
+///
+/// Flat `Vec`, children as indices, no `Box`: the whole tree is one allocation
+/// and one memcpy, and a node index is a `u32` a fixed-size stack can hold.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BvhNode {
+    min: Vec3,
+    max: Vec3,
+    /// Leaf: the first triangle. Inner: the left child node.
+    first: u32,
+    /// Leaf: how many triangles (always `> 0`). Inner: `0`.
+    count: u32,
+    /// Inner: the right child node. Leaf: unused.
+    right: u32,
+    /// Inner: the axis the split was made on, `0..3`. Leaf: `3`.
+    axis: u32,
+}
+
+impl BvhNode {
+    pub fn bounds(&self) -> (Vec3, Vec3) {
+        (self.min, self.max)
+    }
+
+    pub fn is_leaf(&self) -> bool {
+        self.count > 0
+    }
+
+    /// `(first triangle, count)` for a leaf, `None` for an inner node.
+    pub fn leaf_range(&self) -> Option<(u32, u32)> {
+        self.is_leaf().then_some((self.first, self.count))
+    }
+
+    /// `(left, right)` node indices for an inner node, `None` for a leaf.
+    pub fn children(&self) -> Option<(u32, u32)> {
+        (!self.is_leaf()).then_some((self.first, self.right))
+    }
+
+    /// The axis an inner node was split on, `None` for a leaf.
+    pub fn split_axis(&self) -> Option<usize> {
+        (!self.is_leaf()).then_some(self.axis as usize)
+    }
+
+    /// Does this node's box overlap `[lo, hi]`?
+    #[inline]
+    fn overlaps(&self, lo: Vec3, hi: Vec3) -> bool {
+        self.min.cmple(hi).all() && self.max.cmpge(lo).all()
+    }
+}
+
+/// A **static** triangle soup with a BVH over it.
+///
+/// Immutable after [`build`](Trimesh::build), which is what lets the whole thing
+/// live behind an [`Arc`] and be shared by every entry that references it: a
+/// level's baked geometry is built once at load and then only read.
+///
+/// ## What `build` does, and why each step is deterministic
+///
+/// 1. **Weld** positions onto a [`WELD_GRID`] cell. The lookup is a `HashMap`,
+///    but the *output* order is the input's — vertices are appended on first
+///    occurrence, so nothing here iterates a hash container and two runs over
+///    the same soup produce the same `verts` array.
+/// 2. **Drop degenerates** — a triangle with a repeated welded index, or a raw
+///    cross below [`DEGENERATE_AREA_SQ`]. A zero-area triangle has no normal,
+///    and a contact routine that divides by its length is a NaN generator.
+/// 3. **Face normals**, precomputed once. They are the contact normal the solver
+///    reports on the face interior, so the surface a body stands on is the
+///    surface the level author authored — not an average of whatever the
+///    tessellator did nearby.
+/// 4. **BVH**, top-down: split at the *median index* of the triangles sorted by
+///    centroid along the longest axis of the node's centroid bounds, keyed
+///    `(axis value, original triangle index)` so equal centroids still have one
+///    order. Median-index (rather than median-value) split means the halves are
+///    always the same size, which is what bounds the depth — a soup whose
+///    centroids all coincide splits evenly instead of recursing forever.
+///
+/// The triangles are physically reordered into BVH order, so a leaf is a
+/// contiguous range and "ascending triangle index" — the tie-break rule for both
+/// contacts and raycasts — is the order the arrays are already in.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Trimesh {
+    verts: Vec<Vec3>,
+    tris: Vec<[u32; 3]>,
+    face_normals: Vec<Vec3>,
+    /// Three bits per triangle: bit `k` is set when edge `k` (`0` = `a→b`, `1` =
+    /// `b→c`, `2` = `c→a`) is **exposed** — an open boundary of the soup, or a
+    /// ridge the surface genuinely turns a corner at. A clear bit is a *seam*: a
+    /// shared edge where the neighbour continues this triangle's surface flat or
+    /// concave, so touching it is touching the face. See
+    /// [`build_from_soup`](Trimesh::build_from_soup).
+    edge_flags: Vec<u8>,
+    nodes: Vec<BvhNode>,
+}
+
+/// One triangle while the tree is being built. Dropped once the arrays are
+/// written out in BVH order.
+struct BuildTri {
+    centroid: Vec3,
+    min: Vec3,
+    max: Vec3,
+    tri: [u32; 3],
+    normal: Vec3,
+    edge_flags: u8,
+    /// Index in the *welded* triangle list, before any reordering: the
+    /// tie-break key, and the one thing about a triangle that a sort cannot
+    /// change.
+    original: u32,
+}
+
+impl Trimesh {
+    /// Build from a [`MeshData`](runt_mesh::MeshData) — the mesh a generator or
+    /// a CSG bake produced. Only `positions` and `indices` are read; normals,
+    /// UVs and colours are the drawing's business, not the collider's.
+    pub fn build(mesh: &runt_mesh::MeshData) -> Arc<Trimesh> {
+        Trimesh::build_from_soup(&mesh.positions, &mesh.indices)
+    }
+
+    /// Build from bare slices, for geometry that never became a `MeshData`.
+    pub fn build_from_soup(positions: &[Vec3], indices: &[u32]) -> Arc<Trimesh> {
+        // -- weld ----------------------------------------------------------
+        let mut verts: Vec<Vec3> = Vec::new();
+        let mut welded: Vec<u32> = Vec::with_capacity(positions.len());
+        let mut grid: HashMap<[i64; 3], u32> = HashMap::with_capacity(positions.len());
+        for &p in positions {
+            let key = weld_key(p);
+            let index = *grid.entry(key).or_insert_with(|| {
+                verts.push(p);
+                (verts.len() - 1) as u32
+            });
+            welded.push(index);
+        }
+
+        // -- triangles, degenerates dropped, normals precomputed ------------
+        let mut items: Vec<BuildTri> = Vec::with_capacity(indices.len() / 3);
+        for face in indices.chunks_exact(3) {
+            debug_assert!(
+                face.iter().all(|i| (*i as usize) < welded.len()),
+                "trimesh index out of range of the position array"
+            );
+            if face.iter().any(|i| (*i as usize) >= welded.len()) {
+                continue;
+            }
+            let tri = [
+                welded[face[0] as usize],
+                welded[face[1] as usize],
+                welded[face[2] as usize],
+            ];
+            if tri[0] == tri[1] || tri[1] == tri[2] || tri[0] == tri[2] {
+                continue;
+            }
+            let (a, b, c) = (
+                verts[tri[0] as usize],
+                verts[tri[1] as usize],
+                verts[tri[2] as usize],
+            );
+            let cross = (b - a).cross(c - a);
+            if cross.length_squared() < DEGENERATE_AREA_SQ {
+                continue;
+            }
+            let original = items.len() as u32;
+            items.push(BuildTri {
+                centroid: (a + b + c) / 3.0,
+                min: a.min(b).min(c),
+                max: a.max(b).max(c),
+                tri,
+                normal: cross.normalize(),
+                edge_flags: 0b111,
+                original,
+            });
+        }
+
+        mark_exposed_edges(&verts, &mut items);
+
+        // -- BVH -----------------------------------------------------------
+        let mut nodes: Vec<BvhNode> = Vec::new();
+        if !items.is_empty() {
+            nodes.reserve(items.len() / BVH_LEAF_TRIS * 2 + 2);
+            build_bvh(&mut items, 0, &mut nodes);
+        }
+
+        let tris = items.iter().map(|i| i.tri).collect();
+        let face_normals = items.iter().map(|i| i.normal).collect();
+        let edge_flags = items.iter().map(|i| i.edge_flags).collect();
+        Arc::new(Trimesh {
+            verts,
+            tris,
+            face_normals,
+            edge_flags,
+            nodes,
+        })
+    }
+
+    pub fn triangle_count(&self) -> usize {
+        self.tris.len()
+    }
+
+    pub fn vertex_count(&self) -> usize {
+        self.verts.len()
+    }
+
+    /// The welded vertices, in first-occurrence order.
+    pub fn verts(&self) -> &[Vec3] {
+        &self.verts
+    }
+
+    /// The triangles, in BVH order — the order every tie-break refers to.
+    pub fn tris(&self) -> &[[u32; 3]] {
+        &self.tris
+    }
+
+    /// One unit normal per triangle, in the same order as [`tris`](Trimesh::tris).
+    pub fn face_normals(&self) -> &[Vec3] {
+        &self.face_normals
+    }
+
+    /// Three bits per triangle saying which of its edges are exposed ridges
+    /// rather than seams with a neighbour — see the field's own docs and
+    /// [`trimesh_contact`].
+    pub fn edge_flags(&self) -> &[u8] {
+        &self.edge_flags
+    }
+
+    /// The flat node array. `nodes[0]` is the root; empty for an empty mesh.
+    pub fn nodes(&self) -> &[BvhNode] {
+        &self.nodes
+    }
+
+    /// Local-space bounds, or `None` for an empty mesh.
+    pub fn bounds(&self) -> Option<(Vec3, Vec3)> {
+        self.nodes.first().map(|n| n.bounds())
+    }
+
+    #[inline]
+    fn triangle(&self, index: u32) -> [Vec3; 3] {
+        let t = self.tris[index as usize];
+        [
+            self.verts[t[0] as usize],
+            self.verts[t[1] as usize],
+            self.verts[t[2] as usize],
+        ]
+    }
+
+    /// Every triangle whose box overlaps `[lo, hi]`, in **ascending triangle
+    /// index**.
+    ///
+    /// The stack is a fixed `[u32; BVH_STACK_DEPTH]` and children are pushed in
+    /// a fixed order (right then left, so the left subtree pops first), which
+    /// makes the leaves come out in index order already; the sort is there so
+    /// the guarantee is the routine's rather than the traversal's.
+    fn query_aabb(&self, lo: Vec3, hi: Vec3, out: &mut Vec<u32>) {
+        out.clear();
+        if self.nodes.is_empty() {
+            return;
+        }
+        let mut stack = [0u32; BVH_STACK_DEPTH];
+        let mut depth = 0usize;
+        stack[depth] = 0;
+        depth += 1;
+        while depth > 0 {
+            depth -= 1;
+            let node = &self.nodes[stack[depth] as usize];
+            if !node.overlaps(lo, hi) {
+                continue;
+            }
+            if node.is_leaf() {
+                out.extend(node.first..node.first + node.count);
+                continue;
+            }
+            assert!(
+                depth + 2 <= BVH_STACK_DEPTH,
+                "BVH traversal exceeded its fixed stack — the tree is not balanced"
+            );
+            stack[depth] = node.right;
+            stack[depth + 1] = node.first;
+            depth += 2;
+        }
+        out.sort_unstable();
+    }
+}
+
+/// The quantised weld key. `round` rather than `floor` so a position sitting on
+/// a cell boundary is not split by an ulp of noise, and `i64` so a 32-bit world
+/// coordinate cannot overflow it.
+#[inline]
+fn weld_key(p: Vec3) -> [i64; 3] {
+    let q = p / WELD_GRID;
+    [q.x.round() as i64, q.y.round() as i64, q.z.round() as i64]
+}
+
+/// How far off a triangle's plane a neighbour's far vertex has to lie, relative
+/// to its distance, before the shared edge counts as a ridge rather than a seam.
+///
+/// `1e-4` of the distance is a dihedral of about 0.006° — far below anything a
+/// level author authored on purpose, and far above the float noise in a surface
+/// that is meant to be flat. Being *wrong* in the tolerant direction is the safe
+/// side: a seam mistaken for a ridge is the internal-edge bug back again, while
+/// a ridge of six thousandths of a degree is a flat surface.
+const EDGE_RIDGE_TOLERANCE: f32 = 1.0e-4;
+
+/// Work out which of each triangle's edges are **exposed** — the rule
+/// [`trimesh_contact`] leans on.
+///
+/// An edge is a *seam* when some triangle sharing it continues this one's
+/// surface: the neighbour's opposite vertex lies on or in front of this
+/// triangle's plane, so a body on the front side can never legitimately touch
+/// that edge from outside — whatever it touches there, it touches the face.
+/// An edge is *exposed* when no triangle shares it (the open boundary of a
+/// sheet) or every neighbour folds away behind the plane (a convex ridge, where
+/// the direction to the edge really is the surface direction).
+///
+/// The lookup is a `HashMap` keyed on the welded vertex pair, filled and read in
+/// triangle order. Nothing iterates it, so the flags are a pure function of the
+/// soup (DESIGN §9a).
+fn mark_exposed_edges(verts: &[Vec3], items: &mut [BuildTri]) {
+    // Edge (low, high) → the triangles on it, as (triangle, opposite vertex).
+    let mut shared: HashMap<(u32, u32), Vec<(u32, u32)>> = HashMap::with_capacity(items.len() * 2);
+    for (index, item) in items.iter().enumerate() {
+        for k in 0..3usize {
+            let (v0, v1) = (item.tri[k], item.tri[(k + 1) % 3]);
+            let key = (v0.min(v1), v0.max(v1));
+            shared
+                .entry(key)
+                .or_default()
+                .push((index as u32, item.tri[(k + 2) % 3]));
+        }
+    }
+
+    for (index, item) in items.iter_mut().enumerate() {
+        let (tri, normal) = (item.tri, item.normal);
+        let mut flags = 0u8;
+        for k in 0..3usize {
+            let (v0, v1) = (tri[k], tri[(k + 1) % 3]);
+            let key = (v0.min(v1), v0.max(v1));
+            let on_edge = &shared[&key];
+            let mut exposed = true;
+            for &(other, opposite) in on_edge {
+                if other == index as u32 {
+                    continue;
+                }
+                let away = verts[opposite as usize] - verts[v0 as usize];
+                let reach = away.length().max(1e-6);
+                // In front of, or level with, this triangle's plane: the surface
+                // does not turn a corner here.
+                if away.dot(normal) > -EDGE_RIDGE_TOLERANCE * reach {
+                    exposed = false;
+                    break;
+                }
+            }
+            if exposed {
+                flags |= 1 << k;
+            }
+        }
+        item.edge_flags = flags;
+    }
+}
+
+/// Build the subtree covering `items`, whose first triangle will end up at
+/// `offset`. Returns the index of the node it wrote.
+fn build_bvh(items: &mut [BuildTri], offset: usize, nodes: &mut Vec<BvhNode>) -> u32 {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for it in items.iter() {
+        min = min.min(it.min);
+        max = max.max(it.max);
+    }
+
+    let me = nodes.len() as u32;
+    nodes.push(BvhNode {
+        min,
+        max,
+        first: offset as u32,
+        count: items.len() as u32,
+        right: 0,
+        axis: 3,
+    });
+    if items.len() <= BVH_LEAF_TRIS {
+        return me;
+    }
+
+    // The longest axis of the *centroid* bounds, not of the geometry bounds: a
+    // node of long thin triangles all lying in a row is split along the row.
+    let mut cmin = Vec3::splat(f32::INFINITY);
+    let mut cmax = Vec3::splat(f32::NEG_INFINITY);
+    for it in items.iter() {
+        cmin = cmin.min(it.centroid);
+        cmax = cmax.max(it.centroid);
+    }
+    let extent = cmax - cmin;
+    let axis = if extent.x >= extent.y && extent.x >= extent.z {
+        0usize
+    } else if extent.y >= extent.z {
+        1
+    } else {
+        2
+    };
+
+    // Stable in the sense that matters: a *total* order. `partial_cmp` cannot
+    // fail on a coordinate that reached here (degenerates are gone), and the
+    // `then` on the original index means two triangles with the same centroid
+    // still have exactly one relative order.
+    items.sort_by(|a, b| {
+        a.centroid[axis]
+            .partial_cmp(&b.centroid[axis])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.original.cmp(&b.original))
+    });
+
+    let mid = items.len() / 2;
+    let (left_items, right_items) = items.split_at_mut(mid);
+    let left = build_bvh(left_items, offset, nodes);
+    let right = build_bvh(right_items, offset + mid, nodes);
+    nodes[me as usize] = BvhNode {
+        min,
+        max,
+        first: left,
+        count: 0,
+        right,
+        axis: axis as u32,
+    };
+    me
+}
+
+// -- closest-point math ------------------------------------------------------
+
+/// Which part of a triangle a closest point landed on.
+///
+/// Edges are numbered by their first vertex: `0` is `a→b`, `1` is `b→c`, `2` is
+/// `c→a`. A vertex sits on two of them — vertex `i` on edges `i` and `(i+2)%3`.
+///
+/// The distinction is not cosmetic. An **interior** closest point means the
+/// contact is against the face, and the face's own normal is the honest answer.
+/// A boundary point is on an edge that some *other* triangle probably shares,
+/// and whether the direction to it is a real surface direction or an artefact of
+/// where the tessellator happened to cut is exactly what
+/// [`Trimesh::edge_flags`](Trimesh) records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TriFeature {
+    Interior,
+    Edge(u8),
+    Vertex(u8),
+}
+
+impl TriFeature {
+    /// Is this feature on an edge the mesh marked **exposed** — a real ridge or
+    /// an open boundary, rather than a seam between two triangles that continue
+    /// each other?
+    ///
+    /// A vertex is exposed if either of its edges is: it takes only one genuine
+    /// ridge through a point for the direction to that point to be real.
+    #[inline]
+    fn is_exposed(self, edge_flags: u8) -> bool {
+        match self {
+            TriFeature::Interior => false,
+            TriFeature::Edge(k) => edge_flags & (1 << k) != 0,
+            TriFeature::Vertex(i) => edge_flags & ((1 << i) | (1 << ((i + 2) % 3))) != 0,
+        }
+    }
+}
+
+/// Closest point on triangle `abc` to `p` — Ericson, *Real-Time Collision
+/// Detection* 5.1.5, with the Voronoi region it landed in reported.
+fn closest_point_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> (Vec3, TriFeature) {
+    let ab = b - a;
+    let ac = c - a;
+    let ap = p - a;
+    let d1 = ab.dot(ap);
+    let d2 = ac.dot(ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return (a, TriFeature::Vertex(0));
+    }
+
+    let bp = p - b;
+    let d3 = ab.dot(bp);
+    let d4 = ac.dot(bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return (b, TriFeature::Vertex(1));
+    }
+
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        return (a + ab * v, TriFeature::Edge(0));
+    }
+
+    let cp = p - c;
+    let d5 = ab.dot(cp);
+    let d6 = ac.dot(cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return (c, TriFeature::Vertex(2));
+    }
+
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        return (a + ac * w, TriFeature::Edge(2));
+    }
+
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return (b + (c - b) * w, TriFeature::Edge(1));
+    }
+
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    (a + ab * v + ac * w, TriFeature::Interior)
+}
+
+/// Closest pair between two segments — RTCD 5.1.9. Returns `(on p1q1, on p2q2)`.
+fn closest_segment_segment(p1: Vec3, q1: Vec3, p2: Vec3, q2: Vec3) -> (Vec3, Vec3) {
+    const EPS: f32 = 1e-12;
+    let d1 = q1 - p1;
+    let d2 = q2 - p2;
+    let r = p1 - p2;
+    let a = d1.dot(d1);
+    let e = d2.dot(d2);
+    let f = d2.dot(r);
+
+    if a <= EPS && e <= EPS {
+        return (p1, p2);
+    }
+    let (s, t);
+    if a <= EPS {
+        s = 0.0;
+        t = (f / e).clamp(0.0, 1.0);
+    } else {
+        let c = d1.dot(r);
+        if e <= EPS {
+            t = 0.0;
+            s = (-c / a).clamp(0.0, 1.0);
+        } else {
+            let b = d1.dot(d2);
+            let denom = a * e - b * b;
+            let s0 = if denom > EPS {
+                ((b * f - c * e) / denom).clamp(0.0, 1.0)
+            } else {
+                // Parallel: any `s` is as good, and zero is the one both a
+                // forward and a reversed pair of segments agree on.
+                0.0
+            };
+            let t0 = (b * s0 + f) / e;
+            if t0 < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t0 > 1.0 {
+                t = 1.0;
+                s = ((b - c) / a).clamp(0.0, 1.0);
+            } else {
+                t = t0;
+                s = s0;
+            }
+        }
+    }
+    (p1 + d1 * s, p2 + d2 * t)
+}
+
+/// Closest pair between a segment and a triangle — RTCD 5.1.10's decomposition:
+/// the minimum over each segment **endpoint** against the triangle and the
+/// segment against each of the three triangle **edges**.
+///
+/// Those candidates cover every configuration in which the two are disjoint,
+/// including the awkward one (segment parallel to the plane, both endpoints
+/// projecting outside the triangle, the middle projecting inside) — there the
+/// segment-vs-edge candidate reports exactly the perpendicular distance.
+///
+/// The *piercing* case is deliberately not special-cased: a segment through the
+/// face has an endpoint behind the plane, that endpoint's closest triangle point
+/// is interior, and [`trimesh_contact`] reads a negative signed distance there
+/// and pushes out along the face normal — which is the answer a special case
+/// would have had to produce anyway.
+///
+/// Ties keep the earlier candidate (endpoints before edges, `a→b` before `b→c`
+/// before `c→a`), which is a fixed order and therefore a deterministic one.
+fn closest_segment_triangle(
+    s0: Vec3,
+    s1: Vec3,
+    a: Vec3,
+    b: Vec3,
+    c: Vec3,
+) -> (Vec3, Vec3, TriFeature) {
+    let mut best_d2 = f32::INFINITY;
+    let mut best = (s0, a, TriFeature::Vertex(0));
+    for s in [s0, s1] {
+        let (on_tri, feature) = closest_point_on_triangle(s, a, b, c);
+        let d2 = (s - on_tri).length_squared();
+        if d2 < best_d2 {
+            best_d2 = d2;
+            best = (s, on_tri, feature);
+        }
+    }
+    if s0 != s1 {
+        for (k, (e0, e1)) in [(a, b), (b, c), (c, a)].into_iter().enumerate() {
+            let (on_seg, on_edge) = closest_segment_segment(s0, s1, e0, e1);
+            let d2 = (on_seg - on_edge).length_squared();
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best = (on_seg, on_edge, TriFeature::Edge(k as u8));
+            }
+        }
+    }
+    best
+}
+
+/// Contact between a swept sphere (`seg_lo`..`seg_hi`, `radius`) and one
+/// triangle, in the triangle's own space.
+///
+/// Returns `(normal, depth, point)` in the same convention every other contact
+/// routine here uses: the normal points **out of** the surface towards the body,
+/// the depth is penetration along it, the point is on the surface.
+///
+/// ## The normal, and why it is not always the direction to the closest point
+///
+/// Taking `(closest_on_segment − closest_on_triangle) / dist` is right when the
+/// body is off the side of a face and wrong when it is over one: a body standing
+/// on a tessellated floor is only ever a hair from the shared edge of two
+/// coplanar triangles, and the direction to that *edge* tilts away from vertical
+/// the moment the body drifts past it. That is the **internal edge** problem,
+/// and it is not cosmetic: a tilted normal is a tilted floor, a floor tilted
+/// past `max_floor_angle` is a *wall*, and a wall in the middle of flat ground
+/// eats the speed of everything that runs over it.
+///
+/// Four rules, all of them geometry rather than tuning:
+///
+/// - **Interior closest point ⇒ the face normal.** The body is over the face;
+///   the face's own normal is the surface it is on, exactly as the OBB path
+///   reports the box face it touched rather than an averaged direction.
+/// - **A closest point on a seam ⇒ the face normal.** `edge_flags` says which of
+///   the triangle's three edges are genuine ridges (see
+///   [`Trimesh::build_from_soup`]); a seam between two triangles that continue
+///   each other is not a feature of the *surface*, only of the tessellation, and
+///   a contact must not be able to tell they were ever separate triangles.
+/// - **`dist` below 1e-6 ⇒ the face normal.** There is no direction to
+///   normalise, and dividing by it would be a NaN.
+/// - **A direction pointing behind the face ⇒ the face normal.** The body got
+///   through and wants pushing back to the front, not further in.
+///
+/// What is left keeps the true direction: a body against a real exposed edge —
+/// the lip of a triangulated ledge, the corner of a baked box, the boundary of
+/// an open sheet — where the rounded normal is the right answer and snapping to
+/// the face would shove the body along a surface it is beside rather than on.
+///
+/// ## Depth
+///
+/// Against the face the depth is measured from the **plane** (a signed
+/// distance), not from the closest point: a body that has sunk behind the
+/// triangle then reads a depth of `radius + |signed|` and comes back out,
+/// instead of reading a small unsigned distance and staying stuck. The candidate
+/// is rejected on unsigned distance first, so the depth this can produce is
+/// bounded by `2·radius + CONTACT_MARGIN` — a body far behind a face is out of
+/// range of it, not catapulted by it.
+fn trimesh_contact(
+    seg_lo: Vec3,
+    seg_hi: Vec3,
+    radius: f32,
+    tri: [Vec3; 3],
+    face_normal: Vec3,
+    edge_flags: u8,
+) -> Option<(Vec3, f32, Vec3)> {
+    let [a, b, c] = tri;
+    let (on_seg, on_tri, feature) = closest_segment_triangle(seg_lo, seg_hi, a, b, c);
+    let delta = on_seg - on_tri;
+    let dist = delta.length();
+    if dist > radius + CONTACT_MARGIN {
+        return None;
+    }
+    let front = delta.dot(face_normal);
+    let (normal, separation) = if dist < 1e-6 || front < 0.0 || !feature.is_exposed(edge_flags) {
+        (face_normal, front)
+    } else {
+        (delta / dist, dist)
+    };
+    let depth = radius - separation;
+    if depth <= -CONTACT_MARGIN {
+        return None;
+    }
+    Some((normal, depth, on_tri))
+}
+
+/// Every contact a swept sphere has with a trimesh placed at `center`, emitted
+/// in **ascending triangle index**.
+///
+/// The broadphase is the segment's AABB grown by `radius + CONTACT_MARGIN` — the
+/// exact reach of a contact, so the box neither misses one nor collects
+/// triangles that cannot produce one. There is no travel term in it because
+/// there is nothing swept to cover: [`move_and_slide`] tests the *end* position
+/// of each sub-step and re-collects after every push-out, and the sub-step cap
+/// ([`SUBSTEP_RADIUS_FRACTION`]) is what covers the path between them.
+fn segment_trimesh_contacts(
+    mesh: &Trimesh,
+    center: Vec3,
+    seg_lo: Vec3,
+    seg_hi: Vec3,
+    radius: f32,
+    scratch: &mut Vec<u32>,
+    mut emit: impl FnMut(Vec3, f32, Vec3),
+) {
+    if mesh.nodes.is_empty() {
+        return;
+    }
+    let lo = seg_lo - center;
+    let hi = seg_hi - center;
+    let reach = Vec3::splat(radius + CONTACT_MARGIN);
+    mesh.query_aabb(lo.min(hi) - reach, lo.max(hi) + reach, scratch);
+    for &index in scratch.iter() {
+        if let Some((normal, depth, point)) = trimesh_contact(
+            lo,
+            hi,
+            radius,
+            mesh.triangle(index),
+            mesh.face_normals[index as usize],
+            mesh.edge_flags[index as usize],
+        ) {
+            emit(normal, depth, point + center);
+        }
+    }
+}
+
+// -- rays --------------------------------------------------------------------
+
+/// Reciprocal that never becomes an infinity, so the slab test cannot produce
+/// `0 · inf = NaN` on a ray that runs exactly along a box face.
+#[inline]
+fn safe_recip(x: f32) -> f32 {
+    const TINY: f32 = 1e-20;
+    if x.abs() < TINY {
+        if x < 0.0 {
+            -1.0 / TINY
+        } else {
+            1.0 / TINY
+        }
+    } else {
+        1.0 / x
+    }
+}
+
+/// Slab test against an axis-aligned box, returning the entry parameter.
+#[inline]
+fn ray_aabb_enter(origin: Vec3, inv_dir: Vec3, max_dist: f32, min: Vec3, max: Vec3) -> Option<f32> {
+    let t0 = (min - origin) * inv_dir;
+    let t1 = (max - origin) * inv_dir;
+    let near = t0.min(t1);
+    let far = t0.max(t1);
+    let t_enter = near.max_element().max(0.0);
+    let t_exit = far.min_element().min(max_dist);
+    if t_enter <= t_exit {
+        Some(t_enter)
+    } else {
+        None
+    }
+}
+
+/// Möller–Trumbore, double-sided.
+///
+/// Double-sided because the box and sphere paths are: a ray that starts inside
+/// geometry reports a hit rather than silently missing, and a soup's winding is
+/// the *drawing's* business — a collider that answered "no hit" for a ray coming
+/// from the wrong side would make a floor probe depend on which way the level's
+/// exporter wound it.
+fn ray_triangle(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let e1 = b - a;
+    let e2 = c - a;
+    let pvec = dir.cross(e2);
+    let det = e1.dot(pvec);
+    if det.abs() < 1e-12 {
+        return None; // Parallel to the plane.
+    }
+    let inv_det = 1.0 / det;
+    let tvec = origin - a;
+    let u = tvec.dot(pvec) * inv_det;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let qvec = tvec.cross(e1);
+    let v = dir.dot(qvec) * inv_det;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = e2.dot(qvec) * inv_det;
+    if t < 0.0 {
+        return None;
+    }
+    Some(t)
+}
+
+/// Nearest triangle a ray hits, as `(dist, normal)`.
+///
+/// Traversal descends the **near child first** — which child that is comes from
+/// the sign of `dir` along the node's stored split axis, a pure function of the
+/// ray — so the running best prunes the far subtree as often as possible. The
+/// answer does not depend on that ordering: the winner is chosen on
+/// `(t, triangle index)` lexicographically, so an exact tie always goes to the
+/// lowest triangle index no matter which order the two were visited in.
+fn ray_trimesh(
+    mesh: &Trimesh,
+    center: Vec3,
+    origin: Vec3,
+    dir: Vec3,
+    max_dist: f32,
+) -> Option<(f32, Vec3)> {
+    if mesh.nodes.is_empty() {
+        return None;
+    }
+    let origin = origin - center;
+    let inv_dir = Vec3::new(safe_recip(dir.x), safe_recip(dir.y), safe_recip(dir.z));
+
+    let mut best: Option<(f32, u32)> = None;
+    let mut stack = [0u32; BVH_STACK_DEPTH];
+    let mut depth = 0usize;
+    stack[depth] = 0;
+    depth += 1;
+
+    while depth > 0 {
+        depth -= 1;
+        let node = &mesh.nodes[stack[depth] as usize];
+        // Bounded by the running best, so a subtree that can only produce a
+        // *later* hit is skipped — but `<=` inside the slab test keeps a subtree
+        // that can produce an exactly-tying one, which is where the lowest-index
+        // rule below has to be able to see it.
+        let limit = best.map_or(max_dist, |(t, _)| t);
+        if ray_aabb_enter(origin, inv_dir, limit, node.min, node.max).is_none() {
+            continue;
+        }
+
+        if node.is_leaf() {
+            for index in node.first..node.first + node.count {
+                let [a, b, c] = mesh.triangle(index);
+                if let Some(t) = ray_triangle(origin, dir, a, b, c) {
+                    if t <= max_dist
+                        && best.is_none_or(|(bt, bi)| t < bt || (t == bt && index < bi))
+                    {
+                        best = Some((t, index));
+                    }
+                }
+            }
+            continue;
+        }
+
+        assert!(
+            depth + 2 <= BVH_STACK_DEPTH,
+            "BVH traversal exceeded its fixed stack — the tree is not balanced"
+        );
+        // The left subtree holds the smaller centroids along `axis`, so a ray
+        // travelling in `+axis` meets it first. Push the far child, then the
+        // near one, so the near one pops first.
+        let (near, far) = if dir[node.axis as usize] >= 0.0 {
+            (node.first, node.right)
+        } else {
+            (node.right, node.first)
+        };
+        stack[depth] = far;
+        stack[depth + 1] = near;
+        depth += 2;
+    }
+
+    best.map(|(t, index)| {
+        let n = mesh.face_normals[index as usize];
+        // The reported normal faces back along the ray, as the box path's does.
+        (t, if dir.dot(n) > 0.0 { -n } else { n })
+    })
+}
+
+// ---------------------------------------------------------------------------
 // The world snapshot
 // ---------------------------------------------------------------------------
 
-/// A collider's shape, resolved from whichever component the entity carried.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A collider's shape, resolved from whichever component the entity carried —
+/// or, for [`Trimesh`], handed to [`CollisionWorld::push_collider`] directly.
+///
+/// Not `Copy`: a trimesh is shared by [`Arc`], never copied. Cloning an entry is
+/// a refcount bump.
+#[derive(Clone, Debug, PartialEq)]
 pub enum ColliderShape {
     Sphere { radius: f32 },
     Aabb { half_extents: Vec3 },
     Obb { half_extents: Vec3, rotation: Quat },
+    /// A static triangle soup, its vertices in the collider's own space and
+    /// offset by [`ColliderEntry::center`]. There is no rotation: a trimesh is
+    /// baked geometry that already has the orientation the level author gave
+    /// it, and rotating one at runtime would be the dynamic case §9a refuses.
+    Trimesh(Arc<Trimesh>),
 }
 
 /// One collider, snapshotted.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ColliderEntry {
     pub entity: Entity,
     pub center: Vec3,
@@ -736,8 +1652,17 @@ impl CollisionWorld {
     }
 
     /// Add a collider by hand. For tests and for gameplay-owned geometry that
-    /// never became an entity.
+    /// never became an entity — and the **entry point for a [`Trimesh`]**, which
+    /// has no component of its own yet (scene authoring is a later step; a
+    /// baked soup is loaded by game code, built once, and pushed here).
     pub fn push_collider(&mut self, entry: ColliderEntry) -> &mut CollisionWorld {
+        debug_assert!(
+            !matches!(&entry.shape, ColliderShape::Trimesh(mesh) if mesh.triangle_count() == 0),
+            "entity {} was given a trimesh collider with no triangles — \
+             the soup welded away to nothing, which is an authoring bug rather \
+             than an entity that happens to be intangible",
+            entry.entity
+        );
         self.colliders.push(entry);
         self.finish();
         self
@@ -1024,6 +1949,13 @@ fn segment_field_contact(
 ///
 /// `solid_only` drops [`Trigger`] colliders — what the solver wants; the overlap
 /// queries keep them and flag them instead.
+///
+/// A convex collider contributes at most one contact. A [`Trimesh`] contributes
+/// **one per penetrating triangle**, in ascending triangle index, and that is
+/// deliberate: a body wedged into the inside corner of two triangles must have
+/// its velocity projected against both planes, exactly as a body between two
+/// boxes does. The set is folded down to one contact per entity later
+/// ([`merge_contacts`]), so what a caller reads back is unchanged.
 fn collect_contacts(
     world: &CollisionWorld,
     shape: CharacterShape,
@@ -1036,14 +1968,15 @@ fn collect_contacts(
     out.clear();
     let (lo, hi) = shape.segment(position, up);
     let radius = shape.radius();
+    let mut candidates: Vec<u32> = Vec::new();
 
     world.for_each(mask, |entry| {
         if solid_only && entry.trigger {
             return;
         }
-        let hit = match entry.shape {
+        let hit = match &entry.shape {
             ColliderShape::Sphere { radius: r } => {
-                segment_sphere_contact(lo, hi, radius, entry.center, r)
+                segment_sphere_contact(lo, hi, radius, entry.center, *r)
             }
             ColliderShape::Aabb { half_extents } => segment_box_contact(
                 lo,
@@ -1051,12 +1984,31 @@ fn collect_contacts(
                 radius,
                 entry.center,
                 Quat::IDENTITY,
-                half_extents,
+                *half_extents,
             ),
             ColliderShape::Obb {
                 half_extents,
                 rotation,
-            } => segment_box_contact(lo, hi, radius, entry.center, rotation, half_extents),
+            } => segment_box_contact(lo, hi, radius, entry.center, *rotation, *half_extents),
+            ColliderShape::Trimesh(mesh) => {
+                segment_trimesh_contacts(
+                    mesh,
+                    entry.center,
+                    lo,
+                    hi,
+                    radius,
+                    &mut candidates,
+                    |normal, depth, point| {
+                        out.push(RawContact {
+                            entity: entry.entity,
+                            normal,
+                            point,
+                            depth,
+                        });
+                    },
+                );
+                None
+            }
         };
         if let Some((normal, depth, point)) = hit {
             out.push(RawContact {
@@ -1162,6 +2114,19 @@ pub fn move_and_slide(
     velocity: Vec3,
     dt: f32,
 ) -> MoveResult {
+    // A trimesh is static world geometry and never the thing being moved: the
+    // moving shape is a `CharacterShape`, which has no trimesh form, so the body
+    // cannot *be* one by construction. What is still reachable is a snapshot
+    // holding an empty one — a soup that welded away to nothing — which would
+    // read as a solid collider that is silently intangible.
+    debug_assert!(
+        !world
+            .colliders
+            .iter()
+            .any(|c| matches!(&c.shape, ColliderShape::Trimesh(m) if m.triangle_count() == 0)),
+        "a trimesh collider in this snapshot has no triangles"
+    );
+
     let up = body.up.try_normalize().unwrap_or(Vec3::Y);
     let radius = body.shape.radius();
     if !dt.is_finite() || dt <= 0.0 || radius <= 0.0 {
@@ -1619,10 +2584,11 @@ impl CollisionWorld {
             }
         };
 
+        let mut candidates: Vec<u32> = Vec::new();
         self.for_each(mask, |entry| {
-            let hit = match entry.shape {
+            let hit = match &entry.shape {
                 ColliderShape::Sphere { radius: r } => {
-                    segment_sphere_contact(lo, hi, radius, entry.center, r)
+                    segment_sphere_contact(lo, hi, radius, entry.center, *r)
                 }
                 ColliderShape::Aabb { half_extents } => segment_box_contact(
                     lo,
@@ -1630,12 +2596,32 @@ impl CollisionWorld {
                     radius,
                     entry.center,
                     Quat::IDENTITY,
-                    half_extents,
+                    *half_extents,
                 ),
                 ColliderShape::Obb {
                     half_extents,
                     rotation,
-                } => segment_box_contact(lo, hi, radius, entry.center, rotation, half_extents),
+                } => segment_box_contact(lo, hi, radius, entry.center, *rotation, *half_extents),
+                // One hit per *collider*, as every other shape reports: the
+                // deepest triangle is what the overlap is. Ties go to the lowest
+                // triangle index, which is the order they arrive in.
+                ColliderShape::Trimesh(mesh) => {
+                    let mut best: Option<(Vec3, f32, Vec3)> = None;
+                    segment_trimesh_contacts(
+                        mesh,
+                        entry.center,
+                        lo,
+                        hi,
+                        radius,
+                        &mut candidates,
+                        |normal, depth, point| {
+                            if best.is_none_or(|(_, d, _)| depth > d) {
+                                best = Some((normal, depth, point));
+                            }
+                        },
+                    );
+                    best
+                }
             };
             push(entry.entity, entry.trigger, hit, &mut hits);
         });
@@ -1650,9 +2636,10 @@ impl CollisionWorld {
     ///
     /// `dir` need not be normalized; `dist` is in world units either way. Boxes
     /// use an exact slab test in the box's own frame, spheres the usual
-    /// quadratic, and the analytic height field a fixed-step march refined by
-    /// bisection — see [`RAY_MARCH_STEP`]. The field is sampled, never its mesh,
-    /// so the same ray returns the same hit at every quality tier.
+    /// quadratic, trimeshes a near-child-first BVH descent with Möller–Trumbore
+    /// at the leaves, and the analytic height field a fixed-step march refined
+    /// by bisection — see [`RAY_MARCH_STEP`]. The field is sampled, never its
+    /// mesh, so the same ray returns the same hit at every quality tier.
     ///
     /// PORT_SPEC's ledge vault (a head ray that must miss and a chest ray that
     /// must hit) and the air pulse's wall find are both this call.
@@ -1673,17 +2660,20 @@ impl CollisionWorld {
         };
 
         self.for_each(mask, |entry| {
-            let found = match entry.shape {
+            let found = match &entry.shape {
                 ColliderShape::Sphere { radius } => {
-                    ray_sphere(origin, dir, max_dist, entry.center, radius)
+                    ray_sphere(origin, dir, max_dist, entry.center, *radius)
                 }
                 ColliderShape::Aabb { half_extents } => {
-                    ray_box(origin, dir, max_dist, entry.center, Quat::IDENTITY, half_extents)
+                    ray_box(origin, dir, max_dist, entry.center, Quat::IDENTITY, *half_extents)
                 }
                 ColliderShape::Obb {
                     half_extents,
                     rotation,
-                } => ray_box(origin, dir, max_dist, entry.center, rotation, half_extents),
+                } => ray_box(origin, dir, max_dist, entry.center, *rotation, *half_extents),
+                ColliderShape::Trimesh(mesh) => {
+                    ray_trimesh(mesh, entry.center, origin, dir, max_dist)
+                }
             };
             if let Some((dist, normal)) = found {
                 consider(

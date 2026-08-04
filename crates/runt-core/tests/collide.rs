@@ -21,12 +21,14 @@
 //! - [`a_default_layers_component_collides_exactly_as_no_component_does`] — the
 //!   additive property, at the layer level.
 
+use std::sync::Arc;
+
 use bevy_ecs::prelude::*;
 use glam::{Quat, Vec3};
 
 use runt_core::collide::{
-    self, move_and_slide, CharacterBody, CharacterShape, CollisionLayers, CollisionWorld,
-    ContactKind, MoveResult, ObbCollider, ALL_LAYERS,
+    self, move_and_slide, CharacterBody, CharacterShape, ColliderEntry, ColliderShape,
+    CollisionLayers, CollisionWorld, ContactKind, MoveResult, ObbCollider, Trimesh, ALL_LAYERS,
 };
 use runt_core::physics::{AabbCollider, SphereCollider, Trigger, Velocity};
 use runt_core::{Sim, SimConfig, Transform};
@@ -90,6 +92,13 @@ impl Level {
     fn trigger(&mut self, entity: Entity) -> Entity {
         self.world.entity_mut(entity).insert(Trigger);
         entity
+    }
+
+    /// An entity carrying nothing — the id a hand-pushed [`ColliderEntry`]
+    /// needs. A trimesh has no component yet (DESIGN §9a: scene authoring is a
+    /// later step), so `push_collider` is how one enters a snapshot.
+    fn bare(&mut self) -> Entity {
+        self.world.spawn_empty().id()
     }
 
     fn snapshot(&mut self) -> CollisionWorld {
@@ -1717,4 +1726,845 @@ fn a_scene_without_collision_v2_fields_is_unchanged() {
         "the demo scene grew a collider"
     );
     assert_eq!(geometry.terrain().len(), 1, "the demo has one terrain patch");
+}
+
+// ---------------------------------------------------------------------------
+// Static trimeshes (DESIGN §9a's 2026-08-04 trimesh amendment)
+// ---------------------------------------------------------------------------
+//
+// The claim these make together is narrow and load-bearing: a triangulated
+// surface behaves like the analytic one it approximates. So almost every test
+// below is a *comparison* — the same run against a box and against the two
+// triangles of that box's top face, against an OBB ramp and against a
+// triangulated one — rather than a number someone chose. What is pinned rather
+// than compared is the one thing there is nothing to compare against: the
+// 240-tick fingerprint over a bumpy soup.
+
+/// Push a trimesh into a snapshot at `center`.
+fn push_trimesh(
+    geometry: &mut CollisionWorld,
+    entity: Entity,
+    center: Vec3,
+    mesh: &Arc<Trimesh>,
+    memberships: u16,
+) {
+    geometry.push_collider(ColliderEntry {
+        entity,
+        center,
+        shape: ColliderShape::Trimesh(mesh.clone()),
+        memberships,
+        trigger: false,
+    });
+}
+
+/// A `cells × cells` grid over `[-half, half]²`, height from `height(i, j)`.
+///
+/// Two triangles per cell, wound so both face normals point up. This is the
+/// shape a baked surface actually has — many small coplanar-ish triangles with
+/// shared internal edges — which is the case the contact normal rules exist for.
+fn grid_soup(
+    half: f32,
+    cells: usize,
+    height: impl Fn(usize, usize) -> f32,
+) -> (Vec<Vec3>, Vec<u32>) {
+    let n = cells + 1;
+    let step = 2.0 * half / cells as f32;
+    let mut verts = Vec::with_capacity(n * n);
+    for j in 0..n {
+        for i in 0..n {
+            verts.push(Vec3::new(
+                -half + i as f32 * step,
+                height(i, j),
+                -half + j as f32 * step,
+            ));
+        }
+    }
+    let mut indices = Vec::with_capacity(cells * cells * 6);
+    for j in 0..cells {
+        for i in 0..cells {
+            let a = (j * n + i) as u32;
+            let b = a + 1;
+            let d = ((j + 1) * n + i) as u32;
+            let c = d + 1;
+            indices.extend([a, d, c, a, c, b]);
+        }
+    }
+    (verts, indices)
+}
+
+/// The **top face** of a box as a two-triangle soup: the same surface the OBB
+/// path presents, with nothing else attached, so a comparison isolates the
+/// contact routine rather than the shape.
+fn box_top_face(half: Vec3, rotation: Quat) -> (Vec<Vec3>, Vec<u32>) {
+    let corners = [
+        Vec3::new(-half.x, half.y, -half.z),
+        Vec3::new(half.x, half.y, -half.z),
+        Vec3::new(half.x, half.y, half.z),
+        Vec3::new(-half.x, half.y, half.z),
+    ];
+    (
+        corners.iter().map(|c| rotation * *c).collect(),
+        vec![0, 2, 1, 0, 3, 2],
+    )
+}
+
+/// The same geometry as a **per-face** soup: every triangle carrying its own
+/// three vertices, which is what a CSG bake or an `.obj` export hands you and
+/// what `build` has to weld back together.
+fn unwelded(verts: &[Vec3], indices: &[u32]) -> (Vec<Vec3>, Vec<u32>) {
+    let out: Vec<Vec3> = indices.iter().map(|i| verts[*i as usize]).collect();
+    let idx: Vec<u32> = (0..out.len() as u32).collect();
+    (out, idx)
+}
+
+/// A deterministic bump field — a fixed function of the grid index, not noise,
+/// so the fingerprint below is reproducible from the source alone.
+fn bumpy(i: usize, j: usize) -> f32 {
+    0.12 * (i as f32 * 0.7).sin() * (j as f32 * 0.9).cos()
+}
+
+// -- build -------------------------------------------------------------------
+
+#[test]
+fn building_a_trimesh_welds_drops_degenerates_and_is_reproducible() {
+    let (verts, indices) = grid_soup(4.0, 6, bumpy);
+    let (mut soup, mut soup_indices) = unwelded(&verts, &indices);
+    assert_eq!(soup.len(), indices.len(), "the per-face soup is unwelded");
+
+    // Three degenerates a real bake produces: a repeated corner, a collinear
+    // sliver, and a zero-area triangle from a vertex the weld will merge.
+    let base = soup.len() as u32;
+    soup.extend([
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(-2.0, 0.5, 1.0),
+        Vec3::new(-1.0, 0.5, 1.0),
+        Vec3::new(0.0, 0.5, 1.0),
+        Vec3::new(3.0, 1.0, 3.0),
+        // Closer to the first than the weld grid, so it becomes the same vertex.
+        Vec3::new(3.0 + 1e-6, 1.0, 3.0),
+        Vec3::new(3.0, 1.0, 3.5),
+    ]);
+    soup_indices.extend(base..base + 9);
+
+    let mesh = Trimesh::build_from_soup(&soup, &soup_indices);
+    assert_eq!(
+        mesh.triangle_count(),
+        indices.len() / 3,
+        "the three degenerate triangles survived the build"
+    );
+    assert_eq!(
+        mesh.vertex_count(),
+        verts.len() + 7,
+        "welding did not collapse the per-face soup back onto the grid \
+         (the seven extra are the degenerate triangles' own distinct corners — \
+         nine positions, two of which weld together and none of which land on \
+         the grid)"
+    );
+    assert!(
+        mesh.face_normals().iter().all(|n| n.is_finite() && (n.length() - 1.0).abs() < 1e-5),
+        "a face normal is not a unit vector"
+    );
+    assert!(
+        mesh.face_normals().iter().all(|n| n.y > 0.0),
+        "the grid's triangles are wound the wrong way"
+    );
+
+    // The whole point of the weld: an unwelded soup and the indexed mesh it came
+    // from are the same collider. Not the same *index* arrays — first-occurrence
+    // order differs, and the degenerates left a few vertices behind — but the
+    // same triangles, in the same order, with the same tree over them.
+    let indexed = Trimesh::build_from_soup(&verts, &indices);
+    let positions = |m: &Trimesh| -> Vec<[Vec3; 3]> {
+        m.tris()
+            .iter()
+            .map(|t| {
+                [
+                    m.verts()[t[0] as usize],
+                    m.verts()[t[1] as usize],
+                    m.verts()[t[2] as usize],
+                ]
+            })
+            .collect()
+    };
+    assert_eq!(positions(&indexed), positions(&mesh));
+    assert_eq!(indexed.face_normals(), mesh.face_normals());
+    assert_eq!(indexed.nodes(), mesh.nodes());
+    assert_eq!(indexed.edge_flags(), mesh.edge_flags());
+}
+
+#[test]
+fn a_shared_edge_is_a_seam_unless_the_surface_turns_a_corner_at_it() {
+    // What `edge_flags` decides, and the whole reason a tessellated floor can be
+    // walked on: an edge two triangles share is a *seam* when the neighbour
+    // continues this triangle's surface, and a *ridge* only when the surface
+    // genuinely folds away behind it.
+
+    // Flat grid: every internal edge is a seam, and only the sheet's own open
+    // boundary is exposed. 4 × 4 cells is 16 boundary edges.
+    let (verts, indices) = grid_soup(4.0, 4, |_, _| 0.0);
+    let flat = Trimesh::build_from_soup(&verts, &indices);
+    let exposed: u32 = flat.edge_flags().iter().map(|f| f.count_ones()).sum();
+    assert_eq!(
+        exposed, 16,
+        "a flat grid grew a ridge somewhere in its interior"
+    );
+
+    // Two quads meeting along `y`: a tent (they fold *up* to the shared edge) has
+    // a real ridge there, a gutter (they fold *down* to it) has a seam. Same
+    // triangles, same winding, one sign apart — so the flag is reading the
+    // geometry and not the topology.
+    let fold = |ridge_y: f32, outer_y: f32| {
+        let soup = vec![
+            Vec3::new(-1.0, outer_y, -1.0),
+            Vec3::new(1.0, outer_y, -1.0),
+            Vec3::new(-1.0, ridge_y, 0.0),
+            Vec3::new(1.0, ridge_y, 0.0),
+            Vec3::new(-1.0, outer_y, 1.0),
+            Vec3::new(1.0, outer_y, 1.0),
+        ];
+        // Both faces wound so their normals point upwards. Triangle 0 is
+        // `(v0, v2, v3)`, whose edge 1 is the shared one.
+        let idx = vec![0, 2, 3, 0, 3, 1, 2, 4, 5, 2, 5, 3];
+        Trimesh::build_from_soup(&soup, &idx)
+    };
+
+    // Triangle 0 is `(v0, v2, v3)`: edge 0 is `v0→v2`, the sheet's open left
+    // side; edge 1 is `v2→v3`, the fold; edge 2 is `v3→v0`, the quad's own
+    // diagonal, which its coplanar other half shares.
+    let tent = fold(1.0, 0.0);
+    assert_eq!(tent.triangle_count(), 4);
+    assert!(tent.face_normals().iter().all(|n| n.y > 0.0));
+    assert_eq!(
+        tent.edge_flags()[0],
+        0b011,
+        "the open side and the convex ridge are exposed; the coplanar diagonal \
+         is a seam"
+    );
+
+    let gutter = fold(0.0, 1.0);
+    assert!(gutter.face_normals().iter().all(|n| n.y > 0.0));
+    assert_eq!(
+        gutter.edge_flags()[0],
+        0b001,
+        "a concave fold is a seam: nothing can touch it from the front"
+    );
+}
+
+#[test]
+fn building_the_same_soup_twice_produces_identical_arrays() {
+    // DESIGN §9a: the BVH is built once at load and *deterministically*. Median
+    // index split plus a `(axis value, original index)` sort key means there is
+    // exactly one tree for a given soup — no tie a hash seed or a sort's
+    // internal order could break.
+    let (verts, indices) = grid_soup(6.0, 9, bumpy);
+    let (soup, soup_indices) = unwelded(&verts, &indices);
+
+    let a = Trimesh::build_from_soup(&soup, &soup_indices);
+    let b = Trimesh::build_from_soup(&soup, &soup_indices);
+
+    assert_eq!(a.verts(), b.verts(), "welded vertices differ");
+    assert_eq!(a.tris(), b.tris(), "triangle order differs");
+    assert_eq!(a.face_normals(), b.face_normals(), "face normals differ");
+    assert_eq!(a.nodes(), b.nodes(), "BVH nodes differ");
+    assert_eq!(a, b);
+
+    // …and the tree really is one: the leaves partition the triangle array,
+    // every leaf is within the fixed size, and a node's box contains its
+    // children's. "The lowest triangle index" is only a rule if the leaves are
+    // contiguous ranges of the array the tie-break names.
+    let mut covered = vec![0u32; a.triangle_count()];
+    for node in a.nodes() {
+        match (node.leaf_range(), node.children()) {
+            (Some((first, count)), None) => {
+                assert!(count as usize <= 8, "a leaf holds {count} triangles");
+                for t in first..first + count {
+                    covered[t as usize] += 1;
+                }
+            }
+            (None, Some((left, right))) => {
+                assert!(node.split_axis().is_some_and(|axis| axis < 3));
+                let (lo, hi) = node.bounds();
+                for child in [left, right] {
+                    let (clo, chi) = a.nodes()[child as usize].bounds();
+                    assert!(
+                        clo.cmpge(lo).all() && chi.cmple(hi).all(),
+                        "a child's box escapes its parent's"
+                    );
+                }
+            }
+            _ => unreachable!("a node is a leaf or an inner node"),
+        }
+    }
+    assert!(
+        covered.iter().all(|c| *c == 1),
+        "the leaves do not partition the triangles exactly once"
+    );
+}
+
+// -- resting on a triangulated surface ---------------------------------------
+
+/// Drop a standing capsule from `start` and run it for `ticks`.
+fn drop_onto(geometry: &CollisionWorld, start: Vec3, ticks: u32) -> (CharacterBody, Vec3) {
+    let mut body = standing();
+    let mut p = start;
+    let mut v = Vec3::ZERO;
+    for _ in 0..ticks {
+        step(geometry, &mut body, &mut p, &mut v);
+    }
+    (body, p)
+}
+
+#[test]
+fn a_capsule_settles_on_a_triangulated_plane_where_it_settles_on_a_box_floor() {
+    // The headline equivalence: two triangles and a 50 m slab are the same
+    // ground. Anything else — a floor half a contact margin low, a body resting
+    // on the *edge* direction rather than the face — shows up here as a
+    // millimetre.
+    let mut boxed = Level::new();
+    with_floor(&mut boxed);
+    let box_geometry = boxed.snapshot();
+
+    let mut level = Level::new();
+    let ground = level.bare();
+    let (verts, indices) = grid_soup(25.0, 1, |_, _| 0.0);
+    assert_eq!(indices.len(), 6, "a one-cell grid is two triangles");
+    let mesh = Trimesh::build_from_soup(&verts, &indices);
+    let mut geometry = level.snapshot();
+    push_trimesh(&mut geometry, ground, Vec3::ZERO, &mesh, 1);
+
+    let start = Vec3::new(0.7, 4.0, -1.3);
+    let (box_body, box_p) = drop_onto(&box_geometry, start, 120);
+    let (tri_body, tri_p) = drop_onto(&geometry, start, 120);
+
+    assert!(box_body.on_floor && tri_body.on_floor, "one never landed");
+    assert!(
+        (tri_p.y - 1.0).abs() < 1e-4,
+        "the capsule rests at {} on triangles, not 1.0 above them",
+        tri_p.y
+    );
+    assert!(
+        (tri_p.y - box_p.y).abs() < 1e-4,
+        "triangles rest the body at {}, the box at {}",
+        tri_p.y,
+        box_p.y
+    );
+    assert!(
+        (tri_p.x - start.x).abs() < 1e-4 && (tri_p.z - start.z).abs() < 1e-4,
+        "the drop walked sideways to {tri_p}"
+    );
+
+    // And it stays put to the bit, which is what `floor_stop_on_slope` promises
+    // and what a contact normal wobbling between face and edge would break.
+    let mut body = tri_body;
+    let mut p = tri_p;
+    let mut v = Vec3::ZERO;
+    for tick in 0..240 {
+        step(&geometry, &mut body, &mut p, &mut v);
+        assert_eq!(p, tri_p, "the settled capsule drifted on tick {tick}");
+    }
+}
+
+#[test]
+fn a_triangulated_thirty_degree_ramp_is_walked_like_the_obb_one() {
+    // PORT_SPEC's 30° ramp, twice: once as the solid box the OBB path solves in
+    // the box's own frame, once as the two triangles of that box's top face. The
+    // surfaces are the same plane, so 120 ticks of walking up it have to agree.
+    let half = Vec3::new(6.0, 1.0, 6.0);
+    let rotation = Quat::from_rotation_x(30.0f32.to_radians());
+
+    let mut boxed = Level::new();
+    boxed.obb(Vec3::ZERO, half, rotation);
+    let box_geometry = boxed.snapshot();
+
+    let mut level = Level::new();
+    let face = level.bare();
+    let (verts, indices) = box_top_face(half, rotation);
+    let mesh = Trimesh::build_from_soup(&verts, &indices);
+    assert_eq!(mesh.triangle_count(), 2);
+    let mut tri_geometry = level.snapshot();
+    push_trimesh(&mut tri_geometry, face, Vec3::ZERO, &mesh, 1);
+
+    // Seeded from the box, so the two runs start at the same bits.
+    let hit = box_geometry
+        .raycast(Vec3::new(0.0, 8.0, 2.5), Vec3::NEG_Y, 16.0, ALL_LAYERS)
+        .expect("the ramp is under the probe");
+    let start = hit.point + Vec3::Y;
+
+    // The trimesh raycast has to find the same surface, to the millimetre.
+    let tri_hit = tri_geometry
+        .raycast(Vec3::new(0.0, 8.0, 2.5), Vec3::NEG_Y, 16.0, ALL_LAYERS)
+        .expect("the triangulated ramp is under the probe");
+    assert_eq!(tri_hit.entity, face);
+    assert!(
+        (tri_hit.dist - hit.dist).abs() < 1e-4,
+        "the two ramps are {} apart under the probe",
+        (tri_hit.dist - hit.dist).abs()
+    );
+    assert!(tri_hit.normal.abs_diff_eq(hit.normal, 1e-5));
+
+    let run = |geometry: &CollisionWorld| {
+        let mut body = standing().with_snap_length(0.5);
+        body.on_floor = true;
+        let mut p = start;
+        let mut v = Vec3::ZERO;
+        let mut trace = Vec::with_capacity(120);
+        for _ in 0..120 {
+            // Uphill: the ramp descends towards +Z.
+            let r = walk_step(geometry, &mut body, &mut p, &mut v, Vec3::new(0.0, 0.0, -3.0));
+            trace.push((p, r.on_floor, r.floor_angle));
+        }
+        trace
+    };
+
+    let box_trace = run(&box_geometry);
+    let tri_trace = run(&tri_geometry);
+    for (tick, (b, t)) in box_trace.iter().zip(&tri_trace).enumerate() {
+        assert_eq!(b.1, t.1, "tick {tick}: grounded disagrees");
+        assert!(
+            b.0.abs_diff_eq(t.0, 1e-3),
+            "tick {tick}: the box put the body at {} and the triangles at {}",
+            b.0,
+            t.0
+        );
+        assert!(
+            (degrees(t.2) - 30.0).abs() < 0.05,
+            "tick {tick}: the triangulated ramp reported {}°",
+            degrees(t.2)
+        );
+    }
+    // The run has to have gone somewhere, or it proved nothing.
+    let climbed = tri_trace.last().unwrap().0;
+    assert!(
+        start.z - climbed.z > 5.0,
+        "the body only climbed {} m of ramp",
+        start.z - climbed.z
+    );
+    assert!(climbed.y - start.y > 2.5, "it climbed without rising");
+}
+
+#[test]
+fn crossing_an_internal_edge_keeps_a_stable_floor_normal() {
+    // The reason `trimesh_contact` snaps to the face normal on an interior
+    // closest point. A tessellated floor is nothing but shared edges; a body
+    // walking over one must not read the direction to that edge as a surface,
+    // which is a normal tilting away from vertical — and a normal past
+    // `max_floor_angle` is a *wall*, so the failure is a phantom wall blip and a
+    // hitch in a run, not a cosmetic one.
+    let mut level = Level::new();
+    let ground = level.bare();
+    let (verts, indices) = grid_soup(6.0, 8, |_, _| 0.0);
+    let mesh = Trimesh::build_from_soup(&verts, &indices);
+    assert_eq!(mesh.triangle_count(), 128, "8×8 cells, two triangles each");
+    let mut geometry = level.snapshot();
+    push_trimesh(&mut geometry, ground, Vec3::ZERO, &mesh, 1);
+
+    let mut body = standing().with_snap_length(0.5);
+    body.on_floor = true;
+    // Slightly off the vertex rows in z, so the crossings are the cells' shared
+    // diagonals and boundaries rather than a lattice of exact corners.
+    let mut p = Vec3::new(-3.0, 1.0, 0.05);
+    let mut v = Vec3::ZERO;
+
+    for tick in 0..120 {
+        let r = walk_step(&geometry, &mut body, &mut p, &mut v, Vec3::new(3.0, 0.0, 0.0));
+        assert!(r.on_floor, "tick {tick}: went airborne on flat ground");
+        assert!(
+            !r.on_wall,
+            "tick {tick}: an internal edge read as a wall ({})",
+            r.wall_normal
+        );
+        assert!(
+            !r.on_ceiling,
+            "tick {tick}: an internal edge read as a ceiling"
+        );
+        assert!(
+            r.floor_normal.abs_diff_eq(Vec3::Y, 1e-5),
+            "tick {tick}: the floor normal became {} at x = {}",
+            r.floor_normal,
+            p.x
+        );
+        assert!(
+            (p.y - 1.0).abs() < 1e-4,
+            "tick {tick}: the body's height became {} crossing an edge",
+            p.y
+        );
+        assert!(
+            r.contacts.iter().all(|c| c.kind == ContactKind::Floor),
+            "tick {tick}: a flat floor produced {:?}",
+            r.contacts.iter().map(|c| c.kind).collect::<Vec<_>>()
+        );
+    }
+    // It really did cross the edges rather than stalling on one.
+    assert!(p.x > 2.5, "the walk stalled at x = {}", p.x);
+    assert!(
+        (v.x - 3.0).abs() < 1e-3,
+        "an internal edge ate {} m/s of forward speed",
+        3.0 - v.x
+    );
+}
+
+// -- queries -----------------------------------------------------------------
+
+#[test]
+fn a_ray_hits_the_triangle_it_should_with_that_triangle_s_normal() {
+    let mut level = Level::new();
+    let flat = level.bare();
+    let tilted = level.bare();
+
+    let (fv, fi) = grid_soup(4.0, 4, |_, _| 0.0);
+    let flat_mesh = Trimesh::build_from_soup(&fv, &fi);
+    let rotation = Quat::from_rotation_x(30.0f32.to_radians());
+    let (tv, ti) = box_top_face(Vec3::new(3.0, 0.0, 3.0), rotation);
+    let tilted_mesh = Trimesh::build_from_soup(&tv, &ti);
+
+    let mut geometry = level.snapshot();
+    // The flat sheet sits 2 m up; the tilted one is 20 m away in +X.
+    push_trimesh(&mut geometry, flat, Vec3::new(0.0, 2.0, 0.0), &flat_mesh, 1);
+    push_trimesh(
+        &mut geometry,
+        tilted,
+        Vec3::new(20.0, 0.0, 0.0),
+        &tilted_mesh,
+        1 << PHASEABLE,
+    );
+
+    // Straight down onto the flat sheet: t is the drop, the normal is up, and
+    // the point is on the plane.
+    let hit = geometry
+        .raycast(Vec3::new(0.7, 6.0, -1.3), Vec3::NEG_Y, 10.0, ALL_LAYERS)
+        .expect("the sheet is under the ray");
+    assert_eq!(hit.entity, flat);
+    assert!((hit.dist - 4.0).abs() < 1e-5, "dist {}", hit.dist);
+    assert!(hit.normal.abs_diff_eq(Vec3::Y, 1e-6), "{}", hit.normal);
+    assert!((hit.point.y - 2.0).abs() < 1e-5);
+    assert!(!hit.trigger);
+
+    // A ray that misses the sheet's extent finds nothing, even though the BVH
+    // root's box is right there.
+    assert!(
+        geometry
+            .raycast(Vec3::new(9.0, 6.0, 0.0), Vec3::NEG_Y, 10.0, ALL_LAYERS)
+            .is_none(),
+        "a ray outside the sheet still hit it"
+    );
+
+    // The tilted sheet reports the plane's own normal, and the ray reaches it
+    // through the mask.
+    let tilt = geometry
+        .raycast(Vec3::new(20.0, 6.0, 0.0), Vec3::NEG_Y, 10.0, ALL_LAYERS)
+        .expect("the tilted sheet is under the ray");
+    assert_eq!(tilt.entity, tilted);
+    let expected = rotation * Vec3::Y;
+    assert!(tilt.normal.abs_diff_eq(expected, 1e-5), "{}", tilt.normal);
+    assert!((tilt.dist - 6.0).abs() < 1e-4, "dist {}", tilt.dist);
+
+    // Mask filtering is the same one-way rule everything else obeys.
+    let solid_only = ALL_LAYERS & !(1 << PHASEABLE);
+    assert!(
+        geometry
+            .raycast(Vec3::new(20.0, 6.0, 0.0), Vec3::NEG_Y, 10.0, solid_only)
+            .is_none(),
+        "a masked-out trimesh still stopped a ray"
+    );
+    // …and the untagged sheet still answers, so the mask hid one thing only.
+    assert!(geometry
+        .raycast(Vec3::new(0.0, 6.0, 0.0), Vec3::NEG_Y, 10.0, solid_only)
+        .is_some());
+
+    // A ray from *below* hits too, with the normal turned to face it: the box
+    // and sphere paths both answer a ray that starts inside, and a soup's
+    // winding is the drawing's business, not the collider's.
+    let under = geometry
+        .raycast(Vec3::new(0.0, 0.0, 0.0), Vec3::Y, 10.0, ALL_LAYERS)
+        .expect("a ray from below must find the sheet");
+    assert_eq!(under.entity, flat);
+    assert!(under.normal.abs_diff_eq(Vec3::NEG_Y, 1e-6), "{}", under.normal);
+}
+
+#[test]
+fn the_bvh_raycast_answers_what_a_brute_force_scan_answers() {
+    // The traversal prunes with the running best and visits the near child
+    // first. Both are optimisations; neither may change an answer. A hundred and
+    // sixty-nine rays over a bumpy soup, against the same soup scanned linearly.
+    let (verts, indices) = grid_soup(8.0, 16, bumpy);
+    let mesh = Trimesh::build_from_soup(&verts, &indices);
+
+    let mut level = Level::new();
+    let ground = level.bare();
+    let mut geometry = level.snapshot();
+    push_trimesh(&mut geometry, ground, Vec3::ZERO, &mesh, 1);
+
+    // Möller–Trumbore, restated here so the comparison is against an
+    // independent scan rather than against the routine under test.
+    let brute = |origin: Vec3, dir: Vec3, max_dist: f32| -> Option<(f32, u32)> {
+        let mut best: Option<(f32, u32)> = None;
+        for (index, tri) in mesh.tris().iter().enumerate() {
+            let a = mesh.verts()[tri[0] as usize];
+            let b = mesh.verts()[tri[1] as usize];
+            let c = mesh.verts()[tri[2] as usize];
+            let (e1, e2) = (b - a, c - a);
+            let pv = dir.cross(e2);
+            let det = e1.dot(pv);
+            if det.abs() < 1e-12 {
+                continue;
+            }
+            let inv = 1.0 / det;
+            let tv = origin - a;
+            let u = tv.dot(pv) * inv;
+            if !(0.0..=1.0).contains(&u) {
+                continue;
+            }
+            let qv = tv.cross(e1);
+            let v = dir.dot(qv) * inv;
+            if v < 0.0 || u + v > 1.0 {
+                continue;
+            }
+            let t = e2.dot(qv) * inv;
+            if t < 0.0 || t > max_dist {
+                continue;
+            }
+            let index = index as u32;
+            if best.is_none_or(|(bt, bi)| t < bt || (t == bt && index < bi)) {
+                best = Some((t, index));
+            }
+        }
+        best
+    };
+
+    let mut hits = 0;
+    for i in -6..=6 {
+        for j in -6..=6 {
+            let origin = Vec3::new(i as f32 * 1.1, 5.0, j as f32 * 1.1);
+            // Not straight down: a slanted ray crosses several nodes, which is
+            // what exercises the ordering.
+            let dir = Vec3::new(0.25, -1.0, -0.15).normalize();
+            let expected = brute(origin, dir, 20.0);
+            let got = geometry.raycast(origin, dir, 20.0, ALL_LAYERS);
+            assert_eq!(
+                expected.is_some(),
+                got.is_some(),
+                "from {origin}: brute force and the BVH disagree about hitting"
+            );
+            if let (Some((t, index)), Some(hit)) = (expected, got) {
+                hits += 1;
+                // Exact, except for the one case where "exact" is not a
+                // well-posed question: a ray crossing the shared edge of two
+                // triangles hits both at the same `t` up to an ulp, either
+                // answer is the surface, and which one the BVH sees first
+                // depends on the pruning bound. A whole ulp is four orders of
+                // magnitude inside the tolerance that would hide a real miss.
+                assert!(
+                    (hit.dist - t).abs() < 1e-5,
+                    "from {origin}: the BVH says {} and a linear scan {t}",
+                    hit.dist
+                );
+                if hit.dist == t {
+                    let n = mesh.face_normals()[index as usize];
+                    let n = if dir.dot(n) > 0.0 { -n } else { n };
+                    assert_eq!(hit.normal, n, "from {origin}");
+                }
+            }
+        }
+    }
+    assert!(hits > 150, "only {hits} of 169 rays found the soup");
+}
+
+#[test]
+fn overlap_queries_report_a_trimesh_like_they_report_a_box() {
+    let mut level = Level::new();
+    let ground = level.bare();
+    let (verts, indices) = grid_soup(6.0, 4, |_, _| 0.0);
+    let mesh = Trimesh::build_from_soup(&verts, &indices);
+    let mut geometry = level.snapshot();
+    push_trimesh(&mut geometry, ground, Vec3::ZERO, &mesh, 1 << PHASEABLE);
+
+    // A capsule 0.1 m into the surface genuinely overlaps it.
+    let hits = geometry.overlap_capsule(Vec3::new(0.4, 0.9, -0.7), 0.35, 2.0, ALL_LAYERS);
+    assert_eq!(hits.len(), 1, "one collider, one hit: {hits:?}");
+    assert_eq!(hits[0].entity, ground);
+    assert!(
+        (hits[0].depth - 0.1).abs() < 1e-4,
+        "depth {} for a 0.1 m overlap",
+        hits[0].depth
+    );
+    assert!(hits[0].normal.abs_diff_eq(Vec3::Y, 1e-5));
+    assert!(!hits[0].trigger);
+
+    // Clear of it: overlap means overlap, not the solver's touching band.
+    assert!(geometry
+        .overlap_capsule(Vec3::new(0.4, 1.001, -0.7), 0.35, 2.0, ALL_LAYERS)
+        .is_empty());
+    // Off the edge of the sheet entirely.
+    assert!(geometry
+        .overlap_sphere(Vec3::new(20.0, 0.0, 0.0), 0.35, ALL_LAYERS)
+        .is_empty());
+    // A sphere sitting in the surface.
+    let sphere_hits = geometry.overlap_sphere(Vec3::new(1.0, 0.2, 1.0), 0.5, ALL_LAYERS);
+    assert_eq!(sphere_hits.len(), 1);
+    assert!((sphere_hits[0].depth - 0.3).abs() < 1e-4);
+
+    // And the same one-way mask rule.
+    assert!(geometry
+        .overlap_capsule(
+            Vec3::new(0.4, 0.9, -0.7),
+            0.35,
+            2.0,
+            ALL_LAYERS & !(1 << PHASEABLE)
+        )
+        .is_empty());
+
+    // `overlap_body` says the same thing about the shape a solver would use.
+    let mut body = standing();
+    body.layers = CollisionLayers::DEFAULT;
+    assert_eq!(
+        geometry
+            .overlap_body(&body, Vec3::new(0.4, 0.9, -0.7))
+            .len(),
+        1
+    );
+}
+
+// -- determinism -------------------------------------------------------------
+
+#[test]
+fn a_run_over_a_trimesh_is_a_pure_function_of_the_snapshot() {
+    let (verts, indices) = grid_soup(8.0, 16, bumpy);
+    let build = || {
+        let mut level = Level::new();
+        let ground = level.bare();
+        let mesh = Trimesh::build_from_soup(&verts, &indices);
+        let mut geometry = level.snapshot();
+        push_trimesh(&mut geometry, ground, Vec3::ZERO, &mesh, 1);
+        geometry
+    };
+    let run = |geometry: &CollisionWorld| {
+        let mut body = standing().with_snap_length(0.5);
+        let mut p = Vec3::new(-6.0, 2.0, -1.5);
+        let mut v = Vec3::new(3.0, 0.0, 0.5);
+        let mut trace = Vec::with_capacity(240);
+        for _ in 0..240 {
+            step(geometry, &mut body, &mut p, &mut v);
+            trace.push((p, v, body.on_floor));
+        }
+        trace
+    };
+
+    let a = run(&build());
+    assert_eq!(run(&build()), a, "two identical runs over a soup diverged");
+    // A freshly built mesh is the same collider, not merely an equal one.
+    let one = build();
+    assert_eq!(run(&one), a);
+    assert_eq!(run(&one), a);
+}
+
+/// FNV-1a over the capsule's position, velocity and grounded flag, every tick,
+/// for 240 ticks of a run across the bumpy soup — the same hash shape
+/// `physics.rs` pins the demo scene with. Returns the trace's end state too, so
+/// the test can say what the hash is a hash *of*.
+fn bumpy_trimesh_fingerprint() -> (u64, Vec3, bool, u32) {
+    let (verts, indices) = grid_soup(8.0, 16, bumpy);
+    let mesh = Trimesh::build_from_soup(&verts, &indices);
+    let mut level = Level::new();
+    let ground = level.bare();
+    let mut geometry = level.snapshot();
+    push_trimesh(&mut geometry, ground, Vec3::ZERO, &mesh, 1);
+
+    let mut body = standing().with_snap_length(0.5);
+    let mut p = Vec3::new(-6.0, 2.0, -1.5);
+    let mut v = Vec3::new(3.0, 0.0, 0.5);
+
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut grounded_ticks = 0u32;
+    for _ in 0..240 {
+        step(&geometry, &mut body, &mut p, &mut v);
+        grounded_ticks += body.on_floor as u32;
+        for word in [
+            p.x.to_bits(),
+            p.y.to_bits(),
+            p.z.to_bits(),
+            v.x.to_bits(),
+            v.y.to_bits(),
+            v.z.to_bits(),
+            body.on_floor as u32,
+        ] {
+            h ^= word as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    (h, p, body.on_floor, grounded_ticks)
+}
+
+#[test]
+fn the_bumpy_trimesh_run_ticks_to_its_pinned_fingerprint() {
+    // The one number here that is pinned rather than compared. Everything the
+    // trimesh path does is in it: the weld, the BVH's triangle order, the leaf
+    // scan order, the seam/ridge flags, the face-normal snap, the
+    // deepest-contact tie-break, the snap probe. If any of them changes, this
+    // moves — which is the point. A change that is *meant* to move it re-pins it
+    // with a note saying why.
+    let (hash, end, on_floor, grounded_ticks) = bumpy_trimesh_fingerprint();
+
+    // …but a hash of a run that fell off the world would be just as stable, so
+    // say what the run was: a dozen metres of +X across a 16 m sheet, deflected
+    // by the bumps (nothing drives the horizontal velocity — the only thing that
+    // changes it is the surface), and still on that surface at the end.
+    assert!(on_floor, "the run ended airborne");
+    assert!(
+        end.x > 5.0 && end.x < 7.5,
+        "the run ended at x = {}, not a dozen metres of +X from −6",
+        end.x
+    );
+    assert!(
+        end.z.abs() < 2.0,
+        "the bumps deflected the run {} m off its lane — it is not crossing \
+         the sheet any more",
+        end.z
+    );
+    assert!(
+        end.y > 0.85 && end.y < 1.15,
+        "the capsule is at {} — off the ±0.12 m surface it was rolling over",
+        end.y
+    );
+    assert!(
+        grounded_ticks > 200,
+        "only {grounded_ticks} of 240 ticks were grounded; the run is a fall, \
+         not a roll across bumps"
+    );
+
+    assert_eq!(
+        hash, 0xc959_12ed_9d98_0d91,
+        "the 240-tick run across the bumpy soup changed"
+    );
+}
+
+#[test]
+fn a_trimesh_snapshot_is_a_value_that_shares_its_geometry() {
+    // An `Arc` in a collider entry is what makes a level's baked soup one
+    // allocation no matter how many entries reference it — and cloning a
+    // snapshot has to stay a refcount bump rather than a copy of the mesh.
+    let (verts, indices) = grid_soup(4.0, 4, bumpy);
+    let mesh = Trimesh::build_from_soup(&verts, &indices);
+    let mut level = Level::new();
+    let a = level.bare();
+    let b = level.bare();
+    let mut geometry = level.snapshot();
+    push_trimesh(&mut geometry, a, Vec3::ZERO, &mesh, 1);
+    push_trimesh(&mut geometry, b, Vec3::new(0.0, -4.0, 0.0), &mesh, 1);
+
+    assert_eq!(Arc::strong_count(&mesh), 3, "the soup was copied, not shared");
+    let cloned = geometry.clone();
+    assert_eq!(Arc::strong_count(&mesh), 5);
+    assert_eq!(cloned, geometry);
+
+    // Entity order, as everywhere else: the scan is a `Vec` walk in it.
+    assert!(geometry.colliders()[0].entity < geometry.colliders()[1].entity);
+    assert_eq!(geometry.colliders().len(), 2);
+
+    // Two sheets 4 m apart: a ray finds the near one.
+    let hit = geometry
+        .raycast(Vec3::new(0.0, 5.0, 0.0), Vec3::NEG_Y, 20.0, ALL_LAYERS)
+        .expect("both sheets are under the ray");
+    assert_eq!(hit.entity, a);
 }
