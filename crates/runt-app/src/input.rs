@@ -64,6 +64,12 @@ pub fn translate_key(code: KeyCode) -> Key {
         KeyCode::Tab => Key::Tab,
         KeyCode::Escape => Key::Escape,
 
+        // Physical positions, like every other entry: on an AZERTY board these
+        // two are where `^` and `$` print, and a replay recorded on one layout
+        // has to step the render scale the same way on another.
+        KeyCode::BracketLeft => Key::BracketLeft,
+        KeyCode::BracketRight => Key::BracketRight,
+
         // Left/right modifiers collapse: a ball game wants "is shift down".
         KeyCode::ShiftLeft | KeyCode::ShiftRight => Key::Shift,
         KeyCode::ControlLeft | KeyCode::ControlRight => Key::Ctrl,

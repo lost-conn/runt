@@ -75,6 +75,12 @@ pub enum Key {
     Shift,
     Ctrl,
     Alt,
+    /// `[` — the physical key left of `]`, whatever it prints on this layout.
+    /// Conventionally a "step something down" binding (render scale, in the
+    /// hosts that have one).
+    BracketLeft,
+    /// `]`. See [`Key::BracketLeft`].
+    BracketRight,
     /// Every key the host could not map. Never given gameplay meaning.
     Other,
 }
@@ -96,7 +102,7 @@ impl Key {
         [
             A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, Digit0,
             Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9, Up, Down, Left,
-            Right, Space, Enter, Tab, Escape, Shift, Ctrl, Alt, Other,
+            Right, Space, Enter, Tab, Escape, Shift, Ctrl, Alt, BracketLeft, BracketRight, Other,
         ]
     };
 }

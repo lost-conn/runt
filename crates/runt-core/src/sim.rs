@@ -182,6 +182,7 @@ impl Sim {
         world.insert_resource(crate::texture::TextureLibrary::new());
         world.insert_resource(Lighting::default());
         world.insert_resource(StatusLine::default());
+        world.insert_resource(crate::ecs::RenderScale::default());
         world.insert_resource(crate::audio::AudioOut::new());
         world.insert_resource(quality);
         world.insert_resource(GenCache::new(cache));
@@ -531,6 +532,28 @@ impl Sim {
         {
             library.set_live_textures(live);
         }
+    }
+
+    /// The fraction of the host's resolution the scene is drawn at
+    /// (DESIGN §11). See [`RenderScale`](crate::ecs::RenderScale).
+    pub fn render_scale(&self) -> crate::ecs::RenderScale {
+        self.world
+            .get_resource::<crate::ecs::RenderScale>()
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Draw the scene at `scale` × the host's resolution, clamped into
+    /// `[RenderScale::MIN, RenderScale::MAX]`.
+    ///
+    /// Render-side only, exactly like
+    /// [`set_live_textures`](Sim::set_live_textures): the renderer reads it
+    /// while sizing its internal target and no system reads it at all, so a
+    /// determinism fingerprint cannot move when it changes. Game code that wants
+    /// it on a key writes `ResMut<RenderScale>` from a `FixedSim` system.
+    pub fn set_render_scale(&mut self, scale: f32) {
+        let scale = crate::ecs::RenderScale::new(scale);
+        self.world.insert_resource(scale);
     }
 
     /// The persistent content store, so the bake can consult it (DESIGN §7).

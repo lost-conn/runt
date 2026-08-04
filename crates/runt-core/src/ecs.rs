@@ -121,6 +121,124 @@ impl QualityTier {
     }
 }
 
+/// The fraction of the host's target resolution the 3D scene is drawn at
+/// (DESIGN §11's resolution lever) — "pixel chonkiness".
+///
+/// At 1.0 (the default) the renderer draws straight into the view the host
+/// handed it and this resource costs nothing. Below 1.0 the whole pass sequence
+/// goes into an internal color+depth target of [`size`](RenderScale::size) and
+/// is then blitted up with a **nearest** sampler, so a 0.5 frame is honest 2×2
+/// blocks rather than a blur. Fragment cost falls with the *area*: 0.5 is a
+/// quarter of the pixels, which is why this is the first thing to reach for on a
+/// device that cannot afford the shading it is being asked for.
+///
+/// # Why it is a resource and not a `Renderer` field
+///
+/// Exactly the arrangement §7's live-texture switch already uses (see
+/// [`TextureLibrary::set_live_textures`](crate::texture::TextureLibrary::set_live_textures)):
+/// the value lives where a `FixedSim` system can write it — so a game binds it
+/// to a key once and both hosts, the window and the canvas, get the binding —
+/// while the *effect* is confined to the render path. Nothing in the engine
+/// reads it inside a tick, so no simulation state can depend on it and no
+/// determinism fingerprint can move when it changes. It is an output knob that
+/// happens to be reachable from input.
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
+pub struct RenderScale(f32);
+
+impl Default for RenderScale {
+    fn default() -> RenderScale {
+        RenderScale(RenderScale::MAX)
+    }
+}
+
+impl RenderScale {
+    /// The floor. A tenth of each axis is a hundredth of the pixels; below that
+    /// the frame stops being a picture of anything, and a scale of zero would
+    /// ask for a zero-sized attachment.
+    pub const MIN: f32 = 0.1;
+
+    /// The ceiling. Supersampling is a different feature with different costs
+    /// (and a different filter); this knob only ever goes down.
+    pub const MAX: f32 = 1.0;
+
+    /// The steps a host's "make it chunkier" key walks through, ascending.
+    ///
+    /// Godot's own resolution-scale presets, near enough: quarter, third, half,
+    /// three-quarter, native. Any `f32` in `[MIN, MAX]` is legal — this is the
+    /// list a UI offers, not a restriction on the value.
+    pub const STEPS: [f32; 5] = [0.25, 1.0 / 3.0, 0.5, 0.75, 1.0];
+
+    /// Clamp `scale` into `[MIN, MAX]`. A NaN becomes [`MAX`](RenderScale::MAX):
+    /// the renderer allocates from this number, so "no opinion" has to resolve
+    /// to the safe end rather than to a zero-sized texture.
+    pub fn new(scale: f32) -> RenderScale {
+        RenderScale(if scale.is_nan() {
+            RenderScale::MAX
+        } else {
+            scale.clamp(RenderScale::MIN, RenderScale::MAX)
+        })
+    }
+
+    pub fn get(self) -> f32 {
+        self.0
+    }
+
+    /// Replace the value, clamped as [`new`](RenderScale::new).
+    pub fn set(&mut self, scale: f32) {
+        *self = RenderScale::new(scale);
+    }
+
+    /// Whether the scene is drawn at the host's own resolution — the one case
+    /// with no internal target and no blit in the frame at all.
+    pub fn is_native(self) -> bool {
+        self.0 >= RenderScale::MAX
+    }
+
+    /// The internal target's size for a `width` × `height` host view.
+    ///
+    /// Round half up (`f32::round` is half-away-from-zero, and these are all
+    /// positive), floor of 1 on each axis: a 3-pixel-wide viewport at 0.25 is
+    /// one pixel wide, never zero. Exactly `(width, height)` at scale 1.0, which
+    /// is what lets the renderer take the old path unchanged there.
+    pub fn size(self, width: u32, height: u32) -> (u32, u32) {
+        let scaled = |n: u32| ((n.max(1) as f32) * self.0).round().max(1.0) as u32;
+        (scaled(width), scaled(height))
+    }
+
+    /// Move `delta` places along [`STEPS`](RenderScale::STEPS) — what a host's
+    /// `[` / `]` pair calls.
+    ///
+    /// The first place moved is always to the next step *in the direction of
+    /// travel*, so a value that is not on the ladder (`0.42` from a URL query
+    /// or a config file) steps up to 0.5 and down to 1/3 rather than skipping
+    /// one. Saturates at both ends rather than wrapping: mashing `[` on a phone
+    /// should bottom out, not jump back to native.
+    pub fn stepped(self, delta: i32) -> RenderScale {
+        if delta == 0 {
+            return self;
+        }
+        // Wide enough to absorb the f32 error in 1/3, narrow enough that no two
+        // steps can be confused for each other.
+        const EPS: f32 = 1e-4;
+        let last = RenderScale::STEPS.len() as i32 - 1;
+        let index = if delta > 0 {
+            let first_above = RenderScale::STEPS
+                .iter()
+                .position(|s| *s > self.0 + EPS)
+                .map_or(last, |i| i as i32);
+            first_above + (delta - 1)
+        } else {
+            let last_below = RenderScale::STEPS
+                .iter()
+                .rposition(|s| *s < self.0 - EPS)
+                .map_or(0, |i| i as i32);
+            last_below + (delta + 1)
+        };
+        RenderScale::new(RenderScale::STEPS[index.clamp(0, last) as usize])
+    }
+}
+
 /// Which scene generator an entity's geometry came from.
 ///
 /// [`MeshRef`] is a content hash and stays one — it is the renderer's key and it

@@ -127,10 +127,12 @@ ordering down now. Cost accepted: wasm size (+~200–400 KB) and compile time.
   changes. True GPU instancing (per-instance vertex buffer) is the first
   optimization once the same (mesh, material) repeats a lot — the sort order
   already groups for it.
-- **Passes:** clear → opaque forward → (later, in order of likely need)
-  transparent-sorted pass, simple shadow map for the key light (capability-
-  gated resolution), post tonemap/vignette. No render-graph framework; a
-  hand-rolled ordered pass list is enough at this scale, forever.
+- **Passes:** clear → opaque forward → (when render scale < 1, see §11) a
+  fullscreen nearest blit from the internal target to the host's view →
+  (later, in order of likely need) transparent-sorted pass, simple shadow map
+  for the key light (capability-gated resolution), post tonemap/vignette. No
+  render-graph framework; a hand-rolled ordered pass list is enough at this
+  scale, forever.
 - **Camera:** a `Camera` component (projection params) + host-fed viewport
   size. Engine renders exactly one camera per `render()` call v1.
 - **Limits:** everything above fits `downlevel_webgl2_defaults()`. Compute,
@@ -425,6 +427,7 @@ immutable for the session:
 |---|---|---|---|
 | Limits requested | backend | `downlevel_webgl2_defaults` | full adapter limits |
 | Mesh quality default | perf | tier-scaled `Quality` | higher default quality |
+| Render scale (below) | perf | 0.5 or lower | 1.0 |
 | Live texture eval (§7) | perf | baked only | live variants allowed |
 | *(v1: an explicit `set_live_textures` flag, default off — see below)* | | | |
 | Bake resolution | both | ≤2048², tier-scaled | up to 4096² |
@@ -457,6 +460,35 @@ call site moves.
   where baked spends its own. So the honest threshold is "a discrete GPU, at
   1080p, for a scene where live is not covering most of the screen" — which is
   another way of saying the gate wants to be per-material rather than global.
+
+### Render scale — the blunt lever (2026-08-04)
+
+Every gate above chooses *what* to draw. This one chooses **how many pixels to
+draw it into**, which is the only lever whose payoff is quadratic and whose
+content cost is zero:
+
+- `Engine::set_render_scale(f32)`, clamped to `[0.1, 1.0]`, default 1.0. The
+  scene is drawn into an internal color+depth target of `round(scale × view)`
+  (half up, floor of one pixel) and blitted to the host's view with a
+  **nearest** sampler. Nearest, not linear: a half-resolution frame smeared
+  bilinearly is a blur that costs the same, and chonky pixels are a look.
+- **At 1.0 nothing happens** — no internal target, no blit pipeline compiled,
+  the same single submit into the host's view, and pixels bit-identical to
+  what the renderer produced before the feature existed. That is a test
+  (`tests/render_scale.rs`), not an intention.
+- The value is a `RenderScale` **resource**, like §7's live-texture switch, so
+  a game can bind it to a key from one `FixedSim` system and have it work on
+  both hosts. Nothing in a tick reads it, so no fingerprint can move when it
+  changes. `RenderScale::STEPS` is the Godot-shaped ladder a UI walks:
+  0.25, 1/3, 0.5, 0.75, 1.0.
+- **On web it multiplies with device pixel ratio**, which is where the win is:
+  the host configures its surface at CSS pixels × DPR, so the fragments drawn
+  are `css_w × css_h × DPR² × scale²`. A DPR-3 phone at 0.5 is still rendering
+  at 1.5× CSS density — visibly sharper than a desktop at 1.0 — for a quarter
+  of the phone's native fragment cost.
+- **Why it is the first thing the probe should reach for:** §7's live path
+  costs 4–5× in the fragment shader, and 0.5 render scale gives 4× back on
+  *any* fragment work, live or baked, with no content decision attached to it.
 
 ## 12. Build order
 

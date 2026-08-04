@@ -31,3 +31,9 @@ bevy_reflect = { version = "0.19", optional = true, default-features = false, fe
 
 [dev-dependencies]
 pollster.workspace = true
+# wgpu's own shader translator, pinned to the version wgpu 30 already resolves,
+# so this adds a feature to a crate the tree contains rather than a crate.
+# `tests/render_scale.rs` runs the WebGL2 backend's exact WGSL → GLSL-ES 3.00
+# path over the blit shader: a pipeline that compiles on Vulkan and fails to
+# *translate* is a shader that only breaks in a browser (DESIGN §11).
+naga = { version = "30", features = ["wgsl-in", "glsl-out"] }

@@ -2290,6 +2290,7 @@ dependencies = [
  "bytemuck",
  "glam 0.33.2",
  "log",
+ "naga",
  "pollster",
  "postcard",
  "ron",

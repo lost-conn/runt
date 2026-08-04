@@ -141,6 +141,40 @@ impl Engine {
         self.sim.set_live_textures(live);
     }
 
+    /// The fraction of the host's resolution the scene is drawn at
+    /// (DESIGN §11). 1.0 unless something set it.
+    pub fn render_scale(&self) -> f32 {
+        self.sim.render_scale().get()
+    }
+
+    /// Draw the scene at `scale` × whatever size [`render`](Engine::render) is
+    /// given, then upscale it with a nearest filter — Godot's resolution scale,
+    /// and the cheapest lever there is on a device that cannot afford its own
+    /// pixel count (0.5 is a quarter of the fragments).
+    ///
+    /// Clamped into `[RenderScale::MIN, RenderScale::MAX]`; a NaN resolves to
+    /// 1.0. At 1.0 the frame is drawn exactly as it was before this existed,
+    /// with no internal target and no blit.
+    ///
+    /// Cheap enough to call every frame, and — like
+    /// [`set_live_textures`](Engine::set_live_textures) — invisible to the sim:
+    /// no system reads it, so no fingerprint can move when it changes. A game
+    /// that would rather bind it to a key writes the
+    /// [`RenderScale`](crate::ecs::RenderScale) resource from a `FixedSim`
+    /// system instead; this is the host-side door to the same value.
+    pub fn set_render_scale(&mut self, scale: f32) {
+        self.sim.set_render_scale(scale);
+    }
+
+    /// The pixel size the scene is actually drawn at, for a host view of
+    /// `width` × `height` — what a status line should report.
+    ///
+    /// Equal to `(width, height)` at scale 1.0. Pure: it asks nothing of the
+    /// GPU and allocates nothing, so a host may call it before the first frame.
+    pub fn render_size(&self, width: u32, height: u32) -> (u32, u32) {
+        self.sim.render_scale().size(width, height)
+    }
+
     // -- host surface -------------------------------------------------------
 
     /// Buffer a host input event; it is consumed at the next tick boundary.
@@ -167,7 +201,11 @@ impl Engine {
     /// [`target_format`]: Engine::target_format
     pub fn render(&mut self, view: &wgpu::TextureView, width: u32, height: u32) {
         let (width, height) = (width.max(1), height.max(1));
+        // The host rectangle's aspect, not the internal target's: a scaled frame
+        // is stretched back over the full view, so this is the projection that
+        // belongs in it either way (see `Renderer::render_scaled`).
         let aspect = width as f32 / height as f32;
+        let scale = self.sim.render_scale();
 
         let Some(frame) = self.sim.frame_params(aspect) else {
             if !self.warned_no_camera {
@@ -177,10 +215,11 @@ impl Engine {
             // Still render, so a host sees an empty sky rather than garbage.
             // With no camera there is no view ray to speak of, so the gradient
             // resolves to a flat horizon-colored frame.
-            self.renderer.render(
+            self.renderer.render_scaled(
                 view,
                 width,
                 height,
+                scale,
                 &crate::FrameParams::default(),
                 &[],
                 self.sim.mesh_library(),
@@ -190,10 +229,11 @@ impl Engine {
         };
 
         let draws = self.sim.draw_list();
-        self.renderer.render(
+        self.renderer.render_scaled(
             view,
             width,
             height,
+            scale,
             &frame,
             &draws,
             self.sim.mesh_library(),

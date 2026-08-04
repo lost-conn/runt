@@ -47,6 +47,11 @@ pub mod trace;
 /// [`material::BASE_SHADER`].
 pub const SKY_SHADER: &str = include_str!("sky.wgsl");
 
+/// The render-scale blit's WGSL: one fullscreen triangle, nearest sampler
+/// (DESIGN §11). Standalone like [`SKY_SHADER`]; see
+/// [`Renderer::render_scaled`].
+pub const BLIT_SHADER: &str = include_str!("blit.wgsl");
+
 pub use audio::{
     AudioBackend, AudioEvent, AudioOut, Listener, ParamId, PatchId, RecordingBackend, Rolloff,
     SilentBackend, VoiceId,
@@ -63,7 +68,8 @@ pub use collide::{
 pub use draw::{DrawItem, FrameParams};
 pub use ecs::{
     default_horizon, DemoScene, FixedSim, GeneratorRef, GlobalTransform, Interpolated, Lighting,
-    MeshRef, PostSim, QualityTier, Spin, Startup, StatusLine, TerrainSurface, TickCount, Transform,
+    MeshRef, PostSim, QualityTier, RenderScale, Spin, Startup, StatusLine, TerrainSurface,
+    TickCount, Transform,
 };
 pub use engine::Engine;
 pub use gen::{GeneratorSpec, Shading};
@@ -248,6 +254,31 @@ pub struct Renderer {
     textures: bake::TextureRegistry,
 
     depth: Option<(u32, u32, wgpu::TextureView)>,
+
+    /// The internal color target a below-native [`RenderScale`] draws into, and
+    /// the bind group that reads it back. `None` until the first scaled frame —
+    /// a host that never leaves 1.0 allocates nothing and compiles no blit
+    /// pipeline (see [`ensure_blit`](Renderer::ensure_blit)).
+    offscreen: Option<Offscreen>,
+    /// The blit pipeline and its nearest sampler, compiled on first use.
+    blit: Option<Blit>,
+}
+
+/// The internal color target for a scaled frame, plus the bind group that
+/// samples it. Kept whole because the three parts are only ever valid together:
+/// the bind group names the view, and the view names the texture.
+struct Offscreen {
+    width: u32,
+    height: u32,
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+}
+
+/// The upscale pass: one pipeline, one nearest sampler, one layout.
+struct Blit {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
 }
 
 impl Renderer {
@@ -355,6 +386,8 @@ impl Renderer {
             baker,
             textures,
             depth: None,
+            offscreen: None,
+            blit: None,
         }
     }
 
@@ -518,8 +551,58 @@ impl Renderer {
         library: &MeshLibrary,
         textures: &texture::TextureLibrary,
     ) {
+        self.render_scaled(
+            view,
+            width,
+            height,
+            RenderScale::default(),
+            frame,
+            draws,
+            library,
+            textures,
+        );
+    }
+
+    /// As [`render`](Renderer::render), drawing the scene at `scale` × the
+    /// view's size and blitting it up (DESIGN §11's resolution lever).
+    ///
+    /// At [`RenderScale::MAX`] this *is* [`render`](Renderer::render): same
+    /// encoder, same passes, same one submit, straight into the host's view. No
+    /// internal target exists, nothing is sampled, and the pixels are bit for
+    /// bit what they were before this method did. That equivalence is the whole
+    /// design constraint — the screenshot suite pins it.
+    ///
+    /// Below it: the depth attachment and the color target are both sized by
+    /// [`RenderScale::size`], the entire existing pass sequence runs into that
+    /// internal color target, and one extra fullscreen pass copies it to the
+    /// real view through a **nearest** sampler. Both passes ride the same
+    /// encoder, so a scaled frame is still exactly one submission.
+    ///
+    /// `aspect` is deliberately *not* recomputed from the scaled size: the frame
+    /// is stretched back over the host's rectangle, so the projection that
+    /// belongs in it is the host rectangle's. The caller (see
+    /// [`Engine::render`](crate::Engine::render)) already built `frame` that way.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_scaled(
+        &mut self,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        scale: RenderScale,
+        frame: &FrameParams,
+        draws: &[DrawItem],
+        library: &MeshLibrary,
+        textures: &texture::TextureLibrary,
+    ) {
         let (width, height) = (width.max(1), height.max(1));
-        self.ensure_depth(width, height);
+        let (render_width, render_height) = scale.size(width, height);
+        // Not `scale.is_native()`: at a small enough viewport the rounding lands
+        // back on the host's own size (a 1-pixel view at 0.5 is still 1 pixel),
+        // and blitting a texture onto itself at 1:1 would be pure waste and one
+        // more thing to get wrong.
+        let scaled = (render_width, render_height) != (width, height);
+
+        self.ensure_depth(render_width, render_height);
 
         self.upload_missing_meshes(draws, library);
         self.bake_missing_textures(draws, textures);
@@ -528,7 +611,16 @@ impl Renderer {
         for item in draws {
             self.ensure_pipeline(item.variant);
         }
+        if scaled {
+            self.ensure_blit();
+            self.ensure_offscreen(render_width, render_height);
+        }
 
+        // The pass writes here; `view` is what the blit writes, if there is one.
+        let target = match &self.offscreen {
+            Some(off) if scaled => &off.view,
+            _ => view,
+        };
         let depth_view = &self.depth.as_ref().expect("depth ensured").2;
         let mut encoder = self
             .device
@@ -537,7 +629,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("opaque forward"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
+                    view: target,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(CLEAR_COLOR),
@@ -612,7 +704,49 @@ impl Renderer {
                 pass.draw_indexed(0..gpu.index_count, 0, 0..1);
             }
         }
+
+        if scaled {
+            let blit = self.blit.as_ref().expect("blit ensured");
+            let off = self.offscreen.as_ref().expect("offscreen ensured");
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("render-scale blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // The triangle covers every pixel of the destination, so
+                        // the load only exists to keep the attachment defined —
+                        // `Clear` rather than `Load` because loading the host's
+                        // previous contents is the one thing that could make a
+                        // scaled frame depend on what was on screen before it.
+                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                // No depth at all: the internal target's depth buffer did its
+                // job in the pass above and this is a copy, not a draw.
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&blit.pipeline);
+            pass.set_bind_group(0, &off.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
         self.queue.submit(Some(encoder.finish()));
+    }
+
+    /// The internal target's size, or `None` while the renderer is drawing at
+    /// the host's own resolution.
+    ///
+    /// Introspection for a host's status line and for the tests that pin the
+    /// rounding; the allocation is sticky, so this reports what *exists* rather
+    /// than what the last frame used.
+    pub fn scaled_target_size(&self) -> Option<(u32, u32)> {
+        self.offscreen.as_ref().map(|o| (o.width, o.height))
     }
 
     // -- frame plumbing -----------------------------------------------------
@@ -756,6 +890,165 @@ impl Renderer {
             let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
             self.depth = Some((width, height, view));
         }
+    }
+
+    /// Compile the blit pipeline, once, the first time a scaled frame needs it.
+    ///
+    /// Lazy rather than built in [`new`](Renderer::new) so that the common case
+    /// — a host that never leaves native resolution — pays nothing for this
+    /// feature: no shader module, no sampler, no pipeline. The sky pipeline is
+    /// eager because every frame draws a sky; no frame at 1.0 blits.
+    fn ensure_blit(&mut self) {
+        if self.blit.is_some() {
+            return;
+        }
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("blit source layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            // Non-filterable + a non-filtering sampler: the pass
+                            // point-samples on purpose, and asking for neither
+                            // capability keeps it valid on the narrowest
+                            // downlevel adapter (DESIGN §11).
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                        count: None,
+                    },
+                ],
+            });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("blit pipeline layout"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("render-scale blit"),
+                source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("render-scale blit"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_blit"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_blit"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.target_format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+        // Nearest on every axis, including between mips (there is one). Chonky
+        // pixels are the feature; a `Linear` here would be a blur that costs the
+        // same and looks like a mistake.
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blit nearest"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        log::info!(
+            "render scale: blit pipeline compiled (nearest, {:?})",
+            self.target_format
+        );
+        self.blit = Some(Blit {
+            pipeline,
+            layout,
+            sampler,
+        });
+    }
+
+    /// Keep the internal color target at `width` × `height`, recreating it (and
+    /// its bind group, which names its view) only when the size changes.
+    ///
+    /// The mirror of [`ensure_depth`](Renderer::ensure_depth), and sticky for
+    /// the same reason: a host that steps the scale up and down, or drags a
+    /// window edge, would otherwise reallocate on the frame it can least afford
+    /// to. The size is the *scaled* size, so a resize and a scale change are the
+    /// same event as far as this is concerned.
+    fn ensure_offscreen(&mut self, width: u32, height: u32) {
+        if matches!(&self.offscreen, Some(o) if o.width == width && o.height == height) {
+            return;
+        }
+        let blit = self.blit.as_ref().expect("blit compiled before offscreen");
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("render scale target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // The surface's own format, not a fixed Rgba8: every material
+            // pipeline was compiled against `target_format`, and a mismatched
+            // attachment is a validation error rather than a conversion.
+            format: self.target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit source"),
+            layout: &blit.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&blit.sampler),
+                },
+            ],
+        });
+        log::debug!("render scale: internal target {width}×{height}");
+        self.offscreen = Some(Offscreen {
+            width,
+            height,
+            view,
+            bind_group,
+        });
     }
 }
 
