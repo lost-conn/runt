@@ -8,7 +8,7 @@ use std::f32::consts::TAU;
 
 use glam::{Vec2, Vec3};
 
-use super::{MeshData, DEGENERATE_AREA_SQ};
+use super::{MeshData, Quality, DEGENERATE_AREA_SQ};
 
 const WHITE: Vec3 = Vec3::ONE;
 
@@ -238,6 +238,91 @@ pub fn uv_sphere(radius: f32, rings: u32, sectors: u32) -> MeshData {
     m
 }
 
+/// Base radial segments around a capsule's Y axis, before [`Quality`] scaling.
+const CAPSULE_RADIAL_SEGMENTS: u32 = 16;
+/// Base latitude bands per hemispherical cap, before [`Quality`] scaling.
+const CAPSULE_CAP_RINGS: u32 = 4;
+
+/// Capsule along the Y axis, centered: a cylinder wall with a hemispherical cap
+/// welded to each end.
+///
+/// `height` is the **total** cap-to-cap extent, Godot's `CapsuleMesh`
+/// convention, so the cylindrical mid-section is `height - 2 * radius` and
+/// `height == 2 * radius` is a sphere. A shorter `height` is a caller bug rather
+/// than a shape; it is clamped up to `2 * radius` (debug builds assert) so a bad
+/// number produces a sphere instead of a self-intersecting mesh.
+///
+/// Caps are UV-sphere style and share their equator ring with the wall, so the
+/// surface is one welded strip from pole to pole: normals are analytic and
+/// already smooth across both seams, and no `smooth_normals` pass is wanted.
+/// UVs are cylindrical — `u` around, `v` along the profile by **arc length**, so
+/// a cap covers the fraction of the texture its surface actually occupies.
+///
+/// Segment counts scale with `quality`: [`CAPSULE_RADIAL_SEGMENTS`] around and
+/// [`CAPSULE_CAP_RINGS`] bands per cap.
+pub fn capsule(radius: f32, height: f32, quality: Quality) -> MeshData {
+    debug_assert!(
+        height >= 2.0 * radius,
+        "capsule height {height} is shorter than its own caps (2 * radius = {})",
+        2.0 * radius
+    );
+    let radius = radius.max(0.0);
+    let height = height.max(2.0 * radius);
+    let seg = quality.segs(CAPSULE_RADIAL_SEGMENTS, 3);
+    let cap = quality.segs(CAPSULE_CAP_RINGS, 1);
+
+    // Half the cylindrical mid-section: the Y the cap centers sit at.
+    let hc = (height - 2.0 * radius) * 0.5;
+    // The profile, measured along the surface: a quarter circle, the wall, a
+    // quarter circle. `v` is this normalized, so nothing is stretched.
+    let quarter = std::f32::consts::FRAC_PI_2 * radius;
+    let profile = 2.0 * quarter + (height - 2.0 * radius);
+    let along = |d: f32| if profile > 0.0 { d / profile } else { 0.0 };
+
+    // Rows from the +Y pole down: `cap+1` on the top hemisphere (the last of
+    // which is the wall's top ring, where the cap normal is already horizontal)
+    // and `cap+1` on the bottom, whose first is the wall's bottom ring.
+    let mut m = MeshData::default();
+    let row = |phi: f32, center_y: f32, v: f32, m: &mut MeshData| {
+        let (sp, cp) = phi.sin_cos();
+        for s in 0..=seg {
+            let u = s as f32 / seg as f32;
+            let (st, ct) = (u * TAU).sin_cos();
+            let dir = Vec3::new(sp * ct, cp, sp * st);
+            m.positions.push(dir * radius + Vec3::new(0.0, center_y, 0.0));
+            m.normals.push(dir);
+            m.uvs.push(Vec2::new(u, v));
+            m.colors.push(WHITE);
+        }
+    };
+    for i in 0..=cap {
+        let phi = i as f32 / cap as f32 * std::f32::consts::FRAC_PI_2;
+        row(phi, hc, along(phi * radius), &mut m);
+    }
+    for j in 0..=cap {
+        let phi = std::f32::consts::FRAC_PI_2 * (1.0 + j as f32 / cap as f32);
+        let arc = quarter + (height - 2.0 * radius) + (phi - std::f32::consts::FRAC_PI_2) * radius;
+        row(phi, -hc, along(arc), &mut m);
+    }
+
+    let stride = seg + 1;
+    let rows = 2 * cap + 1;
+    for r in 0..rows {
+        for s in 0..seg {
+            let a = r * stride + s;
+            let b = r * stride + s + 1;
+            let c = (r + 1) * stride + s + 1;
+            let d = (r + 1) * stride + s;
+            // Checked for the same two reasons `uv_sphere` checks: a quad
+            // collapses to one triangle at each pole, and the whole wall band
+            // collapses when `height == 2 * radius`.
+            tri_checked(&mut m, a, b, c);
+            tri_checked(&mut m, a, c, d);
+        }
+    }
+    m
+}
+
 /// Torus in the XZ plane. `major` is the ring radius, `minor` the tube radius.
 pub fn torus(major: f32, minor: f32, major_seg: u32, minor_seg: u32) -> MeshData {
     let maj = major_seg.max(3);
@@ -271,4 +356,167 @@ pub fn torus(major: f32, minor: f32, major_seg: u32, minor_seg: u32) -> MeshData
         }
     }
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Quality;
+
+    /// A capsule's every vertex is `radius` from the nearer cap center, which is
+    /// the shape's whole definition — and its normal points straight out from
+    /// that center.
+    fn assert_on_the_surface(m: &MeshData, radius: f32, height: f32) {
+        let hc = (height - 2.0 * radius) * 0.5;
+        for (i, &p) in m.positions.iter().enumerate() {
+            let center = Vec3::new(0.0, p.y.clamp(-hc, hc), 0.0);
+            let radial = p - center;
+            assert!(
+                (radial.length() - radius).abs() < 1e-4,
+                "vertex {i} at {p:?} is {} from its cap center, not {radius}",
+                radial.length()
+            );
+            let expected = radial.normalize();
+            assert!(
+                m.normals[i].abs_diff_eq(expected, 1e-4),
+                "vertex {i} normal {:?} != outward {expected:?}",
+                m.normals[i]
+            );
+        }
+    }
+
+    #[test]
+    fn capsule_is_well_formed_and_the_right_size() {
+        let m = capsule(0.35, 1.4, Quality::FULL);
+        m.validate();
+        assert_eq!(m.normals.len(), m.positions.len());
+        assert_eq!(m.uvs.len(), m.positions.len());
+        assert_eq!(m.colors.len(), m.positions.len());
+
+        // (2 * cap + 2) rows of (seg + 1), welded at both equators.
+        let (seg, cap) = (CAPSULE_RADIAL_SEGMENTS, CAPSULE_CAP_RINGS);
+        assert_eq!(m.vertex_count() as u32, (2 * cap + 2) * (seg + 1));
+        // Every band is two triangles per segment except the two polar ones,
+        // where half of each quad collapses.
+        assert_eq!(m.triangle_count() as u32, (2 * (2 * cap + 1) - 2) * seg);
+
+        let (min, max) = m.bounds().unwrap();
+        assert!((max.y - 0.7).abs() < 1e-5, "half the total height: {max:?}");
+        assert!((min.y + 0.7).abs() < 1e-5, "{min:?}");
+        assert!((max.x - 0.35).abs() < 1e-5, "widest at the radius: {max:?}");
+        assert!((max.z - 0.35).abs() < 1e-5, "{max:?}");
+        assert_on_the_surface(&m, 0.35, 1.4);
+    }
+
+    #[test]
+    fn capsule_winds_outward_and_has_no_open_edge() {
+        let m = capsule(0.4, 1.6, Quality::FULL);
+        // Convex and centered, so an outward face's geometric normal agrees
+        // with its own centroid.
+        for t in m.indices.chunks_exact(3) {
+            let (a, b, c) = (
+                m.positions[t[0] as usize],
+                m.positions[t[1] as usize],
+                m.positions[t[2] as usize],
+            );
+            let centroid = (a + b + c) / 3.0;
+            assert!(
+                (b - a).cross(c - a).dot(centroid) > 0.0,
+                "face winds inward at {centroid:?}"
+            );
+        }
+
+        // Watertight up to the duplicated UV seam: every directed edge, taken
+        // between *positions* rather than indices, has exactly one opposite.
+        let key = |p: Vec3| {
+            let q = |f: f32| (f * 4096.0).round() as i32;
+            (q(p.x), q(p.y), q(p.z))
+        };
+        let mut edges = std::collections::HashMap::new();
+        for t in m.indices.chunks_exact(3) {
+            for k in 0..3 {
+                let a = key(m.positions[t[k] as usize]);
+                let b = key(m.positions[t[(k + 1) % 3] as usize]);
+                *edges.entry((a, b)).or_insert(0i32) += 1;
+            }
+        }
+        for ((a, b), count) in &edges {
+            assert_eq!(*count, 1, "edge {a:?}->{b:?} used {count} times");
+            assert_eq!(
+                edges.get(&(*b, *a)),
+                Some(&1),
+                "edge {a:?}->{b:?} has no opposite — the surface is open"
+            );
+        }
+    }
+
+    #[test]
+    fn a_capsule_as_tall_as_its_caps_is_a_sphere() {
+        // The wall band collapses to zero height; `tri_checked` drops it, and
+        // what is left has exactly a sphere's bounds and a sphere's surface.
+        let m = capsule(0.5, 1.0, Quality::FULL);
+        m.validate();
+        let (min, max) = m.bounds().unwrap();
+        assert!((max - Vec3::splat(0.5)).length() < 1e-5, "{max:?}");
+        assert!((min + Vec3::splat(0.5)).length() < 1e-5, "{min:?}");
+        for &p in &m.positions {
+            assert!((p.length() - 0.5).abs() < 1e-4, "{p:?} is not on the sphere");
+        }
+        // Two polar bands lose half their quads; the collapsed wall loses all.
+        let (seg, cap) = (CAPSULE_RADIAL_SEGMENTS, CAPSULE_CAP_RINGS);
+        assert_eq!(m.triangle_count() as u32, (2 * (2 * cap) - 2) * seg);
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "shorter than its own caps"))]
+    fn a_capsule_shorter_than_its_caps_clamps_instead_of_folding() {
+        // Debug builds refuse the number; release clamps it. Either way what a
+        // shipping build draws is the sphere, not an inside-out pinch.
+        let m = capsule(0.5, 0.2, Quality::FULL);
+        let (min, max) = m.bounds().unwrap();
+        assert!((max - Vec3::splat(0.5)).length() < 1e-5, "{max:?}");
+        assert!((min + Vec3::splat(0.5)).length() < 1e-5, "{min:?}");
+    }
+
+    #[test]
+    fn capsule_quality_scales_both_axes() {
+        let half = capsule(0.35, 1.4, Quality(0.5));
+        half.validate();
+        let (seg, cap) = (
+            Quality(0.5).segs(CAPSULE_RADIAL_SEGMENTS, 3),
+            Quality(0.5).segs(CAPSULE_CAP_RINGS, 1),
+        );
+        assert_eq!((seg, cap), (8, 2), "the scaled counts the mesh is built from");
+        assert_eq!(half.vertex_count() as u32, (2 * cap + 2) * (seg + 1));
+        assert!(half.vertex_count() < capsule(0.35, 1.4, Quality::FULL).vertex_count());
+        assert_on_the_surface(&half, 0.35, 1.4);
+    }
+
+    #[test]
+    fn capsule_uvs_run_the_profile_by_arc_length() {
+        let m = capsule(0.5, 3.0, Quality::FULL);
+        // A 2 m wall between two quarter-circles of 0.5 * pi/2: the wall is
+        // 2 / (2 + pi/2) of the profile, and the caps split the rest evenly.
+        let profile = 2.0 + std::f32::consts::PI * 0.5;
+        let cap_share = (std::f32::consts::FRAC_PI_2 * 0.5) / profile;
+        let mut v: Vec<f32> = m.uvs.iter().map(|uv| uv.y).collect();
+        v.sort_by(f32::total_cmp);
+        assert!((v[0]).abs() < 1e-6, "the +Y pole is v = 0");
+        assert!((v[v.len() - 1] - 1.0).abs() < 1e-6, "the -Y pole is v = 1");
+        // The wall's top ring: the only v that should sit at the cap's share.
+        let equator = m
+            .uvs
+            .iter()
+            .zip(&m.positions)
+            .find(|(_, p)| (p.y - 1.0).abs() < 1e-5)
+            .expect("the wall's top ring is at y = height/2 - radius");
+        assert!(
+            (equator.0.y - cap_share).abs() < 1e-5,
+            "v {} at the top of the wall, expected {cap_share}",
+            equator.0.y
+        );
+        for uv in &m.uvs {
+            assert!((0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y), "{uv:?}");
+        }
+    }
 }
