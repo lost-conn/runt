@@ -13,10 +13,16 @@ use glam::{Mat3, Mat4, Quat, Vec2, Vec3};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+pub mod curve;
+pub mod extrude;
 pub mod ops;
+pub mod poly2d;
 pub mod primitives;
 pub mod terrain;
 
+pub use curve::{Curve3, CurvePoint, PathFrame};
+pub use extrude::{extrude, lathe, path_extrude};
+pub use poly2d::{signed_area, triangulate};
 pub use primitives::*;
 pub use terrain::{terrain, HeightField, TerrainParams, TerrainTint};
 
