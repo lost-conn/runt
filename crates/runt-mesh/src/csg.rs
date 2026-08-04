@@ -64,9 +64,77 @@
 //!   Snapping inputs first means two brushes authored to meet at `x = 3.0`
 //!   actually meet, instead of meeting at `3.0` and `2.9999998` and generating
 //!   a sliver wall. Everything downstream then works on already-snapped data.
-//! - **1e-5 plane classification epsilon** (`EPSILON`), the csg.js value. It is
-//!   deliberately *smaller* than the input grid: a vertex that survived
-//!   snapping is either exactly on a plane or a full grid step off it.
+//! - **A plane-classification epsilon that is *relative to the operands*
+//!   ([`EPSILON_REL`] `= 1e-5`), computed once per boolean and threaded through
+//!   that operation's two BSP trees.**
+//!
+//! ### Why the classification epsilon cannot be absolute
+//!
+//! `csg.js` hard-codes `1e-5`, and so did this port until a level-scale bake
+//! walked into the failure mode. That number is only meaningful for geometry
+//! near the origin. An `f32` ulp at `|x| = 250` — the reach of a 500-unit-wide
+//! terrain brush — is `1.5e-5`, *larger* than the tolerance: past roughly
+//! `|x| = 60` the epsilon is under one ulp and stops separating anything. A
+//! polygon then classifies as `SPANNING`, gets split, and the fragment
+//! classifies as `SPANNING` again — the interpolated cut vertex cannot land
+//! inside a band narrower than the numbers it is made of. `Bsp::build`'s work
+//! stack never drains. It is not slow, it does not return:
+//!
+//! ```text
+//! let a = primitives::cylinder(100.0, 200.0, 20);
+//! let b = primitives::cylinder(200.0, 100.0, 20);
+//! Csg::from_mesh(&a, 0).union(Csg::from_mesh(&b, 0));   // used to never return
+//! ```
+//!
+//! So the epsilon tracks the arithmetic instead of a constant:
+//!
+//! ```text
+//! eps = max(EPSILON_REL * max|coordinate| over both operands, EPSILON_MIN)
+//! ```
+//!
+//! `f32` carries ~24 bits of mantissa, so one ulp is ~6e-8 *relative* at every
+//! magnitude; `EPSILON_REL = 1e-5` therefore buys ~170 ulps of slack at any
+//! scale, which is the same slack the csg.js constant buys at unit scale. The
+//! measurement is `max|coordinate|`, not the bounding-box diagonal or a
+//! centroid-relative extent, because that is exactly the quantity whose ulp
+//! sets the noise floor of `n · p - w`. It is taken over **both** operands and
+//! computed **once**, at the entry to each boolean, then carried on both `Bsp`s:
+//! the two trees classify each other's polygons, so a tolerance that differed
+//! between them could route a polygon `FRONT` in one direction and `BACK` in
+//! the other. `EPSILON_MIN = 1e-6` is a floor, not a fallback — it keeps the
+//! tolerance positive (and the split lerp's denominator away from zero) for a
+//! solid that is tiny or, degenerately, entirely at the origin.
+//!
+//! This is a pure widening for large geometry and a no-op at unit scale: an
+//! operand pair reaching `1.0` gets `1e-5` back, the csg.js value.
+//!
+//! ### Why the 1e-4 input grid stays absolute
+//!
+//! The grid is a *world lattice*, and its whole job is that two independently
+//! authored brushes land on the same one — a grid that scaled with either
+//! operand's extent would snap a reach-4 brush and a reach-250 brush to
+//! different lattices and stop them meeting, which is the defect it was
+//! introduced to prevent. It also cannot see the other operand: quantization
+//! happens in [`Csg::from_mesh`], one mesh at a time, long before a boolean
+//! pairs it with anything.
+//!
+//! That leaves the two tolerances crossing over at `max|coordinate| = 10`:
+//!
+//! - **Below the crossover** the old invariant holds — `eps < 1e-4`, so a
+//!   vertex that survived snapping is either exactly on a plane or a whole grid
+//!   step off it, and the epsilon never merges two distinct lattice points.
+//! - **Above it** the epsilon is the wider of the two, deliberately. One grid
+//!   step out there is worth fewer and fewer ulps (at `|x| = 250` it is ~6), so
+//!   below the crossover the grid is the finer statement about the geometry and
+//!   above it the epsilon is; the honest tolerance is always `max(grid, eps)`,
+//!   which is what this arrangement computes. Snapping keeps doing its cheap
+//!   de-duplication job either way, and degrades gracefully to a no-op once a
+//!   grid step falls under one ulp (past `|x| ≈ 1.7e3`).
+//!
+//! The residual cost above the crossover is that features closer together than
+//! `1e-5 * reach` get treated as coincident — 2.5 mm on a 250-unit brush. That
+//! is not a choice this file can dodge: it is the resolution `f32` has left at
+//! that magnitude, and the alternative is the hang.
 //!
 //! Split fragments inherit their parent polygon's plane rather than recomputing
 //! it from the fragment's first three vertices (a deliberate deviation from
@@ -110,11 +178,18 @@ use glam::{Vec2, Vec3};
 
 use super::{face_cross, MeshData, DEGENERATE_AREA_SQ};
 
-/// Plane classification tolerance — the `csg.js` value. See the module docs on
-/// why it is smaller than the input quantization grid.
-const EPSILON: f32 = 1.0e-5;
+/// Plane classification tolerance, **relative to the operands' reach**: the
+/// per-operation epsilon is `EPSILON_REL * max|coordinate|`, floored at
+/// [`EPSILON_MIN`]. At unit scale that is `1e-5`, the `csg.js` value. See the
+/// module docs on why an absolute tolerance hangs on level-scale geometry.
+pub const EPSILON_REL: f32 = 1.0e-5;
+
+/// Absolute floor under the relative epsilon, so that a tiny — or degenerate,
+/// all-at-the-origin — operand still gets a positive tolerance.
+pub const EPSILON_MIN: f32 = 1.0e-6;
 
 /// Input positions are snapped to this grid (1e-4) before anything else runs.
+/// Absolute on purpose: see the module docs on grid-versus-epsilon.
 const QUANT: f32 = 1.0e4;
 
 // Vertex-vs-plane classes. Bitwise-or'd into a polygon class, which is why
@@ -186,17 +261,18 @@ impl Plane {
         self.n.dot(p) - self.w
     }
 
-    /// Classify/split `poly` against this plane. Consumes the polygon: the
-    /// non-spanning cases hand it straight back, so only a genuine split
-    /// allocates.
-    fn split_polygon(&self, poly: CsgPolygon) -> Split {
+    /// Classify/split `poly` against this plane, with `eps` as the on-plane
+    /// band (see the module docs — it is the operation's relative epsilon, not
+    /// a constant). Consumes the polygon: the non-spanning cases hand it
+    /// straight back, so only a genuine split allocates.
+    fn split_polygon(&self, poly: CsgPolygon, eps: f32) -> Split {
         let mut poly_class = COPLANAR;
         let mut classes = Vec::with_capacity(poly.verts.len());
         for v in &poly.verts {
             let d = self.distance(v.pos);
-            let c = if d < -EPSILON {
+            let c = if d < -eps {
                 BACK
-            } else if d > EPSILON {
+            } else if d > eps {
                 FRONT
             } else {
                 COPLANAR
@@ -231,7 +307,7 @@ impl Plane {
                     }
                     if (ci | cj) == SPANNING {
                         // One endpoint is strictly in front, the other strictly
-                        // behind, so the denominator is at least 2 * EPSILON.
+                        // behind, so the denominator is at least 2 * eps.
                         let t = (self.w - self.n.dot(vi.pos)) / self.n.dot(vj.pos - vi.pos);
                         let v = vi.lerp(&vj, t);
                         f.push(v);
@@ -306,15 +382,23 @@ struct Node {
 
 /// A BSP tree in a flat arena — node 0 is always the root. See the module docs
 /// on why this is an arena and not `Box`ed children.
+///
+/// The tree carries the classification epsilon of the boolean that created it.
+/// Both trees of one operation are built with the same value (see
+/// [`epsilon_for`]) — they clip each other, so a tolerance that disagreed
+/// between them could call the same polygon `FRONT` one way and `BACK` the
+/// other.
 #[derive(Clone, Debug)]
 struct Bsp {
     nodes: Vec<Node>,
+    eps: f32,
 }
 
 impl Bsp {
-    fn new(polygons: Vec<CsgPolygon>) -> Bsp {
+    fn new(polygons: Vec<CsgPolygon>, eps: f32) -> Bsp {
         let mut bsp = Bsp {
             nodes: vec![Node::default()],
+            eps,
         };
         bsp.build(polygons);
         bsp
@@ -348,7 +432,7 @@ impl Bsp {
             let mut front = Vec::new();
             let mut back = Vec::new();
             for p in polys {
-                match plane.split_polygon(p) {
+                match plane.split_polygon(p, self.eps) {
                     // Coplanar polygons (either facing) live at this node.
                     Split::CoplanarFront(p) | Split::CoplanarBack(p) => own.push(p),
                     Split::Front(p) => front.push(p),
@@ -431,7 +515,7 @@ impl Bsp {
             let mut front = Vec::new();
             let mut back = Vec::new();
             for p in polys {
-                match plane.split_polygon(p) {
+                match plane.split_polygon(p, self.eps) {
                     // Coplanar polygons follow the side they face.
                     Split::CoplanarFront(p) | Split::Front(p) => front.push(p),
                     Split::CoplanarBack(p) | Split::Back(p) => back.push(p),
@@ -555,6 +639,19 @@ impl Csg {
         Csg { polygons }
     }
 
+    /// The largest `|coordinate|` any of this solid's vertices reaches, or
+    /// `0.0` for an empty solid. The scale the classification epsilon is
+    /// relative to — see the module docs on why it is this and not a diagonal.
+    fn reach(&self) -> f32 {
+        let mut r = 0.0f32;
+        for poly in &self.polygons {
+            for v in &poly.verts {
+                r = r.max(v.pos.abs().max_element());
+            }
+        }
+        r
+    }
+
     /// Everything in either solid. (`csg.js` `union`, unchanged.)
     pub fn union(self, other: Csg) -> Csg {
         if self.polygons.is_empty() {
@@ -563,8 +660,9 @@ impl Csg {
         if other.polygons.is_empty() {
             return self;
         }
-        let mut a = Bsp::new(self.polygons);
-        let mut b = Bsp::new(other.polygons);
+        let eps = epsilon_for(&self, &other);
+        let mut a = Bsp::new(self.polygons, eps);
+        let mut b = Bsp::new(other.polygons, eps);
         a.clip_to(&b);
         b.clip_to(&a);
         b.invert();
@@ -585,8 +683,9 @@ impl Csg {
         if self.polygons.is_empty() || other.polygons.is_empty() {
             return self;
         }
-        let mut a = Bsp::new(self.polygons);
-        let mut b = Bsp::new(other.polygons);
+        let eps = epsilon_for(&self, &other);
+        let mut a = Bsp::new(self.polygons, eps);
+        let mut b = Bsp::new(other.polygons, eps);
         a.invert();
         a.clip_to(&b);
         b.clip_to(&a);
@@ -605,8 +704,9 @@ impl Csg {
         if self.polygons.is_empty() || other.polygons.is_empty() {
             return Csg::default();
         }
-        let mut a = Bsp::new(self.polygons);
-        let mut b = Bsp::new(other.polygons);
+        let eps = epsilon_for(&self, &other);
+        let mut a = Bsp::new(self.polygons, eps);
+        let mut b = Bsp::new(other.polygons, eps);
         a.invert();
         b.clip_to(&a);
         b.invert();
@@ -648,6 +748,17 @@ impl Csg {
     pub fn into_mesh(self) -> MeshData {
         build_mesh(self.polygons.iter())
     }
+}
+
+/// The plane-classification tolerance for one boolean over `a` and `b`.
+///
+/// `EPSILON_REL * max|coordinate| over both operands`, floored at
+/// `EPSILON_MIN` — see the module docs for the derivation. Called once per
+/// operation and handed to both `Bsp`s; it is a pure function of the operand
+/// vertices in input order, so it is as deterministic as everything else here
+/// (`f32::max` over a `Vec` is exact and order-independent for finite input).
+fn epsilon_for(a: &Csg, b: &Csg) -> f32 {
+    (EPSILON_REL * a.reach().max(b.reach())).max(EPSILON_MIN)
 }
 
 /// Fan-triangulate polygons into a mesh. Valid because BSP polygons are convex:
@@ -911,6 +1022,91 @@ mod tests {
             solid.into_meshes().iter().map(|(m, _)| *m).collect::<Vec<_>>(),
             [0, 1]
         );
+    }
+
+    #[test]
+    fn the_epsilon_tracks_the_operands_and_floors() {
+        let at = |s: f32| {
+            let c = |t: f32| Csg::from_mesh(&primitives::cube(2.0).scale(Vec3::splat(t)), 0);
+            epsilon_for(&c(s), &c(s * 0.5))
+        };
+        // A unit-scale pair gets the csg.js constant back, unchanged.
+        assert!((at(1.0) - 1.0e-5).abs() < 1e-12, "{}", at(1.0));
+        // It follows the *larger* operand, linearly.
+        assert!((at(250.0) - 250.0 * 1.0e-5).abs() < 1e-9, "{}", at(250.0));
+        // And bottoms out rather than collapsing toward zero.
+        assert_eq!(at(1.0e-6), EPSILON_MIN);
+        assert_eq!(epsilon_for(&Csg::default(), &Csg::default()), EPSILON_MIN);
+    }
+
+    /// The level-scale hang this file's relative epsilon exists to fix.
+    ///
+    /// Two coaxial 20-sided cylinders with a 250-unit reach: with the old
+    /// absolute `EPSILON = 1e-5` — under one `f32` ulp out there — split
+    /// fragments re-classified as `SPANNING` forever and `Bsp::build`'s work
+    /// stack never drained. Bounded rather than timed: a hang fails CI by
+    /// wall clock, and the assertions below say the answer is also *right*.
+    #[test]
+    fn level_scale_cylinders_fold_instead_of_hanging() {
+        let a = primitives::cylinder(100.0, 200.0, 20);
+        let b = primitives::cylinder(200.0, 100.0, 20);
+        let solid = Csg::from_mesh(&a, 0).union(Csg::from_mesh(&b, 1));
+        // The union of two coaxial cylinders is a stepped disc: every input
+        // polygon is either kept, dropped or split a bounded number of times.
+        let tris = a.triangle_count() + b.triangle_count();
+        assert!(
+            solid.polygon_count() > tris / 2 && solid.polygon_count() < tris * 8,
+            "polygon count {} is not in the sane band around {tris}",
+            solid.polygon_count()
+        );
+        let m = solid.into_mesh();
+        m.validate();
+        // The taller/wider of the two in each axis.
+        assert_bounds(
+            &m,
+            Vec3::new(-200.0, -100.0, -200.0),
+            Vec3::new(200.0, 100.0, 200.0),
+        );
+        // Nothing survives strictly inside the tall cylinder.
+        assert!(centroids(&m)
+            .iter()
+            .all(|c| !(Vec2::new(c.x, c.z).length() < 95.0 && c.y.abs() < 95.0)));
+        // Watertightness is *not* pinned here: a cylinder-cylinder union leaves
+        // the T-junctions the module docs list as an accepted defect (the cap
+        // ring and the side seam are cut by different planes), and it does so at
+        // every scale — 0.01 through 100 all come back open by the same amount.
+        // `folds_are_scale_invariant` carries the closed-surface pin at reach
+        // 200 instead, on operands whose seams do line up.
+    }
+
+    /// The same fold at scale 1 and scale 100 has to produce the *same shape*.
+    ///
+    /// Not the same bytes: `f32` rounding differs between the two coordinate
+    /// ranges, so the pin is structural — identical polygon and triangle
+    /// counts, and bounds that agree once scaled back.
+    #[test]
+    fn folds_are_scale_invariant() {
+        let fold = |s: f32| {
+            let a = primitives::cube(2.0).scale(Vec3::splat(s));
+            let b = primitives::cube(2.0)
+                .translate(Vec3::splat(1.0))
+                .scale(Vec3::splat(s));
+            let solid = Csg::from_mesh(&a, 0).subtract(Csg::from_mesh(&b, 1));
+            (solid.polygon_count(), solid.into_mesh())
+        };
+        let (small_polys, small) = fold(1.0);
+        let (big_polys, big) = fold(100.0);
+        assert_eq!(small_polys, big_polys, "polygon count moved with scale");
+        assert_eq!(
+            small.triangle_count(),
+            big.triangle_count(),
+            "triangle count moved with scale"
+        );
+        assert!(is_closed_surface(&big), "the scaled-up fold is not watertight");
+        let (slo, shi) = small.bounds().unwrap();
+        let (blo, bhi) = big.bounds().unwrap();
+        assert!((blo / 100.0 - slo).length() < 1e-4, "min {blo:?} vs {slo:?}");
+        assert!((bhi / 100.0 - shi).length() < 1e-4, "max {bhi:?} vs {shi:?}");
     }
 
     #[test]
