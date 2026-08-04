@@ -13,6 +13,9 @@ use bytemuck::{Pod, Zeroable};
 pub use runt_mesh as mesh;
 use runt_mesh::MeshData;
 
+/// The remappable action layer (DESIGN §4): the engine owns the binding
+/// mechanism, each game owns its action vocabulary.
+pub mod action;
 /// The sim-side audio seam (DESIGN §8). No synthesizer: see the module docs.
 pub mod audio;
 /// Baking a [`texture::TextureSpec`] to GPU textures (DESIGN §7).
@@ -52,6 +55,7 @@ pub const SKY_SHADER: &str = include_str!("sky.wgsl");
 /// [`Renderer::render_scaled`].
 pub const BLIT_SHADER: &str = include_str!("blit.wgsl");
 
+pub use action::{resolve_actions, ActionId, Actions, Bindings, Source, StickDir};
 pub use audio::{
     AudioBackend, AudioEvent, AudioOut, Listener, ParamId, PatchId, RecordingBackend, Rolloff,
     SilentBackend, VoiceId,
@@ -73,7 +77,7 @@ pub use ecs::{
 };
 pub use engine::Engine;
 pub use gen::{GeneratorSpec, Shading};
-pub use input::{Input, InputEvent, Key};
+pub use input::{Input, InputEvent, Key, PadButton, PadStick, PadTrigger};
 pub use material::{Material, MaterialVariant};
 pub use physics::{
     AabbCollider, Ball, BallController, Grounded, OverlapEvent, RollSpin, SphereCollider, Trigger,
