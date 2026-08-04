@@ -147,7 +147,9 @@ impl std::error::Error for TraceError {}
 ///
 /// The events are re-derived from [`Input`]'s edge sets and analog accumulators
 /// in a fixed order — keys in [`Key::ALL`] order, then mouse buttons, then
-/// motion, then the wheel — so the encoding of a tick is a pure function of that
+/// motion, then the wheel, then the drive stick, then the pad (buttons in
+/// [`PadButton::ALL`](crate::input::PadButton::ALL) order, sticks, triggers) —
+/// so the encoding of a tick is a pure function of that
 /// tick's `Input` and does not depend on how the host happened to interleave its
 /// pushes. Within one key or button, order is *not* free:
 ///
@@ -167,8 +169,9 @@ impl std::error::Error for TraceError {}
 /// ## What a focus loss looks like in a trace
 ///
 /// [`InputEvent::FocusLost`] is never written out, because by the time this runs
-/// it has already become ordinary state: the keys it dropped appear as `KeyUp`s
-/// and the stick it centred as a `TouchDrive` of zero. Replaying those
+/// it has already become ordinary state: the keys it dropped appear as `KeyUp`s,
+/// the pad buttons as released `PadButton`s, and the sticks and triggers it
+/// centred as zeroed `TouchDrive`/`PadStick`/`PadTrigger`s. Replaying those
 /// reproduces the tick exactly, which is the property that matters — the trace
 /// records what the tick *saw*, not what the window manager did.
 pub fn record(mut trace: ResMut<InputTrace>, tick: Res<TickCount>, input: Res<Input>) {
@@ -234,6 +237,55 @@ pub fn record(mut trace: ResMut<InputTrace>, tick: Res<TickCount>, input: Res<In
     // already in the replayed `Input` from the tick that set it.
     if input.drive_changed() {
         trace.push(now, InputEvent::TouchDrive { dir: input.drive() });
+    }
+    // The pad, on exactly the terms above: buttons are edges and need the same
+    // four-case table as keys (a tap and a re-press inside one tick differ only
+    // in the order the two events go out), sticks and triggers are levels and
+    // are written only on the ticks they moved.
+    for button in crate::input::PadButton::ALL {
+        let (pressed, released) = (
+            input.pad_just_pressed(button),
+            input.pad_just_released(button),
+        );
+        if !pressed && !released {
+            continue;
+        }
+        let event = |pressed| InputEvent::PadButton { button, pressed };
+        match (pressed, released, input.pad_held(button)) {
+            (true, true, true) => {
+                trace.push(now, event(false));
+                trace.push(now, event(true));
+            }
+            (true, true, false) => {
+                trace.push(now, event(true));
+                trace.push(now, event(false));
+            }
+            (true, false, _) => trace.push(now, event(true)),
+            (false, true, _) => trace.push(now, event(false)),
+            (false, false, _) => unreachable!("filtered above"),
+        }
+    }
+    for stick in crate::input::PadStick::ALL {
+        if input.stick_changed(stick) {
+            trace.push(
+                now,
+                InputEvent::PadStick {
+                    stick,
+                    dir: input.stick(stick),
+                },
+            );
+        }
+    }
+    for trigger in crate::input::PadTrigger::ALL {
+        if input.trigger_changed(trigger) {
+            trace.push(
+                now,
+                InputEvent::PadTrigger {
+                    trigger,
+                    value: input.trigger(trigger),
+                },
+            );
+        }
     }
 }
 
