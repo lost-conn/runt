@@ -279,4 +279,6 @@ pub fn register(registry: &mut TypeRegistry) {
     registry.register::<crate::scene::LightingDesc>();
     registry.register::<crate::scene::BallDesc>();
     registry.register::<crate::scene::BallControllerDesc>();
+    registry.register::<crate::scene::ObbColliderDesc>();
+    registry.register::<crate::scene::CollisionLayersDesc>();
 }

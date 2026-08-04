@@ -17,6 +17,9 @@ use runt_mesh::MeshData;
 pub mod audio;
 pub mod cache;
 pub mod camera;
+/// Collision v2 (DESIGN §9): capsule character solver, OBBs, layers, queries.
+/// Additive — `physics` is untouched by it.
+pub mod collide;
 pub mod draw;
 pub mod ecs;
 pub mod engine;
@@ -44,6 +47,10 @@ pub use audio::{
 };
 pub use cache::{CacheStats, CacheStore, GenCache, NoopCache};
 pub use camera::{Camera, FollowCamera};
+pub use collide::{
+    move_and_slide, CharacterBody, CharacterShape, CollisionLayers, CollisionWorld, Contact,
+    ContactKind, MoveResult, ObbCollider, OverlapHit, RayHit, ALL_LAYERS,
+};
 pub use draw::{DrawItem, FrameParams};
 pub use ecs::{
     default_horizon, DemoScene, FixedSim, GeneratorRef, GlobalTransform, Interpolated, Lighting,

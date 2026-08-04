@@ -51,6 +51,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache::GenCache;
 use crate::camera::{Camera, FollowCamera};
+use crate::collide::{CollisionLayers, ObbCollider};
 use crate::ecs::{
     DemoEntity, DemoScene, GeneratorRef, GlobalTransform, Interpolated, Lighting, MeshRef,
     QualityTier, Spin, TerrainSurface, Transform,
@@ -171,12 +172,99 @@ pub struct EntityDesc {
     #[serde(default)]
     #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::OptVec3Def))]
     pub aabb_collider: Option<Vec3>,
+    /// **Oriented** box collider (DESIGN §9, collision v2). Rotation is authored
+    /// in degrees exactly like [`TransformDesc::rotation`]; see
+    /// [`ObbColliderDesc`] for why it is a field of its own rather than the
+    /// entity's transform.
+    ///
+    /// Read by the [`collide`](crate::collide) solver and queries **only**: the
+    /// v1 ball overlap pass does not know about rotated boxes and a ball will
+    /// roll through one. Use `aabb_collider` for ball geometry.
+    #[serde(default)]
+    pub obb_collider: Option<ObbColliderDesc>,
+    /// Collision layers (DESIGN §9, collision v2). Absent means
+    /// [`CollisionLayers::DEFAULT`] — member of layer 0, colliding with
+    /// everything — which is what every scene written before layers existed
+    /// behaves as.
+    #[serde(default)]
+    pub collision_layers: Option<CollisionLayersDesc>,
     /// Overlapping this collider reports an event but pushes nothing out.
     #[serde(default)]
     pub trigger: bool,
     /// Drive this ball from keyboard input. Exactly one per scene in v1.
     #[serde(default)]
     pub ball_controller: Option<BallControllerDesc>,
+}
+
+/// An [`ObbCollider`] as a scene file writes it.
+///
+/// The rotation is the **collider's**, not the entity's: a scene usually gives
+/// both the same angle, but the solver never reads `Transform.rotation` and a
+/// collider that is not the drawing is the same rule
+/// [`Ball::radius`](crate::physics::Ball::radius) already follows. Authored in
+/// degrees, `EulerRot::XYZ`, via the same [`RotationDesc`] a transform uses — so
+/// the PoC level's `rotation: Euler((-40.0, 0.0, 0.0))` ramp reads identically
+/// whether it is describing the mesh or the box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
+pub struct ObbColliderDesc {
+    #[serde(default)]
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def))]
+    pub half_extents: Vec3,
+    #[serde(default)]
+    pub rotation: RotationDesc,
+}
+
+impl ObbColliderDesc {
+    pub fn to_collider(self) -> ObbCollider {
+        ObbCollider {
+            half_extents: self.half_extents,
+            rotation: self.rotation.quat(),
+        }
+    }
+}
+
+/// A [`CollisionLayers`] as a scene file writes it. Both fields are bit sets;
+/// omitting either takes the [`CollisionLayers::DEFAULT`] value for it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
+pub struct CollisionLayersDesc {
+    #[serde(default = "default_memberships")]
+    pub memberships: u16,
+    #[serde(default = "default_mask")]
+    pub mask: u16,
+}
+
+fn default_memberships() -> u16 {
+    CollisionLayers::DEFAULT.memberships
+}
+
+fn default_mask() -> u16 {
+    CollisionLayers::DEFAULT.mask
+}
+
+impl Default for CollisionLayersDesc {
+    fn default() -> CollisionLayersDesc {
+        CollisionLayersDesc::from(CollisionLayers::DEFAULT)
+    }
+}
+
+impl From<CollisionLayers> for CollisionLayersDesc {
+    fn from(l: CollisionLayers) -> CollisionLayersDesc {
+        CollisionLayersDesc {
+            memberships: l.memberships,
+            mask: l.mask,
+        }
+    }
+}
+
+impl CollisionLayersDesc {
+    pub fn to_layers(self) -> CollisionLayers {
+        CollisionLayers {
+            memberships: self.memberships,
+            mask: self.mask,
+        }
+    }
 }
 
 /// A [`Ball`]'s parameters, every one of them optional so a scene can say
@@ -782,6 +870,12 @@ pub fn spawn_scene(world: &mut World, desc: SceneDesc) -> Result<SceneStats, Sce
                  a rotated box is not an axis-aligned box"
             );
             entity.insert(AabbCollider { half_extents });
+        }
+        if let Some(obb) = placement.obb_collider {
+            entity.insert(obb.to_collider());
+        }
+        if let Some(layers) = placement.collision_layers {
+            entity.insert(layers.to_layers());
         }
         if placement.trigger {
             entity.insert(Trigger);

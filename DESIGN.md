@@ -249,6 +249,88 @@ dumb pump.
   colliders. A game that needs these forces a doctrine revisit (likely
   rapier3d behind a feature flag), not an incremental slide into one.
 
+### 9a. Collision v2 (2026-08-04, for the 3dimenshift port)
+
+The revisit the clause above asked for, taken deliberately. Porting a Godot
+platformer (`3dimenshift-runt/docs/PORT_SPEC.md`) needs a moveset the point
+integrator cannot express — 14 land states built on `move_and_slide`,
+per-contact normals, runtime `floor_max_angle` mutation, shape queries with
+layer masks. The answer is **not** rapier3d: everything the moveset needs is a
+few hundred lines of closest-point math, and the §9 properties (analytic
+terrain, tick-rate determinism, no mesh collision) survive intact. It is a
+sibling module, `runt-core/src/collide.rs`; `physics.rs` is untouched and the
+demo's pinned 240-tick fingerprint is unchanged.
+
+**Added:**
+
+- **Capsule character solver.** `move_and_slide(&CollisionWorld, &mut
+  CharacterBody, position, velocity, dt) -> MoveResult`. A **library function**,
+  not a system: game code calls it from its own `FixedSim` system and owns the
+  position and velocity it passes in — there is no second copy of the simulation
+  state in a component. Discrete, iterative: translate, collect contacts, push
+  the deepest one out, project velocity onto every contact plane, repeat up to
+  five times. The moving shape is a swept sphere along a **vertical** segment —
+  capsule or, degenerately, sphere — so the port's runtime capsule↔sphere roll
+  swap is one enum field. Contacts classify as floor / wall / ceiling against a
+  per-body `max_floor_angle` (45° standing, 89° slam, 180° rolling), and Godot's
+  floor snap is reproduced: probe down `snap_length`, land straight along `up`,
+  keep horizontal velocity.
+- **`ObbCollider { half_extents, rotation: Quat }`** — full rotation, not the
+  yaw-only box originally planned. The contact solve happens in the box's own
+  frame, where orientation has already been divided out, so a pitched ramp costs
+  what a yawed wall costs and restricting to yaw bought nothing. `AabbCollider`
+  stays as the zero-rotation fast path (a vertical segment against an
+  axis-aligned box has a closed-form contact point; an OBB needs a search).
+  Authored in a scene as `obb_collider`, rotation in Euler degrees exactly like a
+  transform.
+- **`CollisionLayers { memberships: u16, mask: u16 }`**, one-way and query-side:
+  *a collider is visible to a query iff `query_mask & collider.memberships != 0`*.
+  That is Godot's rule (`A.collision_mask & B.collision_layer`, evaluated from
+  the mover's side), not a symmetric both-must-agree variant — the symmetric
+  form breaks the port's phase mechanic, which mutates only the player's mask and
+  expects static world geometry to become passable. Absent component =
+  `{ memberships: layer 0, mask: all }`, so every scene written before layers
+  behaves identically. Mutable from any system; a `CollisionWorld` is a value
+  taken once per solve, so a mask write can never land mid-tick.
+- **Queries:** `overlap_sphere`, `overlap_capsule`, `overlap_body` and `raycast`,
+  all mask-filtered, all reporting triggers with a flag rather than hiding them.
+  The raycast is exact against boxes and spheres (slab test in the box frame) and
+  a fixed-step march plus fixed-count bisection against the analytic height
+  field — never its mesh, so §9's tessellation-independence claim extends to
+  rays. The scan is linear over an `Entity`-sorted `Vec`; the one method it goes
+  through is the seam a spatial index would replace.
+
+**Still refused:**
+
+- **Trimesh / BVH colliders.** Acknowledged as the eventual need — the shipped
+  `playground.tscn` is CSG-baked and cannot port without either re-authoring or
+  triangle-soup collision, and the N64 port of the same game (`dimenshift64`)
+  landed on exactly that. Deliberately out of scope: the PoC level is 16 boxes
+  and 5 pitched ramps, which convex primitives cover exactly.
+- Dynamic-dynamic response, impulse exchange, stacking, joints. A solve moves
+  the character and only the character; the other body never learns it was hit.
+- Swept CCD. Motion is capped per sub-step at the moving shape's radius, which is
+  half the no-gap bound (`2·radius`) — the port's fastest motion is a 30 m/s slam
+  (0.5 m/tick, two sub-steps) against 0.5 m-thick walls that would need 1.2 m of
+  travel to tunnel.
+- Rotated or scaled terrain, and non-vertical capsules. Both are the same refusal
+  as v1's: a rotated height field is not a height field.
+
+**Determinism, extended to the new solver** (DESIGN §3, §4 still govern):
+
+- `CollisionWorld` sorts colliders and terrain patches by `Entity` at
+  construction and every scan walks that order. No hash container is iterated.
+- Contact selection takes the greatest depth, ties to the lowest `Entity`;
+  velocity is projected against contacts in `Entity` order; the "which floor is
+  *the* floor" rule is most-upright-wins, ties to lowest `Entity`.
+- Every loop bound is a compile-time constant — slide iterations, sub-steps, the
+  segment/box ternary search, the ray march and its bisections. Nothing iterates
+  to an error threshold that a different machine could reach on a different step.
+- Sub-step count is a function of the *entry* velocity and `dt` alone, so what a
+  tick collides with cannot change how it was integrated.
+- The whole module is pure: same snapshot + same position/velocity ⇒ the same
+  `MoveResult`, bit for bit, under any host frame cadence.
+
 ## 10. Editor — native rinch app
 
 **Decision:** the editor is a native rinch application (`runt-editor`) using

@@ -1,0 +1,1693 @@
+//! Collision v2 — capsule character solver, rotated boxes, layers, queries
+//! (DESIGN §9, "Collision v2" amendment, 2026-08-04).
+//!
+//! [`physics`](crate::physics) is the v1 story: a point integrator plus
+//! sphere/AABB overlap push-out, tuned for a rolling ball. It is untouched by
+//! this module — no system here runs in `FixedSim`, nothing here reads or writes
+//! a [`Ball`](crate::physics::Ball), and `assets/demo.ron` ticks to the same
+//! fingerprint it always did.
+//!
+//! This module is the *other* shape of kinematic motion: a Godot-style
+//! `move_and_slide` for a vertical capsule (or sphere), which is what a
+//! platformer's state machine needs and what a ball integrator cannot express.
+//! It is a **library**, not a schedule: game code calls [`move_and_slide`] from
+//! its own `FixedSim` system, at whatever point in its state machine makes
+//! sense, and owns the position/velocity it passes in.
+//!
+//! ```text
+//! CollisionWorld::from_world / ::gather   snapshot every collider, Entity-sorted
+//! move_and_slide(&world, &mut body, p, v, dt) -> MoveResult
+//! world.overlap_sphere / overlap_capsule  → Vec<OverlapHit>
+//! world.raycast                           → Option<RayHit>
+//! ```
+//!
+//! ## Shapes
+//!
+//! Everything the solver collides *with* is a convex primitive placed at an
+//! entity's `Transform.translation`:
+//!
+//! | component | shape |
+//! |---|---|
+//! | [`SphereCollider`] | sphere |
+//! | [`AabbCollider`] | box, world axes — the zero-rotation fast path |
+//! | [`ObbCollider`] | box, arbitrary [`Quat`] |
+//! | [`TerrainSurface`] | the analytic height field, sampled — never its mesh |
+//!
+//! Everything that *moves* is a swept sphere along a **vertical** segment: a
+//! capsule of `{radius, height}`, or the degenerate zero-length case, a sphere.
+//! One shape family means one contact routine, which is what keeps the sphere
+//! and capsule modes of the port's roll swap consistent with each other.
+//!
+//! ### Why `ObbCollider` carries its own rotation
+//!
+//! The earlier plan was a yaw-only rotated box. That restriction bought nothing:
+//! the contact math transforms the moving segment into the box's local frame and
+//! is *rotation-agnostic* there — a pitched ramp costs exactly what a yawed wall
+//! costs. So [`ObbCollider`] takes a full [`Quat`], and the PoC level's five
+//! pitched ramps and one −98°-yaw phase wall are the same code path.
+//!
+//! The rotation lives on the **collider**, not on the entity's `Transform`, for
+//! the same reason [`Ball::radius`](crate::physics::Ball::radius) is not the
+//! mesh's radius: the collider is not the drawing. A scene usually gives both
+//! the same angle, and `obb_collider` in a `.ron` file authors it in degrees
+//! exactly like a transform does — but nothing forces them to agree, and the
+//! solver never reads `Transform.rotation`.
+//!
+//! ## Layer semantics — one-way, query-side
+//!
+//! [`CollisionLayers`] is `{ memberships, mask }`, both `u16`. Godot checks
+//! `A.collision_mask & B.collision_layer` — *one-way, per body*, evaluated from
+//! the perspective of whoever is doing the moving. A symmetric
+//! "both directions must agree" rule is a different (and stricter) system, and
+//! it breaks the phase mechanic: the phase system mutates only the **player's**
+//! mask and expects tagged world geometry, whose memberships never change, to
+//! become passable.
+//!
+//! So runt takes the one-way rule and states it as a property of the *query*:
+//!
+//! > A collider is visible to a query iff `query_mask & collider.memberships != 0`.
+//!
+//! Every entry point here takes a `mask: u16`; [`move_and_slide`] uses
+//! `body.layers.mask`. A collider with no [`CollisionLayers`] component is
+//! `CollisionLayers::DEFAULT` — member of layer 0, mask all — so a scene written
+//! before layers existed behaves identically. `memberships` on a *moving* body
+//! is carried for symmetry and for the day something queries against the player;
+//! nothing in this module reads it.
+//!
+//! Layers are plain component data, mutable from any system. A mask written this
+//! tick is read by the next [`move_and_slide`] call that snapshots the world —
+//! [`CollisionWorld`] is a value, taken once, so a mutation can never take effect
+//! *part way through* a solve.
+//!
+//! ## Determinism (DESIGN §3, §4)
+//!
+//! - [`CollisionWorld`] sorts its colliders and terrain patches by `Entity` at
+//!   construction; every scan is a `Vec` walk in that order. No hash container
+//!   is iterated anywhere in this file.
+//! - Contact selection picks the greatest `depth`; an exact tie goes to the
+//!   lowest `Entity`. Velocity is projected against contacts in `Entity` order.
+//! - Every iteration count is a compile-time constant
+//!   ([`SLIDE_ITERATIONS`], [`MAX_SUBSTEPS`], [`SEGMENT_SEARCH_ITERATIONS`],
+//!   [`RAY_BISECTIONS`], [`RAY_MAX_STEPS`]). Nothing loops until an error
+//!   threshold that a different machine might reach on a different step.
+//! - Sub-stepping is derived from the *entry* velocity and `dt` only, so the
+//!   number of sub-steps a tick takes cannot depend on what it collides with.
+//! - Everything is a pure function of its arguments: same snapshot + same
+//!   position/velocity ⇒ same `MoveResult`, bit for bit.
+//!
+//! ## Where the two halves of §9 do *not* meet
+//!
+//! [`resolve_overlaps`](crate::physics::resolve_overlaps) — the `Ball` path's
+//! overlap pass — knows nothing about [`ObbCollider`] or [`CollisionLayers`]. A
+//! ball rolls straight through a rotated box, and a masked-out collider is still
+//! solid to it. That is a deliberate boundary, not an oversight: the v1 pass is
+//! pinned by a fingerprint test and a set of trajectory tests, and the game that
+//! wanted collision v2 drives a [`CharacterBody`] (sphere mode is what its
+//! rolling state uses), never a `Ball`. Extending the ball pass is a few lines
+//! whenever something actually needs it.
+//!
+//! ## What this is not
+//!
+//! No swept CCD (see [`MAX_SUBSTEPS`] for what is done instead), no trimesh or
+//! BVH, no dynamic-dynamic response, no joints. See DESIGN §9.
+
+use bevy_ecs::prelude::*;
+use glam::{Quat, Vec3};
+
+use crate::ecs::{TerrainSurface, Transform};
+use crate::physics::{AabbCollider, SphereCollider, Trigger};
+
+// ---------------------------------------------------------------------------
+// Tuning
+// ---------------------------------------------------------------------------
+
+/// How many push-out/slide passes one sub-step may take. Godot's
+/// `max_slides` default is 6; 5 is enough for a floor plus two walls with a
+/// pass to spare, and the loop exits early the moment nothing is penetrating.
+pub const SLIDE_ITERATIONS: u32 = 5;
+
+/// Separation below which a surface still counts as *touching*, in metres.
+///
+/// Without it a body that comes to rest exactly on the floor reports
+/// `on_floor == false` on the very next tick — it is no longer penetrating, and
+/// "not penetrating" is not the same as "not standing on". 1 mm is far below
+/// anything a player can see and far above `f32` noise at world scale.
+pub const CONTACT_MARGIN: f32 = 1e-3;
+
+/// Penetration below which the push-out step is skipped (the contact is still
+/// reported and still projects velocity).
+const PUSH_EPSILON: f32 = 1e-6;
+
+/// Largest translation one sub-step may attempt, as a fraction of the moving
+/// shape's radius.
+///
+/// ## The margin, with the port's actual numbers
+///
+/// The solve is discrete: it tests the *end* position of a step, never the swept
+/// volume. Consecutive test positions `d` apart each cover an interval of
+/// `2·radius` along the motion axis, so they overlap — and therefore cover the
+/// path with no gap for an obstacle to hide in — exactly when `d < 2·radius`.
+/// Half of that bound is the fraction below, i.e. consecutive positions always
+/// overlap by at least half a radius.
+///
+/// PORT_SPEC's body is a capsule of `radius ≈ 0.35`, so the per-sub-step cap is
+/// `0.35 m`:
+///
+/// | motion | `|v|·dt` at 60 Hz | sub-steps |
+/// |---|---|---|
+/// | `max_speed` 8 | 0.133 m | 1 |
+/// | `max_fall_speed` 20 | 0.333 m | 1 |
+/// | ground-pound slam 30 | 0.500 m | 2 |
+/// | defensive 40 | 0.667 m | 2 |
+///
+/// Normal play therefore never sub-steps, and the thinnest geometry in the level
+/// (the 0.5 m phase wall) needs `d ≥ 0.5 + 2·0.35 = 1.2 m` to be tunnelled —
+/// three and a half times the cap.
+pub const SUBSTEP_RADIUS_FRACTION: f32 = 1.0;
+
+/// Ceiling on sub-steps per call. Eight of them at the cap above is `2.8 m` of
+/// motion in one tick — 168 m/s. Past that the body *can* tunnel, and it does so
+/// loudly (a teleporting player) rather than by silently costing a hundred
+/// solves a tick.
+pub const MAX_SUBSTEPS: u32 = 8;
+
+/// Ternary-search steps used to find the contact point on a segment against a
+/// rotated box. The bracket shrinks by `(2/3)^n`, so 30 steps put the parameter
+/// within `5·10⁻⁶` of the true minimum; the signed distance function is
+/// 1-Lipschitz, so the depth error is that times the segment length.
+pub const SEGMENT_SEARCH_ITERATIONS: u32 = 30;
+
+/// March step for the analytic-height-field raycast, in metres. This is the
+/// smallest terrain feature a ray is guaranteed to notice; the field is analytic,
+/// so it has nothing to do with the mesh's tessellation and the same ray hits the
+/// same point at every [`Quality`](runt_mesh::Quality) tier.
+pub const RAY_MARCH_STEP: f32 = 0.125;
+
+/// Cap on march steps: `512 · 0.125 = 64 m` of terrain ray.
+pub const RAY_MAX_STEPS: u32 = 512;
+
+/// Bisection steps that refine a bracketed terrain crossing. 24 of them resolve
+/// [`RAY_MARCH_STEP`] to `7·10⁻⁹ m`.
+pub const RAY_BISECTIONS: u32 = 24;
+
+// ---------------------------------------------------------------------------
+// Components
+// ---------------------------------------------------------------------------
+
+/// An **oriented** box collider, centered on the entity's
+/// `Transform.translation`.
+///
+/// The rotation is world-space and belongs to the collider, not the entity — see
+/// the module docs. Full [`Quat`], not yaw: the closest-point solve happens in
+/// the box's own frame, where orientation has already been divided out, so a
+/// pitched ramp is not more expensive than a yawed wall. This supersedes the
+/// earlier yaw-only plan.
+///
+/// [`AabbCollider`] remains the zero-rotation form and stays cheaper: a vertical
+/// segment against an axis-aligned box has a closed-form contact point, while an
+/// OBB needs the search.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub struct ObbCollider {
+    pub half_extents: Vec3,
+    pub rotation: Quat,
+}
+
+impl Default for ObbCollider {
+    fn default() -> ObbCollider {
+        ObbCollider {
+            half_extents: Vec3::splat(0.5),
+            rotation: Quat::IDENTITY,
+        }
+    }
+}
+
+impl ObbCollider {
+    pub fn new(half_extents: Vec3, rotation: Quat) -> ObbCollider {
+        ObbCollider {
+            half_extents,
+            rotation,
+        }
+    }
+
+    /// A box pitched about world X, the form the PoC level's five ramps take.
+    pub fn pitched(half_extents: Vec3, degrees: f32) -> ObbCollider {
+        ObbCollider::new(half_extents, Quat::from_rotation_x(degrees.to_radians()))
+    }
+
+    /// A box turned about world Y, the form the PoC level's phase wall takes.
+    pub fn yawed(half_extents: Vec3, degrees: f32) -> ObbCollider {
+        ObbCollider::new(half_extents, Quat::from_rotation_y(degrees.to_radians()))
+    }
+}
+
+/// Which layers an entity belongs to, and which layers it looks for.
+///
+/// One-way, query-side semantics — see the module docs. `memberships` says what
+/// this entity *is*; `mask` says what it *collides with* when it is the one
+/// moving or querying.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CollisionLayers {
+    pub memberships: u16,
+    pub mask: u16,
+}
+
+/// Every layer bit set — the default mask.
+pub const ALL_LAYERS: u16 = u16::MAX;
+
+impl Default for CollisionLayers {
+    fn default() -> CollisionLayers {
+        CollisionLayers::DEFAULT
+    }
+}
+
+impl CollisionLayers {
+    /// Member of layer 0, collides with everything. What an entity with no
+    /// [`CollisionLayers`] component is treated as, which is what makes adding
+    /// layers a non-event for scenes written before them.
+    pub const DEFAULT: CollisionLayers = CollisionLayers {
+        memberships: 1,
+        mask: ALL_LAYERS,
+    };
+
+    /// Member of layer `index` only, colliding with everything.
+    pub fn layer(index: u32) -> CollisionLayers {
+        CollisionLayers {
+            memberships: 1 << index,
+            mask: ALL_LAYERS,
+        }
+    }
+
+    pub fn with_memberships(mut self, memberships: u16) -> CollisionLayers {
+        self.memberships = memberships;
+        self
+    }
+
+    pub fn with_mask(mut self, mask: u16) -> CollisionLayers {
+        self.mask = mask;
+        self
+    }
+
+    /// Turn one mask bit on or off. The phase system's whole job.
+    pub fn set_mask_layer(&mut self, index: u32, enabled: bool) {
+        let bit = 1u16 << index;
+        if enabled {
+            self.mask |= bit;
+        } else {
+            self.mask &= !bit;
+        }
+    }
+
+    /// Turn one membership bit on or off.
+    pub fn set_membership_layer(&mut self, index: u32, enabled: bool) {
+        let bit = 1u16 << index;
+        if enabled {
+            self.memberships |= bit;
+        } else {
+            self.memberships &= !bit;
+        }
+    }
+}
+
+/// The one-way visibility rule, spelled out once so nothing can restate it
+/// differently: a collider is visible to a query iff the query's mask shares a
+/// bit with the collider's memberships.
+#[inline]
+pub fn mask_accepts(query_mask: u16, memberships: u16) -> bool {
+    query_mask & memberships != 0
+}
+
+/// The moving shape: a vertical capsule, or a sphere.
+///
+/// PORT_SPEC swaps between the two at runtime (standing ↔ rolling), so they are
+/// one enum on one component rather than two components a state machine has to
+/// insert and remove.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CharacterShape {
+    /// `height` is the **total** height including both caps, matching Godot's
+    /// `CapsuleShape3D`. The swept segment is therefore `height - 2·radius`
+    /// long; a capsule with `height <= 2·radius` degenerates to a sphere rather
+    /// than becoming invalid.
+    Capsule { radius: f32, height: f32 },
+    Sphere { radius: f32 },
+}
+
+impl Default for CharacterShape {
+    fn default() -> CharacterShape {
+        CharacterShape::Capsule {
+            radius: 0.35,
+            height: 2.0,
+        }
+    }
+}
+
+impl CharacterShape {
+    #[inline]
+    pub fn radius(self) -> f32 {
+        match self {
+            CharacterShape::Capsule { radius, .. } | CharacterShape::Sphere { radius } => radius,
+        }
+    }
+
+    /// Half the length of the swept segment: `0` for a sphere.
+    #[inline]
+    pub fn half_segment(self) -> f32 {
+        match self {
+            CharacterShape::Capsule { radius, height } => (height * 0.5 - radius).max(0.0),
+            CharacterShape::Sphere { .. } => 0.0,
+        }
+    }
+
+    /// The swept segment `(lower, upper)` for a body centered at `position`.
+    /// Both endpoints coincide for a sphere.
+    #[inline]
+    pub fn segment(self, position: Vec3, up: Vec3) -> (Vec3, Vec3) {
+        let h = self.half_segment();
+        (position - up * h, position + up * h)
+    }
+}
+
+/// A kinematic character: the shape and the tunables [`move_and_slide`] reads.
+///
+/// Every field is meant to be written *between* solves — PORT_SPEC needs
+/// `max_floor_angle` at 45° standing, 89° during a ground-pound slam and 180°
+/// rolling, `snap_length` toggled 0.5/0.0 grounded/airborne, the shape swapped
+/// capsule↔sphere, and `layers.mask` rewritten every phase frame. None of them
+/// is read anywhere except inside a call, so a mid-tick write is impossible by
+/// construction.
+///
+/// Position and velocity are **not** here: they are the caller's, passed in and
+/// handed back by [`MoveResult`]. A component that mirrored `Transform` would be
+/// a second copy of the simulation state, which DESIGN §9 already refuses for
+/// [`Grounded`](crate::physics::Grounded).
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub struct CharacterBody {
+    pub shape: CharacterShape,
+    /// Radians. A contact whose normal is within this angle of `up` is floor.
+    /// `PI` makes every contact floor (the rolling case).
+    pub max_floor_angle: f32,
+    /// Godot's `floor_snap_length`, metres. `0` disables snapping.
+    pub snap_length: f32,
+    /// The layers this body collides with (`mask`) and belongs to
+    /// (`memberships`, unread here — see the module docs).
+    pub layers: CollisionLayers,
+    /// Which way is up. Constant `+Y` in practice; a field so the classifier
+    /// never hardcodes it.
+    pub up: Vec3,
+    /// Was the body grounded at the end of the previous solve? **Written by**
+    /// [`move_and_slide`]; floor snap refuses to engage without it, exactly as
+    /// Godot refuses to snap a body that was already airborne.
+    pub on_floor: bool,
+}
+
+impl Default for CharacterBody {
+    fn default() -> CharacterBody {
+        CharacterBody {
+            shape: CharacterShape::default(),
+            max_floor_angle: std::f32::consts::FRAC_PI_4,
+            snap_length: 0.5,
+            layers: CollisionLayers::DEFAULT,
+            up: Vec3::Y,
+            on_floor: false,
+        }
+    }
+}
+
+impl CharacterBody {
+    pub fn with_shape(mut self, shape: CharacterShape) -> CharacterBody {
+        self.shape = shape;
+        self
+    }
+
+    pub fn with_max_floor_degrees(mut self, degrees: f32) -> CharacterBody {
+        self.max_floor_angle = degrees.to_radians();
+        self
+    }
+
+    pub fn with_snap_length(mut self, snap_length: f32) -> CharacterBody {
+        self.snap_length = snap_length;
+        self
+    }
+
+    pub fn with_layers(mut self, layers: CollisionLayers) -> CharacterBody {
+        self.layers = layers;
+        self
+    }
+
+    /// The swept segment for a body centered at `position`.
+    #[inline]
+    pub fn segment(&self, position: Vec3) -> (Vec3, Vec3) {
+        self.shape.segment(position, self.up)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Contacts
+// ---------------------------------------------------------------------------
+
+/// What a contact normal means, relative to a body's `max_floor_angle`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContactKind {
+    Floor,
+    Wall,
+    Ceiling,
+}
+
+/// One resolved contact.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Contact {
+    /// The collider (or terrain patch) that was touched.
+    pub entity: Entity,
+    /// Unit normal pointing **out of** the surface, towards the body — the
+    /// direction push-out moves in. Same convention as
+    /// [`OverlapEvent::normal`](crate::physics::OverlapEvent::normal).
+    pub normal: Vec3,
+    /// A point on the surface, at the deepest part of the overlap.
+    pub point: Vec3,
+    /// Penetration along `normal`. May be slightly negative (down to
+    /// `-CONTACT_MARGIN`) for a body that is touching but not overlapping.
+    pub depth: f32,
+    pub kind: ContactKind,
+}
+
+/// What one [`move_and_slide`] produced.
+///
+/// `contacts` is deduplicated by entity (deepest wins) and sorted by `Entity`.
+/// It is a plain `Vec`, pre-sized to the number of colliders the body could
+/// possibly touch; the inline-storage optimisation is a swap of this one type
+/// when a profile says it matters.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MoveResult {
+    pub position: Vec3,
+    /// Velocity after slide projection. The caller keeps its own *pre-slide*
+    /// copy if it needs one (PORT_SPEC's roll wall-bump does).
+    pub velocity: Vec3,
+    pub on_floor: bool,
+    /// `+Y` when not on floor.
+    pub floor_normal: Vec3,
+    /// Radians between `floor_normal` and `up`; `0` when not on floor.
+    pub floor_angle: f32,
+    pub on_wall: bool,
+    /// `Vec3::ZERO` when not on a wall.
+    pub wall_normal: Vec3,
+    pub on_ceiling: bool,
+    /// `Vec3::ZERO` when not on a ceiling.
+    pub ceiling_normal: Vec3,
+    pub contacts: Vec<Contact>,
+    /// How many sub-steps the translation was split into (≥ 1).
+    pub sub_steps: u32,
+    /// Whether floor snap is what produced `on_floor`.
+    pub snapped: bool,
+}
+
+impl MoveResult {
+    fn empty(position: Vec3, velocity: Vec3) -> MoveResult {
+        MoveResult {
+            position,
+            velocity,
+            on_floor: false,
+            floor_normal: Vec3::Y,
+            floor_angle: 0.0,
+            on_wall: false,
+            wall_normal: Vec3::ZERO,
+            on_ceiling: false,
+            ceiling_normal: Vec3::ZERO,
+            contacts: Vec::new(),
+            sub_steps: 1,
+            snapped: false,
+        }
+    }
+
+    /// The floor contacts, in `Entity` order.
+    pub fn floors(&self) -> impl Iterator<Item = &Contact> {
+        self.contacts.iter().filter(|c| c.kind == ContactKind::Floor)
+    }
+
+    /// The wall contacts, in `Entity` order.
+    pub fn walls(&self) -> impl Iterator<Item = &Contact> {
+        self.contacts.iter().filter(|c| c.kind == ContactKind::Wall)
+    }
+}
+
+/// A contact before classification.
+#[derive(Clone, Copy, Debug)]
+struct RawContact {
+    entity: Entity,
+    normal: Vec3,
+    point: Vec3,
+    depth: f32,
+}
+
+// ---------------------------------------------------------------------------
+// The world snapshot
+// ---------------------------------------------------------------------------
+
+/// A collider's shape, resolved from whichever component the entity carried.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ColliderShape {
+    Sphere { radius: f32 },
+    Aabb { half_extents: Vec3 },
+    Obb { half_extents: Vec3, rotation: Quat },
+}
+
+/// One collider, snapshotted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColliderEntry {
+    pub entity: Entity,
+    pub center: Vec3,
+    pub shape: ColliderShape,
+    pub memberships: u16,
+    /// Carries [`Trigger`]: reported by the queries, never solid to the solver.
+    pub trigger: bool,
+}
+
+/// One analytic terrain patch, snapshotted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerrainEntry {
+    pub entity: Entity,
+    pub surface: TerrainSurface,
+    pub origin: Vec3,
+    pub memberships: u16,
+}
+
+/// Every collider in the world, in `Entity` order.
+///
+/// A **value**, taken once and then read: the solver cannot observe a component
+/// being mutated part way through a solve, and a game system is free to write
+/// layers or transforms while holding one.
+///
+/// The scan is linear. At the scale runt is built for (a level is tens of
+/// boxes) that is the right answer, and it is the seam a broadphase would slot
+/// into: everything here funnels through [`CollisionWorld::for_each`], so a
+/// spatial index becomes a change to one method rather than to five call sites.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CollisionWorld {
+    colliders: Vec<ColliderEntry>,
+    terrain: Vec<TerrainEntry>,
+}
+
+/// The read-only collider components [`CollisionWorld::gather`] wants.
+pub type ColliderQuery = (
+    Entity,
+    Option<&'static SphereCollider>,
+    Option<&'static AabbCollider>,
+    Option<&'static ObbCollider>,
+    &'static Transform,
+    Option<&'static CollisionLayers>,
+    Has<Trigger>,
+);
+
+/// The read-only terrain components [`CollisionWorld::gather`] wants.
+pub type TerrainQuery = (
+    Entity,
+    &'static TerrainSurface,
+    &'static Transform,
+    Option<&'static CollisionLayers>,
+);
+
+impl CollisionWorld {
+    pub fn new() -> CollisionWorld {
+        CollisionWorld::default()
+    }
+
+    /// Snapshot from inside a `FixedSim` system.
+    ///
+    /// Both queries are generic in their **filter** so the caller can exclude
+    /// the thing that is moving — a `&Transform` read here and a `&mut
+    /// Transform` write on the player are the same component, and bevy refuses
+    /// the pair without a `Without<…>` proving them disjoint. That is the same
+    /// `Without<Ball>` shape `resolve_overlaps` already uses.
+    ///
+    /// ```ignore
+    /// fn player_move(
+    ///     colliders: Query<ColliderQuery, Without<Player>>,
+    ///     terrain: Query<TerrainQuery, Without<Player>>,
+    ///     mut player: Query<(&mut CharacterBody, &mut Transform, &mut Velocity), With<Player>>,
+    /// ) {
+    ///     let geometry = CollisionWorld::gather(&colliders, &terrain);
+    ///     …
+    /// }
+    /// ```
+    pub fn gather<Fc: bevy_ecs::query::QueryFilter, Ft: bevy_ecs::query::QueryFilter>(
+        colliders: &Query<'_, '_, ColliderQuery, Fc>,
+        terrain: &Query<'_, '_, TerrainQuery, Ft>,
+    ) -> CollisionWorld {
+        let mut world = CollisionWorld::new();
+        for (entity, sphere, aabb, obb, transform, layers, trigger) in colliders.iter() {
+            let memberships = layers.copied().unwrap_or_default().memberships;
+            if let Some(shape) = resolve_shape(entity, sphere, aabb, obb, transform) {
+                world.colliders.push(ColliderEntry {
+                    entity,
+                    center: transform.translation,
+                    shape,
+                    memberships,
+                    trigger,
+                });
+            }
+        }
+        for (entity, surface, transform, layers) in terrain.iter() {
+            world.terrain.push(TerrainEntry {
+                entity,
+                surface: *surface,
+                origin: transform.translation,
+                memberships: layers.copied().unwrap_or_default().memberships,
+            });
+        }
+        world.finish();
+        world
+    }
+
+    /// Snapshot from a bare [`World`] — what a test or a non-system caller
+    /// wants. Identical output to [`gather`](CollisionWorld::gather).
+    pub fn from_world(world: &mut World) -> CollisionWorld {
+        let mut out = CollisionWorld::new();
+
+        let mut colliders = world.query::<(
+            Entity,
+            Option<&SphereCollider>,
+            Option<&AabbCollider>,
+            Option<&ObbCollider>,
+            &Transform,
+            Option<&CollisionLayers>,
+            Has<Trigger>,
+        )>();
+        for (entity, sphere, aabb, obb, transform, layers, trigger) in colliders.iter(world) {
+            let memberships = layers.copied().unwrap_or_default().memberships;
+            if let Some(shape) = resolve_shape(entity, sphere, aabb, obb, transform) {
+                out.colliders.push(ColliderEntry {
+                    entity,
+                    center: transform.translation,
+                    shape,
+                    memberships,
+                    trigger,
+                });
+            }
+        }
+
+        let mut terrain =
+            world.query::<(Entity, &TerrainSurface, &Transform, Option<&CollisionLayers>)>();
+        for (entity, surface, transform, layers) in terrain.iter(world) {
+            out.terrain.push(TerrainEntry {
+                entity,
+                surface: *surface,
+                origin: transform.translation,
+                memberships: layers.copied().unwrap_or_default().memberships,
+            });
+        }
+
+        out.finish();
+        out
+    }
+
+    /// Add a collider by hand. For tests and for gameplay-owned geometry that
+    /// never became an entity.
+    pub fn push_collider(&mut self, entry: ColliderEntry) -> &mut CollisionWorld {
+        self.colliders.push(entry);
+        self.finish();
+        self
+    }
+
+    pub fn push_terrain(&mut self, entry: TerrainEntry) -> &mut CollisionWorld {
+        self.terrain.push(entry);
+        self.finish();
+        self
+    }
+
+    /// DESIGN §3: sort by `Entity` where ordering matters — and here it does,
+    /// because a body wedged between two colliders resolves differently
+    /// depending on which one it leaves first.
+    fn finish(&mut self) {
+        self.colliders.sort_unstable_by_key(|c| c.entity);
+        self.terrain.sort_unstable_by_key(|t| t.entity);
+    }
+
+    pub fn colliders(&self) -> &[ColliderEntry] {
+        &self.colliders
+    }
+
+    pub fn terrain(&self) -> &[TerrainEntry] {
+        &self.terrain
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.colliders.is_empty() && self.terrain.is_empty()
+    }
+
+    /// Visit every collider a `mask` can see, in `Entity` order. The one place
+    /// the linear scan lives — a broadphase replaces this method and nothing
+    /// else.
+    fn for_each(&self, mask: u16, mut f: impl FnMut(&ColliderEntry)) {
+        for entry in &self.colliders {
+            if mask_accepts(mask, entry.memberships) {
+                f(entry);
+            }
+        }
+    }
+
+    fn for_each_terrain(&self, mask: u16, mut f: impl FnMut(&TerrainEntry)) {
+        for entry in &self.terrain {
+            if mask_accepts(mask, entry.memberships) {
+                f(entry);
+            }
+        }
+    }
+}
+
+fn resolve_shape(
+    entity: Entity,
+    sphere: Option<&SphereCollider>,
+    aabb: Option<&AabbCollider>,
+    obb: Option<&ObbCollider>,
+    transform: &Transform,
+) -> Option<ColliderShape> {
+    // An entity carrying two shapes is an authoring mistake. Same rule
+    // `resolve_overlaps` applies, extended by one arm: sphere, then OBB (the
+    // more specific box), then AABB.
+    debug_assert!(
+        [sphere.is_some(), aabb.is_some(), obb.is_some()]
+            .iter()
+            .filter(|present| **present)
+            .count()
+            <= 1,
+        "entity {entity} carries more than one collider shape"
+    );
+    if let Some(s) = sphere {
+        return Some(ColliderShape::Sphere { radius: s.radius });
+    }
+    if let Some(o) = obb {
+        return Some(ColliderShape::Obb {
+            half_extents: o.half_extents.abs(),
+            rotation: o.rotation,
+        });
+    }
+    if let Some(a) = aabb {
+        debug_assert!(
+            transform.rotation == Quat::IDENTITY,
+            "AABB collider entities must be translation-only; \
+             a rotated box wants an ObbCollider"
+        );
+        return Some(ColliderShape::Aabb {
+            half_extents: a.half_extents.abs(),
+        });
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Contact math
+// ---------------------------------------------------------------------------
+
+/// Exact signed distance from `p` to an origin-centered box of `half` extents.
+/// Negative inside. Convex — which is what makes the ternary search below valid.
+#[inline]
+fn box_sdf(p: Vec3, half: Vec3) -> f32 {
+    let q = p.abs() - half;
+    q.max(Vec3::ZERO).length() + q.max_element().min(0.0)
+}
+
+/// [`box_sdf`] plus the surface data a contact needs: the outward unit normal at
+/// `p` and the nearest point on the box.
+fn box_surface(p: Vec3, half: Vec3) -> (f32, Vec3, Vec3) {
+    let q = p.abs() - half;
+    if q.max_element() > 0.0 {
+        // Outside: the nearest point is the clamp, and the normal points at `p`.
+        let closest = p.clamp(-half, half);
+        let delta = p - closest;
+        let dist = delta.length();
+        let normal = delta.try_normalize().unwrap_or(Vec3::Y);
+        (dist, normal, closest)
+    } else {
+        // Inside (or exactly on the surface): leave by the nearest face, i.e.
+        // the axis of least penetration. Ties take the lowest axis index, which
+        // is arbitrary but fixed — determinism, not physics.
+        let gap = -q;
+        let axis = if gap.x <= gap.y && gap.x <= gap.z {
+            0
+        } else if gap.y <= gap.z {
+            1
+        } else {
+            2
+        };
+        let sign = if p[axis] < 0.0 { -1.0 } else { 1.0 };
+        let mut normal = Vec3::ZERO;
+        normal[axis] = sign;
+        let mut closest = p;
+        closest[axis] = sign * half[axis];
+        (-gap[axis], normal, closest)
+    }
+}
+
+/// The parameter `t ∈ [0,1]` along `a→b` that **minimises** the box's signed
+/// distance.
+///
+/// Outside the box that is the closest point; inside it is the *deepest* point,
+/// which is the one push-out has to clear. One search covers both because the
+/// signed distance to a convex set is a convex function, so its restriction to a
+/// segment is convex and ternary search is exact in the limit.
+///
+/// Fixed [`SEGMENT_SEARCH_ITERATIONS`] with a bracket-width early exit — both
+/// are pure functions of the inputs, so two machines that agree on `f32`
+/// arithmetic agree on the answer.
+fn deepest_on_segment(a: Vec3, b: Vec3, half: Vec3) -> f32 {
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..SEGMENT_SEARCH_ITERATIONS {
+        let third = (hi - lo) / 3.0;
+        if third <= 1e-7 {
+            break;
+        }
+        let m1 = lo + third;
+        let m2 = hi - third;
+        if box_sdf(a.lerp(b, m1), half) <= box_sdf(a.lerp(b, m2), half) {
+            hi = m2;
+        } else {
+            lo = m1;
+        }
+    }
+    (lo + hi) * 0.5
+}
+
+/// Contact between a vertical swept sphere (`seg_lo`..`seg_hi`, `radius`) and a
+/// box.
+///
+/// `rotation` is the box's orientation; [`Quat::IDENTITY`] takes the closed-form
+/// path. Returns `None` when the separation exceeds [`CONTACT_MARGIN`].
+fn segment_box_contact(
+    seg_lo: Vec3,
+    seg_hi: Vec3,
+    radius: f32,
+    center: Vec3,
+    rotation: Quat,
+    half: Vec3,
+) -> Option<(Vec3, f32, Vec3)> {
+    let axis_aligned = rotation == Quat::IDENTITY;
+    let (a, b) = if axis_aligned {
+        (seg_lo - center, seg_hi - center)
+    } else {
+        let inv = rotation.inverse();
+        (inv * (seg_lo - center), inv * (seg_hi - center))
+    };
+
+    let local = if axis_aligned {
+        // The segment is vertical and the box is axis-aligned, so the signed
+        // distance depends on `y` only through `|y| - half.y` — and it is
+        // non-decreasing in that. Minimising it is therefore just clamping the
+        // box's own centre height into the segment. Exact, no search.
+        let y = 0.0f32.clamp(a.y.min(b.y), a.y.max(b.y));
+        Vec3::new(a.x, y, a.z)
+    } else {
+        a.lerp(b, deepest_on_segment(a, b, half))
+    };
+
+    let (sdf, normal_local, closest_local) = box_surface(local, half);
+    let depth = radius - sdf;
+    if depth <= -CONTACT_MARGIN {
+        return None;
+    }
+    let (normal, point) = if axis_aligned {
+        (normal_local, closest_local + center)
+    } else {
+        (rotation * normal_local, rotation * closest_local + center)
+    };
+    Some((normal, depth, point))
+}
+
+/// Contact between a vertical swept sphere and a sphere.
+fn segment_sphere_contact(
+    seg_lo: Vec3,
+    seg_hi: Vec3,
+    radius: f32,
+    center: Vec3,
+    other_radius: f32,
+) -> Option<(Vec3, f32, Vec3)> {
+    // Closest point on a segment to a point: the usual projection, and the
+    // segment is vertical so the clamp is on `y` alone.
+    let closest = Vec3::new(
+        seg_lo.x,
+        center.y.clamp(seg_lo.y.min(seg_hi.y), seg_lo.y.max(seg_hi.y)),
+        seg_lo.z,
+    );
+    let reach = radius + other_radius;
+    let delta = closest - center;
+    let dist = delta.length();
+    let depth = reach - dist;
+    if depth <= -CONTACT_MARGIN {
+        return None;
+    }
+    // Concentric: no direction is more right than another, so pick the one that
+    // will not push a body into the floor. Same rule `physics::overlap` uses.
+    let normal = delta.try_normalize().unwrap_or(Vec3::Y);
+    Some((normal, depth, center + normal * other_radius))
+}
+
+/// Contact between a vertical swept sphere and an analytic height field.
+///
+/// One field evaluation, at the segment's `(x, z)` — a vertical capsule has only
+/// one — giving height *and* gradient, exactly as
+/// [`integrate_balls`](crate::physics::integrate_balls) does. The contact is
+/// against the **tangent plane** there rather than the vertical column, so a
+/// slope holds the body at the right distance instead of over-lifting it by
+/// `1/cos θ`; the same plane is what turns a steep field region into a wall,
+/// since its normal is then nearly horizontal and classification follows.
+///
+/// A plane's signed distance is linear along a segment, so the deepest end is
+/// simply whichever endpoint has the smaller dot product — no search.
+///
+/// Limitation, stated rather than hidden: the sample is taken under the body's
+/// axis, so on a strongly curved field the contact point is approximate (the
+/// solve re-samples each iteration, which converges). A height field has no
+/// overhangs, so the head cap can never be the only thing touching.
+fn segment_field_contact(
+    entry: &TerrainEntry,
+    seg_lo: Vec3,
+    seg_hi: Vec3,
+    radius: f32,
+) -> Option<(Vec3, f32, Vec3)> {
+    let (x, z) = (seg_lo.x, seg_lo.z);
+    if !entry.surface.contains_world(entry.origin, x, z) {
+        return None;
+    }
+    let (height, grad) = entry.surface.sample_world(entry.origin, x, z);
+    let normal = runt_mesh::terrain::normal_from_gradient(grad);
+    let on_surface = Vec3::new(x, height, z);
+
+    let d_lo = (seg_lo - on_surface).dot(normal);
+    let d_hi = (seg_hi - on_surface).dot(normal);
+    let (dist, deepest) = if d_lo <= d_hi {
+        (d_lo, seg_lo)
+    } else {
+        (d_hi, seg_hi)
+    };
+    let depth = radius - dist;
+    if depth <= -CONTACT_MARGIN {
+        return None;
+    }
+    Some((normal, depth, deepest - normal * radius))
+}
+
+/// Every contact a body at `position` has, in `Entity` order.
+///
+/// `solid_only` drops [`Trigger`] colliders — what the solver wants; the overlap
+/// queries keep them and flag them instead.
+fn collect_contacts(
+    world: &CollisionWorld,
+    shape: CharacterShape,
+    up: Vec3,
+    position: Vec3,
+    mask: u16,
+    solid_only: bool,
+    out: &mut Vec<RawContact>,
+) {
+    out.clear();
+    let (lo, hi) = shape.segment(position, up);
+    let radius = shape.radius();
+
+    world.for_each(mask, |entry| {
+        if solid_only && entry.trigger {
+            return;
+        }
+        let hit = match entry.shape {
+            ColliderShape::Sphere { radius: r } => {
+                segment_sphere_contact(lo, hi, radius, entry.center, r)
+            }
+            ColliderShape::Aabb { half_extents } => segment_box_contact(
+                lo,
+                hi,
+                radius,
+                entry.center,
+                Quat::IDENTITY,
+                half_extents,
+            ),
+            ColliderShape::Obb {
+                half_extents,
+                rotation,
+            } => segment_box_contact(lo, hi, radius, entry.center, rotation, half_extents),
+        };
+        if let Some((normal, depth, point)) = hit {
+            out.push(RawContact {
+                entity: entry.entity,
+                normal,
+                point,
+                depth,
+            });
+        }
+    });
+
+    world.for_each_terrain(mask, |entry| {
+        if let Some((normal, depth, point)) = segment_field_contact(entry, lo, hi, radius) {
+            out.push(RawContact {
+                entity: entry.entity,
+                normal,
+                point,
+                depth,
+            });
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The solver
+// ---------------------------------------------------------------------------
+
+/// Move a kinematic body by `velocity · dt`, sliding along whatever it hits.
+///
+/// The Godot `move_and_slide` analog, and the one entry point a state machine
+/// needs per tick.
+///
+/// ## Order of operations
+///
+/// ```text
+/// sub-steps  n = clamp(ceil(|v·dt| / (radius · SUBSTEP_RADIUS_FRACTION)), 1, MAX_SUBSTEPS)
+/// per sub-step:
+///   translate      p += v · (dt/n)
+///   for ≤ SLIDE_ITERATIONS:
+///     collect      every contact at p, layer-filtered, Entity-sorted
+///     record       merge into the result set (deepest per entity)
+///     project      for each contact in Entity order: v -= n·min(v·n, 0)
+///     push out     p += n_deepest · depth_deepest      (deepest wins, ties → lowest Entity)
+///     stop         when nothing is penetrating by more than PUSH_EPSILON
+/// floor snap  (once, after the sub-steps)
+/// classify    floor / wall / ceiling against max_floor_angle
+/// ```
+///
+/// Push-out resolves **one** contact per iteration and then re-collects, rather
+/// than resolving all of them at once: leaving a wall changes what the floor
+/// contact is, and a simultaneous solve would double-count the corner. Velocity
+/// is projected against *every* contact in the iteration, though — a body in a
+/// corner cannot move into either wall, and projecting only the deepest would
+/// let it creep into the other.
+///
+/// ## Floor snap
+///
+/// When `snap_length > 0`, the body **was** on the floor at the end of the
+/// previous call, it is not on the floor now, and it is not moving up: probe
+/// down. Godot's rule, and it is what keeps a runner glued to a descending ramp
+/// instead of launching off every crest.
+///
+/// The probe is analytic rather than a search. Drop the body by `snap_length`,
+/// take the deepest floor-classified contact there, and undo exactly the part of
+/// the drop that penetration accounts for: moving back up by `δ` along `up`
+/// reduces penetration by `δ · (n·up)`, so the body lands at
+/// `snap_length - depth/(n·up)`. Exact for a planar surface, and the ordinary
+/// push-out loop runs afterwards to settle anything curved.
+///
+/// The snap moves the body **straight down along `up`** — never along the
+/// contact normal, which on a 17° ramp would slide it 0.13 m sideways for a
+/// 0.04 m drop. Horizontal velocity is untouched (that is the whole point);
+/// the component heading *into* the floor is projected out, exactly as a real
+/// contact would have done, so a grounded body does not accumulate fall speed.
+///
+/// ## Writes to `body`
+///
+/// Only `body.on_floor`, and only at the very end — it is the memory the *next*
+/// call's snap needs. Everything else the solver reads it never writes.
+pub fn move_and_slide(
+    world: &CollisionWorld,
+    body: &mut CharacterBody,
+    position: Vec3,
+    velocity: Vec3,
+    dt: f32,
+) -> MoveResult {
+    let up = body.up.try_normalize().unwrap_or(Vec3::Y);
+    let radius = body.shape.radius();
+    if !dt.is_finite() || dt <= 0.0 || radius <= 0.0 {
+        let mut result = MoveResult::empty(position, velocity);
+        result.on_floor = body.on_floor;
+        return result;
+    }
+
+    let was_on_floor = body.on_floor;
+    let mask = body.layers.mask;
+    let cos_max = body.max_floor_angle.cos();
+
+    // -- sub-stepping ------------------------------------------------------
+    //
+    // Derived from the *entry* velocity alone: what the body then collides with
+    // must not be able to change how many steps the tick took.
+    let step_cap = radius * SUBSTEP_RADIUS_FRACTION;
+    let distance = velocity.length() * dt;
+    let sub_steps = if step_cap > 0.0 && distance > step_cap {
+        ((distance / step_cap).ceil() as u32).clamp(1, MAX_SUBSTEPS)
+    } else {
+        1
+    };
+    let sub_dt = dt / sub_steps as f32;
+
+    let mut p = position;
+    let mut v = velocity;
+    let mut found: Vec<RawContact> = Vec::new();
+    let mut merged: Vec<RawContact> = Vec::new();
+
+    for _ in 0..sub_steps {
+        p += v * sub_dt;
+        for _ in 0..SLIDE_ITERATIONS {
+            collect_contacts(world, body.shape, up, p, mask, true, &mut found);
+            if found.is_empty() {
+                break;
+            }
+            merge_contacts(&mut merged, &found);
+
+            // Velocity first, against every contact, in Entity order.
+            for contact in &found {
+                let into = v.dot(contact.normal);
+                if into < 0.0 {
+                    v -= contact.normal * into;
+                }
+            }
+
+            let Some(deepest) = deepest_contact(&found) else {
+                break;
+            };
+            if deepest.depth <= PUSH_EPSILON {
+                break;
+            }
+            p += deepest.normal * deepest.depth;
+        }
+    }
+
+    let mut snapped = false;
+    if body.snap_length > 0.0
+        && was_on_floor
+        && v.dot(up) <= 0.0
+        && !merged
+            .iter()
+            .any(|c| classify(c.normal, up, cos_max) == ContactKind::Floor)
+    {
+        if let Some((snap_p, snap_v)) = snap_to_floor(world, body, up, cos_max, p, v, &mut found) {
+            p = snap_p;
+            v = snap_v;
+            snapped = true;
+            collect_contacts(world, body.shape, up, p, mask, true, &mut found);
+            merge_contacts(&mut merged, &found);
+        }
+    }
+
+    // -- classify ----------------------------------------------------------
+    merged.sort_unstable_by_key(|c| c.entity);
+    let mut contacts: Vec<Contact> = Vec::with_capacity(merged.len());
+    let mut result = MoveResult::empty(p, v);
+    result.sub_steps = sub_steps;
+    result.snapped = snapped;
+
+    let mut best_floor_dot = f32::NEG_INFINITY;
+    let mut deepest_wall = f32::NEG_INFINITY;
+    let mut deepest_ceiling = f32::NEG_INFINITY;
+    for raw in &merged {
+        let kind = classify(raw.normal, up, cos_max);
+        match kind {
+            ContactKind::Floor => {
+                // The most upright floor contact wins — a ledge's rounded corner
+                // must not out-vote the ground the body is standing on. Ties go
+                // to the lowest Entity because `merged` is sorted and the
+                // comparison is strict.
+                let dot = raw.normal.dot(up);
+                if dot > best_floor_dot {
+                    best_floor_dot = dot;
+                    result.on_floor = true;
+                    result.floor_normal = raw.normal;
+                    result.floor_angle = dot.clamp(-1.0, 1.0).acos();
+                }
+            }
+            ContactKind::Wall => {
+                if raw.depth > deepest_wall {
+                    deepest_wall = raw.depth;
+                    result.on_wall = true;
+                    result.wall_normal = raw.normal;
+                }
+            }
+            ContactKind::Ceiling => {
+                if raw.depth > deepest_ceiling {
+                    deepest_ceiling = raw.depth;
+                    result.on_ceiling = true;
+                    result.ceiling_normal = raw.normal;
+                }
+            }
+        }
+        contacts.push(Contact {
+            entity: raw.entity,
+            normal: raw.normal,
+            point: raw.point,
+            depth: raw.depth,
+            kind,
+        });
+    }
+    result.contacts = contacts;
+
+    body.on_floor = result.on_floor;
+    result
+}
+
+/// Godot's classification, restated: within `max_floor_angle` of up is floor,
+/// within `max_floor_angle` of down is ceiling, everything between is wall.
+///
+/// At `max_floor_angle == PI` the first test is `dot >= -1`, which every unit
+/// normal satisfies — so *everything* is floor, which is exactly what a rolling
+/// body wants and what PORT_SPEC asks for.
+#[inline]
+fn classify(normal: Vec3, up: Vec3, cos_max: f32) -> ContactKind {
+    let dot = normal.dot(up).clamp(-1.0, 1.0);
+    if dot >= cos_max {
+        ContactKind::Floor
+    } else if dot <= -cos_max {
+        ContactKind::Ceiling
+    } else {
+        ContactKind::Wall
+    }
+}
+
+/// Deepest contact; an exact tie goes to the lowest `Entity`, which `found` is
+/// already ordered by.
+fn deepest_contact(found: &[RawContact]) -> Option<RawContact> {
+    let mut best: Option<RawContact> = None;
+    for c in found {
+        if best.is_none_or(|b| c.depth > b.depth) {
+            best = Some(*c);
+        }
+    }
+    best
+}
+
+/// Fold this iteration's contacts into the accumulated set, keeping the deepest
+/// per entity. Linear search: the set is a handful of entries and a map would be
+/// a hash container in the middle of a deterministic solve.
+fn merge_contacts(merged: &mut Vec<RawContact>, found: &[RawContact]) {
+    for c in found {
+        match merged.iter_mut().find(|m| m.entity == c.entity) {
+            Some(existing) if c.depth > existing.depth => *existing = *c,
+            Some(_) => {}
+            None => merged.push(*c),
+        }
+    }
+}
+
+/// The floor-snap probe. See [`move_and_slide`] for the argument.
+fn snap_to_floor(
+    world: &CollisionWorld,
+    body: &CharacterBody,
+    up: Vec3,
+    cos_max: f32,
+    position: Vec3,
+    velocity: Vec3,
+    scratch: &mut Vec<RawContact>,
+) -> Option<(Vec3, Vec3)> {
+    let probe = position - up * body.snap_length;
+    collect_contacts(
+        world,
+        body.shape,
+        up,
+        probe,
+        body.layers.mask,
+        true,
+        scratch,
+    );
+
+    let mut best: Option<RawContact> = None;
+    for c in scratch.iter() {
+        if classify(c.normal, up, cos_max) != ContactKind::Floor {
+            continue;
+        }
+        // A floor whose normal is perpendicular to `up` (only reachable at
+        // max_floor_angle = 180°) gives no purchase to lift back along `up`.
+        if c.normal.dot(up) <= 1e-3 {
+            continue;
+        }
+        if best.is_none_or(|b| c.depth > b.depth) {
+            best = Some(*c);
+        }
+    }
+    let best = best?;
+
+    let lift = (best.depth / best.normal.dot(up)).clamp(0.0, body.snap_length);
+    let mut p = probe + up * lift;
+    let mut v = velocity;
+
+    // Settle: a planar surface is already exact, a curved field is not.
+    for _ in 0..SLIDE_ITERATIONS {
+        collect_contacts(
+            world,
+            body.shape,
+            up,
+            p,
+            body.layers.mask,
+            true,
+            scratch,
+        );
+        let Some(deepest) = deepest_contact(scratch) else {
+            break;
+        };
+        if deepest.depth <= PUSH_EPSILON {
+            break;
+        }
+        p += deepest.normal * deepest.depth;
+    }
+
+    // The snap must never lift the body above where the ordinary solve left it —
+    // that would be a step *up*, which is a different feature.
+    if (p - position).dot(up) > CONTACT_MARGIN {
+        return None;
+    }
+    // Horizontal velocity survives untouched; only the part driving into the
+    // floor is removed, as the contact would have done had the body reached it.
+    let into = v.dot(best.normal);
+    if into < 0.0 {
+        v -= best.normal * into;
+    }
+    Some((p, v))
+}
+
+// ---------------------------------------------------------------------------
+// Queries
+// ---------------------------------------------------------------------------
+
+/// One overlapping collider.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OverlapHit {
+    pub entity: Entity,
+    /// Penetration depth along `normal`, `> 0`.
+    pub depth: f32,
+    /// Unit normal pointing out of the collider, towards the query shape.
+    pub normal: Vec3,
+    /// The point on the collider's surface.
+    pub point: Vec3,
+    /// The collider carries [`Trigger`]. Queries report triggers rather than
+    /// hiding them — the phase entry guard wants solids only and says so; a
+    /// pickup sweep wants the opposite.
+    pub trigger: bool,
+}
+
+/// One ray hit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RayHit {
+    pub entity: Entity,
+    pub point: Vec3,
+    /// Unit surface normal at `point`, pointing back along the ray's approach.
+    pub normal: Vec3,
+    /// Distance from the ray origin, in world units.
+    pub dist: f32,
+    pub trigger: bool,
+}
+
+impl CollisionWorld {
+    /// Every collider a sphere overlaps, in `Entity` order.
+    ///
+    /// PORT_SPEC's phase entry guard and unphase snap-back are both this call
+    /// with a different mask.
+    pub fn overlap_sphere(&self, center: Vec3, radius: f32, mask: u16) -> Vec<OverlapHit> {
+        self.overlap_segment(center, center, radius, mask)
+    }
+
+    /// Every collider a vertical capsule overlaps, in `Entity` order. `height`
+    /// is total height including caps, as in [`CharacterShape::Capsule`].
+    pub fn overlap_capsule(
+        &self,
+        center: Vec3,
+        radius: f32,
+        height: f32,
+        mask: u16,
+    ) -> Vec<OverlapHit> {
+        let half = (height * 0.5 - radius).max(0.0);
+        self.overlap_segment(
+            center - Vec3::Y * half,
+            center + Vec3::Y * half,
+            radius,
+            mask,
+        )
+    }
+
+    /// Every collider the shape a [`CharacterBody`] would occupy at `position`
+    /// overlaps — the capsule↔sphere swap without restating the shape.
+    pub fn overlap_body(&self, body: &CharacterBody, position: Vec3) -> Vec<OverlapHit> {
+        let (lo, hi) = body.segment(position);
+        self.overlap_segment(lo, hi, body.shape.radius(), body.layers.mask)
+    }
+
+    fn overlap_segment(&self, lo: Vec3, hi: Vec3, radius: f32, mask: u16) -> Vec<OverlapHit> {
+        let mut hits = Vec::new();
+        let push = |entity: Entity,
+                        trigger: bool,
+                        hit: Option<(Vec3, f32, Vec3)>,
+                        hits: &mut Vec<OverlapHit>| {
+            // Overlap means *overlap*: unlike the solver, a query does not want
+            // the touching-tolerance band reported as a hit.
+            if let Some((normal, depth, point)) = hit {
+                if depth > 0.0 {
+                    hits.push(OverlapHit {
+                        entity,
+                        depth,
+                        normal,
+                        point,
+                        trigger,
+                    });
+                }
+            }
+        };
+
+        self.for_each(mask, |entry| {
+            let hit = match entry.shape {
+                ColliderShape::Sphere { radius: r } => {
+                    segment_sphere_contact(lo, hi, radius, entry.center, r)
+                }
+                ColliderShape::Aabb { half_extents } => segment_box_contact(
+                    lo,
+                    hi,
+                    radius,
+                    entry.center,
+                    Quat::IDENTITY,
+                    half_extents,
+                ),
+                ColliderShape::Obb {
+                    half_extents,
+                    rotation,
+                } => segment_box_contact(lo, hi, radius, entry.center, rotation, half_extents),
+            };
+            push(entry.entity, entry.trigger, hit, &mut hits);
+        });
+        self.for_each_terrain(mask, |entry| {
+            let hit = segment_field_contact(entry, lo, hi, radius);
+            push(entry.entity, false, hit, &mut hits);
+        });
+        hits
+    }
+
+    /// The nearest thing a ray hits, or `None`.
+    ///
+    /// `dir` need not be normalized; `dist` is in world units either way. Boxes
+    /// use an exact slab test in the box's own frame, spheres the usual
+    /// quadratic, and the analytic height field a fixed-step march refined by
+    /// bisection — see [`RAY_MARCH_STEP`]. The field is sampled, never its mesh,
+    /// so the same ray returns the same hit at every quality tier.
+    ///
+    /// PORT_SPEC's ledge vault (a head ray that must miss and a chest ray that
+    /// must hit) and the air pulse's wall find are both this call.
+    pub fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32, mask: u16) -> Option<RayHit> {
+        let dir = dir.try_normalize()?;
+        // `is_finite` as well as positive: a NaN length is a caller bug, and a
+        // ray of NaN length must miss rather than march.
+        if !max_dist.is_finite() || max_dist <= 0.0 {
+            return None;
+        }
+        let mut best: Option<RayHit> = None;
+        let consider = |hit: RayHit, best: &mut Option<RayHit>| {
+            // Strict `<`: an exact tie keeps the earlier entity, and the scan is
+            // in Entity order.
+            if best.is_none_or(|b| hit.dist < b.dist) {
+                *best = Some(hit);
+            }
+        };
+
+        self.for_each(mask, |entry| {
+            let found = match entry.shape {
+                ColliderShape::Sphere { radius } => {
+                    ray_sphere(origin, dir, max_dist, entry.center, radius)
+                }
+                ColliderShape::Aabb { half_extents } => {
+                    ray_box(origin, dir, max_dist, entry.center, Quat::IDENTITY, half_extents)
+                }
+                ColliderShape::Obb {
+                    half_extents,
+                    rotation,
+                } => ray_box(origin, dir, max_dist, entry.center, rotation, half_extents),
+            };
+            if let Some((dist, normal)) = found {
+                consider(
+                    RayHit {
+                        entity: entry.entity,
+                        point: origin + dir * dist,
+                        normal,
+                        dist,
+                        trigger: entry.trigger,
+                    },
+                    &mut best,
+                );
+            }
+        });
+        self.for_each_terrain(mask, |entry| {
+            if let Some((dist, normal)) = ray_field(entry, origin, dir, max_dist) {
+                consider(
+                    RayHit {
+                        entity: entry.entity,
+                        point: origin + dir * dist,
+                        normal,
+                        dist,
+                        trigger: false,
+                    },
+                    &mut best,
+                );
+            }
+        });
+        best
+    }
+}
+
+/// Slab test in the box's own frame. Exact.
+fn ray_box(
+    origin: Vec3,
+    dir: Vec3,
+    max_dist: f32,
+    center: Vec3,
+    rotation: Quat,
+    half: Vec3,
+) -> Option<(f32, Vec3)> {
+    let identity = rotation == Quat::IDENTITY;
+    let inv = rotation.inverse();
+    let o = if identity {
+        origin - center
+    } else {
+        inv * (origin - center)
+    };
+    let d = if identity { dir } else { inv * dir };
+
+    let mut t_enter = 0.0f32;
+    let mut t_exit = max_dist;
+    let mut axis = usize::MAX;
+    let mut sign = 1.0f32;
+
+    for i in 0..3 {
+        if d[i].abs() < 1e-8 {
+            // Parallel to this slab: either always inside it or never.
+            if o[i] < -half[i] || o[i] > half[i] {
+                return None;
+            }
+            continue;
+        }
+        let inv_d = 1.0 / d[i];
+        let t_lo = (-half[i] - o[i]) * inv_d;
+        let t_hi = (half[i] - o[i]) * inv_d;
+        let (near, far, near_sign) = if t_lo <= t_hi {
+            (t_lo, t_hi, -1.0)
+        } else {
+            (t_hi, t_lo, 1.0)
+        };
+        if near > t_enter {
+            t_enter = near;
+            axis = i;
+            sign = near_sign;
+        }
+        if far < t_exit {
+            t_exit = far;
+        }
+        if t_enter > t_exit {
+            return None;
+        }
+    }
+
+    // Origin inside the box: report the start of the ray. There is no entry
+    // face to take a normal from, so hand back the one that faces the ray.
+    if axis == usize::MAX {
+        return Some((0.0, -dir));
+    }
+    let mut normal_local = Vec3::ZERO;
+    normal_local[axis] = sign;
+    let normal = if identity {
+        normal_local
+    } else {
+        rotation * normal_local
+    };
+    Some((t_enter, normal))
+}
+
+fn ray_sphere(
+    origin: Vec3,
+    dir: Vec3,
+    max_dist: f32,
+    center: Vec3,
+    radius: f32,
+) -> Option<(f32, Vec3)> {
+    let m = origin - center;
+    let b = m.dot(dir);
+    let c = m.length_squared() - radius * radius;
+    if c <= 0.0 {
+        // Started inside.
+        return Some((0.0, -dir));
+    }
+    if b > 0.0 {
+        return None; // Pointing away.
+    }
+    let disc = b * b - c;
+    if disc < 0.0 {
+        return None;
+    }
+    let t = -b - disc.sqrt();
+    if t < 0.0 || t > max_dist {
+        return None;
+    }
+    let point = origin + dir * t;
+    Some((t, (point - center).try_normalize().unwrap_or(-dir)))
+}
+
+/// Fixed-step march over the analytic field, then bisection on the bracketed
+/// crossing.
+///
+/// `f(t) = ray(t).y − h(ray(t).xz)` is positive above the surface and negative
+/// below it. The march walks `t` in [`RAY_MARCH_STEP`] increments looking for
+/// the first sign change with both ends inside the patch, then
+/// [`RAY_BISECTIONS`] halvings pin it down. Both counts are constants, so the
+/// answer is a pure function of the ray and the field — and the field is what
+/// the mesh is generated *from*, so tessellation cannot move the hit.
+///
+/// A ray that starts below the surface reports a hit at `t = 0` rather than
+/// silently missing.
+fn ray_field(entry: &TerrainEntry, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<(f32, Vec3)> {
+    let above = |t: f32| -> Option<f32> {
+        let p = origin + dir * t;
+        if !entry.surface.contains_world(entry.origin, p.x, p.z) {
+            return None;
+        }
+        Some(p.y - entry.surface.height_world(entry.origin, p.x, p.z))
+    };
+    let normal_at = |t: f32| -> Vec3 {
+        let p = origin + dir * t;
+        entry.surface.normal_world(entry.origin, p.x, p.z)
+    };
+
+    let mut prev_t = 0.0f32;
+    let mut prev = above(0.0);
+    if prev.is_some_and(|f| f <= 0.0) {
+        return Some((0.0, normal_at(0.0)));
+    }
+
+    let steps = ((max_dist / RAY_MARCH_STEP).ceil() as u32).clamp(1, RAY_MAX_STEPS);
+    for i in 1..=steps {
+        let t = (i as f32 * RAY_MARCH_STEP).min(max_dist);
+        let cur = above(t);
+        if let (Some(pf), Some(cf)) = (prev, cur) {
+            if pf > 0.0 && cf <= 0.0 {
+                let (mut lo, mut hi) = (prev_t, t);
+                for _ in 0..RAY_BISECTIONS {
+                    let mid = (lo + hi) * 0.5;
+                    match above(mid) {
+                        Some(f) if f > 0.0 => lo = mid,
+                        Some(_) => hi = mid,
+                        // Left the patch mid-bracket: keep the bracket we have.
+                        None => break,
+                    }
+                }
+                return Some((hi, normal_at(hi)));
+            }
+        }
+        prev_t = t;
+        prev = cur;
+        if t >= max_dist {
+            break;
+        }
+    }
+    None
+}
