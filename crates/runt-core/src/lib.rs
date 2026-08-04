@@ -15,6 +15,8 @@ use runt_mesh::MeshData;
 
 /// The sim-side audio seam (DESIGN §8). No synthesizer: see the module docs.
 pub mod audio;
+/// Baking a [`texture::TextureSpec`] to GPU textures (DESIGN §7).
+pub mod bake;
 pub mod cache;
 pub mod camera;
 /// Collision v2 (DESIGN §9): capsule character solver, OBBs, layers, queries.
@@ -26,6 +28,8 @@ pub mod engine;
 pub mod gen;
 pub mod input;
 pub mod material;
+/// The procedural-noise library, CPU side (DESIGN §7).
+pub mod noise;
 pub mod physics;
 /// Editor-facing reflection (DESIGN §3, §10). Off by default; the wasm player
 /// must never pull `bevy_reflect` in.
@@ -35,6 +39,8 @@ pub mod registry;
 pub mod scene;
 pub mod sim;
 pub mod sky;
+/// Procedural texture specs and their CPU evaluator (DESIGN §7).
+pub mod texture;
 pub mod trace;
 
 /// The background pass's WGSL. Standalone (no feature consts), unlike
@@ -45,6 +51,7 @@ pub use audio::{
     AudioBackend, AudioEvent, AudioOut, Listener, ParamId, PatchId, RecordingBackend, Rolloff,
     SilentBackend, VoiceId,
 };
+pub use bake::{BakeUniform, GpuTexture, TextureBaker, TextureData, TextureRegistry};
 pub use cache::{CacheStats, CacheStore, GenCache, NoopCache};
 pub use camera::{Camera, FollowCamera};
 pub use collide::{
@@ -66,8 +73,14 @@ pub use physics::{
 };
 pub use registry::{GpuMesh, MeshHandle, MeshLibrary, MeshRegistry};
 pub use runt_mesh::{HeightField, MeshData as Mesh, Quality, TerrainParams, TerrainTint};
-pub use scene::{load_scene, save_scene, SceneDesc, SceneError};
+pub use scene::{
+    load_scene, save_scene, SceneDesc, SceneError, TextureEntry, TEXTURED_SCENE_RON,
+};
 pub use sim::{Sim, SimConfig, MAX_ACCUMULATED, TICK_DT};
+pub use texture::{
+    NoiseSpec, NormalMode, NormalSpec, TextureHandle, TextureLibrary, TextureSpec,
+};
+pub use noise::{CellReturn, Fractal, Lattice};
 pub use trace::{InputTrace, TickEvent};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -226,6 +239,12 @@ pub struct Renderer {
     instance_scratch: Vec<u8>,
 
     meshes: MeshRegistry,
+
+    /// The baked-texture half of §7: the bake pass's pipelines, and handle → GPU
+    /// textures. Content-addressed exactly like `meshes`.
+    baker: bake::TextureBaker,
+    textures: bake::TextureRegistry,
+
     depth: Option<(u32, u32, wgpu::TextureView)>,
 }
 
@@ -271,9 +290,18 @@ impl Renderer {
                 count: None,
             }],
         });
+        // Three groups: frame, instance, texture. `max_bind_groups` is 4 under
+        // `downlevel_webgl2_defaults`, so this is still the baseline path
+        // (DESIGN §11). Group 2 is unconditional — see `TextureRegistry`'s
+        // default bind group for why one layout beats two.
+        let textures = bake::TextureRegistry::new(&device, &queue);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline_layout"),
-            bind_group_layouts: &[Some(&frame_layout), Some(&instance_layout)],
+            bind_group_layouts: &[
+                Some(&frame_layout),
+                Some(&instance_layout),
+                Some(textures.layout()),
+            ],
             immediate_size: 0,
         });
 
@@ -304,6 +332,7 @@ impl Renderer {
         );
 
         let sky_pipeline = create_sky_pipeline(&device, &frame_layout, target_format);
+        let baker = bake::TextureBaker::new(&device);
 
         Renderer {
             device,
@@ -321,6 +350,8 @@ impl Renderer {
             instance_capacity: INITIAL_INSTANCE_CAPACITY,
             instance_scratch: Vec::new(),
             meshes: MeshRegistry::new(),
+            baker,
+            textures,
             depth: None,
         }
     }
@@ -353,6 +384,33 @@ impl Renderer {
     /// geometry is already resident.
     pub fn register_mesh(&mut self, mesh: &MeshData) -> MeshHandle {
         self.meshes.register(&self.device, mesh)
+    }
+
+    /// The GPU texture registry — handle → baked textures (DESIGN §7).
+    pub fn textures(&self) -> &bake::TextureRegistry {
+        &self.textures
+    }
+
+    /// Bake `spec` at `resolution` if it is not already resident, consulting
+    /// (and filling) `store` on the way.
+    ///
+    /// The one entry point for §7's baked path. Idempotent, content-addressed,
+    /// and indistinguishable between a cold bake and a cache hit — which is the
+    /// invariant `tests/texture_cache.rs` exists to pin.
+    pub fn bake_texture(
+        &mut self,
+        spec: &texture::TextureSpec,
+        resolution: u32,
+        store: &dyn CacheStore,
+    ) -> texture::TextureHandle {
+        self.textures.resolve(
+            &self.device,
+            &self.queue,
+            &self.baker,
+            spec,
+            resolution,
+            store,
+        )
     }
 
     /// Number of shader variants compiled so far.
@@ -437,10 +495,17 @@ impl Renderer {
     /// Draw one frame into `view`, which must be `target_format` and
     /// `width` × `height`.
     ///
-    /// Frame anatomy: upload any newly-referenced geometry → write the frame
-    /// uniform → write one instance slot per draw → compile any missing variant
-    /// → clear → paint the sky → walk the sorted list, changing pipeline and
-    /// vertex buffers only when the sort key says they changed.
+    /// Frame anatomy: upload any newly-referenced geometry → bake any
+    /// newly-referenced texture → write the frame uniform → write one instance
+    /// slot per draw → compile any missing variant → clear → paint the sky →
+    /// walk the sorted list, changing pipeline, texture and vertex buffers only
+    /// when the sort key says they changed.
+    ///
+    /// Eight parameters is past clippy's taste, and a `RenderArgs` struct would
+    /// only move the same eight values one level out: the target and its size
+    /// come from the host, the frame block and draw list from `Extract`, and the
+    /// two libraries are the content side. They have no cohesion to package.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         view: &wgpu::TextureView,
@@ -449,11 +514,13 @@ impl Renderer {
         frame: &FrameParams,
         draws: &[DrawItem],
         library: &MeshLibrary,
+        textures: &texture::TextureLibrary,
     ) {
         let (width, height) = (width.max(1), height.max(1));
         self.ensure_depth(width, height);
 
         self.upload_missing_meshes(draws, library);
+        self.bake_missing_textures(draws, textures);
         self.write_frame_uniform(frame);
         self.write_instances(draws);
         for item in draws {
@@ -502,6 +569,9 @@ impl Renderer {
 
             let mut bound_variant: Option<MaterialVariant> = None;
             let mut bound_mesh: Option<MeshHandle> = None;
+            // `None` here means "nothing bound yet", which is distinct from
+            // `Some(None)` — the default 1×1 group being bound on purpose.
+            let mut bound_texture: Option<Option<texture::TextureHandle>> = None;
             for (slot, item) in draws.iter().enumerate() {
                 let Some(gpu) = self.meshes.get(item.mesh) else {
                     continue; // Geometry the library could not supply; warned about above.
@@ -513,6 +583,22 @@ impl Renderer {
                         .expect("variant compiled above");
                     pass.set_pipeline(pipeline);
                     bound_variant = Some(item.variant);
+                }
+                // Group 2 is in the layout for every variant, so it is bound for
+                // every draw — the sort order (texture is the second key)
+                // collapses that to one set per texture per frame.
+                let wanted = item
+                    .texture
+                    .filter(|handle| self.textures.contains(*handle));
+                if bound_texture != Some(wanted) {
+                    let group = match wanted {
+                        Some(handle) => {
+                            &self.textures.get(handle).expect("filtered above").bind_group
+                        }
+                        None => self.textures.default_bind_group(),
+                    };
+                    pass.set_bind_group(2, group, &[]);
+                    bound_texture = Some(wanted);
                 }
                 if bound_mesh != Some(item.mesh) {
                     pass.set_vertex_buffer(0, gpu.vertices.slice(..));
@@ -548,6 +634,38 @@ impl Renderer {
                     "entity {:?} references mesh {:#018x}, which is not in the library",
                     item.entity,
                     item.mesh.0
+                ),
+            }
+        }
+    }
+
+    /// Bake any texture in the draw list that is not resident yet.
+    ///
+    /// The mirror of [`upload_missing_meshes`](Renderer::upload_missing_meshes),
+    /// and lazy for the same reason: a library full of alternate textures costs
+    /// nothing until one is drawn. No persistent store here — a host that wants
+    /// the disk cache consulted calls [`Engine::bake_scene_textures`] at load,
+    /// which is where the store lives. Both paths produce identical pixels
+    /// (that is what determinism buys), so this one is a correctness fallback
+    /// rather than a second policy.
+    ///
+    /// [`Engine::bake_scene_textures`]: crate::Engine::bake_scene_textures
+    fn bake_missing_textures(&mut self, draws: &[DrawItem], library: &texture::TextureLibrary) {
+        for item in draws {
+            let Some(handle) = item.texture else { continue };
+            if self.textures.contains(handle) {
+                continue;
+            }
+            match library.get(handle) {
+                Some((spec, resolution)) => {
+                    let spec = spec.clone();
+                    let baked = self.bake_texture(&spec, resolution, &NoopCache);
+                    debug_assert_eq!(baked, handle, "content key must round-trip");
+                }
+                None => log::warn!(
+                    "entity {:?} references texture {:#018x}, which is not in the library",
+                    item.entity,
+                    handle.0
                 ),
             }
         }

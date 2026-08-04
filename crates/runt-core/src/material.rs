@@ -13,12 +13,22 @@
 use bevy_ecs::prelude::Component;
 use glam::Vec4;
 
+use crate::texture::TextureHandle;
+
 /// The un-preprocessed shader. Not valid WGSL on its own — the feature `const`s
 /// it branches on are prepended by [`variant_source`].
 pub const BASE_SHADER: &str = include_str!("shader.wgsl");
 
-/// Shader feature bits. v1 implements `VERTEX_COLOR`; the rest are reserved so
-/// that the key space (and every cache built on it) is stable as §7 lands.
+/// Shader feature bits.
+///
+/// `VERTEX_COLOR`, `TEXTURE` and `NORMAL_MAP` are implemented; `RAMP` and
+/// `LIVE_TEX` are reserved so that the key space (and every cache built on it)
+/// is stable when they land.
+///
+/// **Bit positions are permanent.** `NORMAL_MAP` is appended at bit 4 rather
+/// than slotted in beside `TEXTURE` for exactly that reason: renumbering would
+/// silently re-key every pipeline cache and every scene that spells a variant
+/// out. New looks append.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MaterialVariant(u32);
 
@@ -27,26 +37,36 @@ impl MaterialVariant {
     pub const NONE: MaterialVariant = MaterialVariant(0);
     /// Multiply albedo by the mesh's per-vertex color.
     pub const VERTEX_COLOR: MaterialVariant = MaterialVariant(1 << 0);
-    /// Reserved (§7): sample a baked procedural texture.
+    /// Sample a baked procedural texture (§7), triplanar in world space.
     pub const TEXTURE: MaterialVariant = MaterialVariant(1 << 1);
     /// Reserved (§5): toon/ramp remap of the key-light term.
     pub const RAMP: MaterialVariant = MaterialVariant(1 << 2);
     /// Reserved (§7): evaluate the procedural texture live in the fragment
     /// shader instead of sampling a bake.
     pub const LIVE_TEX: MaterialVariant = MaterialVariant(1 << 3);
+    /// Perturb the shading normal with the bake's normal map (§7).
+    ///
+    /// Separate from [`TEXTURE`](MaterialVariant::TEXTURE) rather than implied
+    /// by it: the crinkle is the expensive half (three more taps and a
+    /// re-normalize) and plenty of surfaces want the colour without it. It is
+    /// inert on its own — with no texture bound there is nothing to perturb by.
+    pub const NORMAL_MAP: MaterialVariant = MaterialVariant(1 << 4);
 
     /// Every declared flag, with the WGSL `const` it maps to. The order here is
     /// the order the preprocessor emits, so generated sources are stable.
-    pub const FLAGS: [(&'static str, MaterialVariant); 4] = [
+    pub const FLAGS: [(&'static str, MaterialVariant); 5] = [
         ("F_VERTEX_COLOR", MaterialVariant::VERTEX_COLOR),
         ("F_TEXTURE", MaterialVariant::TEXTURE),
         ("F_RAMP", MaterialVariant::RAMP),
         ("F_LIVE_TEX", MaterialVariant::LIVE_TEX),
+        ("F_NORMAL_MAP", MaterialVariant::NORMAL_MAP),
     ];
 
-    /// The flags v1 actually implements. Anything outside this is declared,
+    /// The flags that actually do something. Anything outside this is declared,
     /// hashed and cached correctly — it just does not do anything yet.
-    pub const IMPLEMENTED: MaterialVariant = MaterialVariant::VERTEX_COLOR;
+    pub const IMPLEMENTED: MaterialVariant = MaterialVariant(
+        MaterialVariant::VERTEX_COLOR.0 | MaterialVariant::TEXTURE.0 | MaterialVariant::NORMAL_MAP.0,
+    );
 
     pub const fn from_bits(bits: u32) -> MaterialVariant {
         MaterialVariant(bits)
@@ -116,6 +136,13 @@ pub struct Material {
     /// Reserved uniform slot: ramp threshold/softness/… as those variants land.
     /// Uploaded already so adding a ramp never changes the uniform layout.
     pub params: Vec4,
+    /// Which baked texture (§7) this material samples, if any.
+    ///
+    /// A content key, not a pointer — the same handle discipline `MeshRef`
+    /// uses, so two materials naming one spec share one bake. It rides on the
+    /// material rather than in `params` because it is a *binding*, resolved by
+    /// the renderer's texture registry, not a number the shader reads.
+    pub texture: Option<TextureHandle>,
     pub variant: MaterialVariant,
 }
 
@@ -131,6 +158,7 @@ impl Material {
         Material {
             base_color: Vec4::ONE,
             params: Vec4::ZERO,
+            texture: None,
             variant: MaterialVariant::VERTEX_COLOR,
         }
     }
@@ -140,6 +168,7 @@ impl Material {
         Material {
             base_color,
             params: Vec4::ZERO,
+            texture: None,
             variant: MaterialVariant::NONE,
         }
     }
@@ -149,6 +178,19 @@ impl Material {
         Material {
             base_color,
             ..Material::vertex_colored()
+        }
+    }
+
+    /// A baked procedural texture (§7), sampled triplanar and crinkled by its
+    /// normal map. `base_color` tints it; vertex colors are off, because a
+    /// generator's flat per-vertex tint fighting a procedural albedo is never
+    /// what anyone wanted.
+    pub fn textured(handle: TextureHandle) -> Material {
+        Material {
+            base_color: Vec4::ONE,
+            params: Vec4::ZERO,
+            texture: Some(handle),
+            variant: MaterialVariant::TEXTURE | MaterialVariant::NORMAL_MAP,
         }
     }
 }

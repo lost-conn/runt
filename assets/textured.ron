@@ -1,0 +1,192 @@
+// runt textured scene — the procedural texture pipeline's proof (DESIGN §7).
+//
+// A *third* list joins `generators` and `entities`: `textures`, which says what
+// to bake. It has the same shape as `generators` on purpose — name, spec,
+// quality policy — and a material refers to one by name exactly as an entity
+// refers to a generator. Two entities naming one texture share one bake, the
+// same way two entities naming one generator share one mesh.
+//
+// This is a *separate* scene from `demo.ron` deliberately: that one is pinned by
+// a frame fingerprint and a screenshot test, and adding textures to it would
+// change what those measure. Nothing here is loaded by the player by default.
+//
+// The two materials are the authored 3dimenshift terrain params, ported
+// verbatim (see `runt_core::texture::grass` / `rock`, which this file is held
+// against by `tests/textures_scene.rs`). The one number that is not from the
+// original is `world_scale`: the Godot shader evaluated noise in unbounded world
+// space and had no tile, so the tile size is ours to pick, and it is picked so
+// `frequency / world_scale` lands on a whole (even) number of lattice cells —
+// which is what makes the bake seamless. See `TextureSpec::world_scale`.
+(
+    textures: [
+        (
+            name: "grass",
+            spec: (
+                noise: Cellular(
+                    lattice: Fcc,
+                    return_type: CellValue,
+                    jitter: 1.0,
+                ),
+                frequency: 0.21,
+                octaves: 5,
+                lacunarity: 2.718,
+                gain: 0.562,
+                // 27.8 m tile, 5.83 -> 6 cells across it: a 2.9% frequency nudge,
+                // which is the whole price of seamlessness here.
+                world_scale: 0.036,
+                triplanar_sharpness: 4.0,
+                ramp: [
+                    (0.12, (0.0, 0.31, 0.17566665)),
+                    (0.45714286, (0.0, 0.44481665, 0.31058022)),
+                    (1.0, (0.0, 0.53464526, 0.37844315)),
+                ],
+                normal: Some((
+                    mode: ToPoint,
+                    edge_width: 0.52,
+                    strength: 5.106,
+                )),
+                base_resolution: 1024,
+            ),
+        ),
+        (
+            name: "rock",
+            spec: (
+                noise: Cellular(
+                    lattice: Fcc,
+                    return_type: CellValue,
+                    jitter: 1.0,
+                ),
+                frequency: 0.046,
+                octaves: 5,
+                lacunarity: 3.512,
+                gain: 0.543,
+                // 217 m tile, exactly 10 cells: no rounding at all. The Godot
+                // fallback's 0.01 would have cost 13%.
+                world_scale: 0.0046,
+                triplanar_sharpness: 1.0,
+                ramp: [
+                    (0.12, (0.23, 0.1909, 0.20719166)),
+                    (0.45714286, (0.27, 0.2187, 0.240075)),
+                    (1.0, (0.41, 0.3362, 0.36694998)),
+                ],
+                normal: Some((
+                    mode: ToEdge,
+                    edge_width: 0.351,
+                    strength: 5.921,
+                )),
+                base_resolution: 1024,
+            ),
+        ),
+    ],
+
+    generators: [
+        (
+            name: "ground",
+            spec: Terrain((
+                seed: 20260731,
+                size: (40.0, 40.0),
+                amplitude: 1.2,
+                octaves: 4,
+                frequency: 0.055,
+                lacunarity: 2.0,
+                gain: 0.5,
+                base_segments: 64,
+            )),
+        ),
+        (
+            name: "boulder",
+            spec: UvSphere(
+                radius: 1.1,
+                rings: 20,
+                sectors: 28,
+                shading: Smooth(180.0),
+            ),
+        ),
+        (
+            name: "plinth",
+            spec: Cube(size: 1.4, shading: Flat),
+        ),
+        // The control: no texture, vertex colours only. It renders through
+        // exactly the pre-texture path, which is the point of it being here.
+        (
+            name: "marker",
+            spec: Cone(
+                radius: 0.4,
+                height: 1.0,
+                segments: 16,
+                color: Some((0.95, 0.80, 0.30)),
+            ),
+        ),
+    ],
+
+    entities: [
+        // Triplanar means no UVs are consulted at all — the ground is textured
+        // by where it *is*, so the tessellation can change without the grass
+        // sliding around on it.
+        (
+            name: Some("ground"),
+            generator: "ground",
+            transform: (translation: (0.0, -2.0, 0.0)),
+            material: (
+                vertex_color: false,
+                texture: Some("grass"),
+            ),
+        ),
+        // Two boulders, one texture, one mesh: the dedup claim on both axes.
+        (
+            name: Some("boulder"),
+            generator: "boulder",
+            transform: (translation: (-2.2, -0.6, 0.4)),
+            material: (
+                vertex_color: false,
+                texture: Some("rock"),
+            ),
+        ),
+        (
+            name: Some("boulder_twin"),
+            generator: "boulder",
+            transform: (
+                translation: (2.4, -0.9, -0.6),
+                scale: (0.7, 0.7, 0.7),
+            ),
+            material: (
+                vertex_color: false,
+                texture: Some("rock"),
+            ),
+        ),
+        // Same rock, normal map off: the NORMAL_MAP bit is separable from
+        // TEXTURE, and this is what proves it costs a variant rather than a
+        // material.
+        (
+            name: Some("plinth"),
+            generator: "plinth",
+            transform: (translation: (0.0, -0.9, -2.0)),
+            material: (
+                vertex_color: false,
+                texture: Some("rock"),
+                normal_map: false,
+            ),
+        ),
+        (
+            name: Some("marker"),
+            generator: "marker",
+            transform: (translation: (0.0, -0.2, 1.6)),
+        ),
+    ],
+
+    camera: (
+        eye: (0.0, 2.2, 6.0),
+        target: (0.0, -0.6, 0.0),
+        fov_y_degrees: 60.0,
+        z_near: 0.1,
+        z_far: 100.0,
+    ),
+
+    lighting: (
+        key_dir: (0.4, 1.0, 0.6),
+        key_color: (0.74, 0.72, 0.68),
+        sky_color: (0.30, 0.33, 0.40),
+        ground_color: (0.14, 0.13, 0.12),
+        horizon: Some((0.34, 0.31, 0.30)),
+    ),
+)

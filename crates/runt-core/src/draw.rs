@@ -4,10 +4,12 @@
 //! [`DrawItem`]s plus one [`FrameParams`], which is what keeps the GPU side
 //! testable, the ECS side GPU-free, and the sort order an ordinary unit test.
 //!
-//! Sorting is by `(variant, mesh, entity)`: variant first because a pipeline
-//! swap is the expensive state change, mesh second because vertex/index buffer
-//! binds are next, entity last purely as a deterministic tie-break — two frames
-//! from the same world state must produce byte-identical command streams.
+//! Sorting is by `(variant, texture, mesh, entity)`: variant first because a
+//! pipeline swap is the expensive state change, texture second because a
+//! bind-group swap is the next one, mesh third because vertex/index buffer
+//! binds are after that, entity last purely as a deterministic tie-break — two
+//! frames from the same world state must produce byte-identical command
+//! streams.
 
 use bevy_ecs::prelude::*;
 use glam::{Mat4, Vec4};
@@ -15,6 +17,7 @@ use glam::{Mat4, Vec4};
 use crate::ecs::{Interpolated, Lighting, MeshRef, Transform};
 use crate::material::{Material, MaterialVariant};
 use crate::registry::MeshHandle;
+use crate::texture::TextureHandle;
 
 /// One indexed draw: which pipeline, which buffers, and the instance uniform to
 /// write for it.
@@ -28,6 +31,9 @@ pub struct DrawItem {
     pub model: Mat4,
     pub base_color: Vec4,
     pub params: Vec4,
+    /// The baked texture (DESIGN §7) this draw binds, if any. `None` binds the
+    /// renderer's 1×1 white/flat default, so the render loop has no branch.
+    pub texture: Option<TextureHandle>,
 }
 
 impl DrawItem {
@@ -37,9 +43,14 @@ impl DrawItem {
     /// one compares opaque bits, which today happens to run backwards from
     /// spawn order and could change between bevy_ecs releases. Index-then-bits
     /// is just as total, and it reads the way a person expects.
-    pub fn sort_key(&self) -> (u32, u64, u32, u64) {
+    ///
+    /// Untextured draws key as `0`, which sorts them ahead of every textured
+    /// one within a variant — so the two populations never interleave and the
+    /// default bind group is set at most once per variant.
+    pub fn sort_key(&self) -> (u32, u64, u64, u32, u64) {
         (
             self.variant.bits(),
+            self.texture.map(|t| t.0).unwrap_or(0),
             self.mesh.0,
             self.entity.index_u32(),
             self.entity.to_bits(),
@@ -99,14 +110,15 @@ pub fn extract_draw_list(
             },
             base_color: material.base_color,
             params: material.params,
+            texture: material.texture,
         })
         .collect();
     sort_draw_list(&mut items);
     items
 }
 
-/// Sort in place by `(variant, mesh, entity)` — see the module docs for why
-/// that order and why the tie-break is not optional.
+/// Sort in place by `(variant, texture, mesh, entity)` — see the module docs
+/// for why that order and why the tie-break is not optional.
 pub fn sort_draw_list(items: &mut [DrawItem]) {
     items.sort_unstable_by_key(|item| item.sort_key());
 }

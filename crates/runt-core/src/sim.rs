@@ -179,6 +179,7 @@ impl Sim {
         world.insert_resource(TickCount::default());
         world.insert_resource(Input::new());
         world.insert_resource(MeshLibrary::new());
+        world.insert_resource(crate::texture::TextureLibrary::new());
         world.insert_resource(Lighting::default());
         world.insert_resource(StatusLine::default());
         world.insert_resource(crate::audio::AudioOut::new());
@@ -499,6 +500,18 @@ impl Sim {
     /// here on demand.
     pub fn mesh_library(&self) -> &MeshLibrary {
         self.world.resource::<MeshLibrary>()
+    }
+
+    /// Procedural texture specs, keyed by content key (DESIGN §7). The renderer
+    /// bakes from here — eagerly at load if a host asked, lazily on first draw
+    /// otherwise.
+    pub fn texture_library(&self) -> &crate::texture::TextureLibrary {
+        self.world.resource::<crate::texture::TextureLibrary>()
+    }
+
+    /// The persistent content store, so the bake can consult it (DESIGN §7).
+    pub fn cache_store(&self) -> &dyn CacheStore {
+        self.world.resource::<GenCache>().store()
     }
 
     /// The scene's light rig.

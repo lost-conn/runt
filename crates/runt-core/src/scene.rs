@@ -8,10 +8,17 @@
 //!
 //! ```text
 //! generators: [ (name, spec, quality) ]      what to build
+//! textures:   [ (name, spec, quality) ]      what to bake  (DESIGN §7)
 //! entities:   [ (generator, transform, …) ]  where to put it
 //! camera:     …                              one, per DESIGN §5
 //! lighting:   …                              one rig, per DESIGN §5
 //! ```
+//!
+//! `textures` mirrors `generators` deliberately: same name-then-spec shape,
+//! same quality policy, same content-addressed resolution. A material refers to
+//! one by name (`texture: Some("grass")`) exactly as an entity refers to a
+//! generator, and for the same reason — two entities naming one texture share
+//! one bake.
 //!
 //! The split is the point. *Placement* lives on the entity; *shape* lives in the
 //! generator. Two entities naming the same generator get the same content hash,
@@ -62,9 +69,18 @@ use crate::physics::{
     self, AabbCollider, Ball, BallController, Grounded, RollSpin, SphereCollider, Trigger, Velocity,
 };
 use crate::registry::{MeshHandle, MeshLibrary};
+use crate::texture::{TextureHandle, TextureLibrary, TextureSpec};
 
 /// The demo scene, embedded at build time (DESIGN §12 step 4).
 pub const DEMO_SCENE_RON: &str = include_str!("../../../assets/demo.ron");
+
+/// The procedural-texture scene (DESIGN §7), embedded the same way.
+///
+/// Deliberately *not* the default scene: `demo.ron` is pinned by a frame
+/// fingerprint and per-entity screenshot probes, and texturing it would change
+/// what those measure. This one exists so the baked path has something to be
+/// proven against that nothing else depends on.
+pub const TEXTURED_SCENE_RON: &str = include_str!("../../../assets/textured.ron");
 
 /// The demo's spin rate: 0.4 rad/s about +Y, the rate the pre-ECS renderer
 /// hardcoded, kept so screenshots compare like with like.
@@ -84,6 +100,10 @@ pub struct SceneDesc {
     /// Generator invocations, each under a name entities refer to.
     #[serde(default)]
     pub generators: Vec<GeneratorEntry>,
+    /// Procedural textures to bake (DESIGN §7), each under a name materials
+    /// refer to.
+    #[serde(default)]
+    pub textures: Vec<TextureEntry>,
     /// Placements. Order is spawn order, and therefore stable.
     #[serde(default)]
     pub entities: Vec<EntityDesc>,
@@ -101,6 +121,20 @@ pub struct GeneratorEntry {
     /// [`GeneratorSpec::kind`].
     pub name: String,
     pub spec: GeneratorSpec,
+    #[serde(default)]
+    pub quality: QualityPolicy,
+}
+
+/// One named procedural texture (DESIGN §7).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
+pub struct TextureEntry {
+    /// What materials call it. Scene-local, like a generator's name.
+    pub name: String,
+    pub spec: TextureSpec,
+    /// Scales the *bake resolution*, where a generator's scales tessellation —
+    /// the same knob, one pipeline down (DESIGN §11: "Bake resolution … ≤2048²,
+    /// tier-scaled").
     #[serde(default)]
     pub quality: QualityPolicy,
 }
@@ -436,7 +470,7 @@ impl TransformDesc {
 
 /// A material, with the variant bitflags spelled out as booleans so a scene file
 /// never contains a magic number.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct MaterialDesc {
     #[serde(default = "vec4_one")]
@@ -448,15 +482,25 @@ pub struct MaterialDesc {
     pub params: Vec4,
     #[serde(default = "yes")]
     pub vertex_color: bool,
-    /// Reserved (§7).
+    /// The `name` of a [`TextureEntry`] in this scene (DESIGN §7). `None` — the
+    /// default, and what every scene written before textures existed parses to
+    /// — leaves the `TEXTURE` bit unset and the entity rendering exactly as it
+    /// did before.
     #[serde(default)]
-    pub texture: bool,
+    pub texture: Option<String>,
     /// Reserved (§5).
     #[serde(default)]
     pub ramp: bool,
     /// Reserved (§7).
     #[serde(default)]
     pub live_texture: bool,
+    /// Crinkle the shading normal with the texture's normal map.
+    ///
+    /// On by default because a baked material without its normals is half a
+    /// material — but **only consulted when `texture` names one**, so a
+    /// textureless entity's variant key is untouched by this field existing.
+    #[serde(default = "yes")]
+    pub normal_map: bool,
 }
 
 impl Default for MaterialDesc {
@@ -465,21 +509,32 @@ impl Default for MaterialDesc {
             base_color: Vec4::ONE,
             params: Vec4::ZERO,
             vertex_color: true,
-            texture: false,
+            texture: None,
             ramp: false,
             live_texture: false,
+            normal_map: true,
         }
     }
 }
 
 impl MaterialDesc {
-    pub fn to_material(self) -> Material {
+    /// Resolve, given the handle this material's `texture` name pointed at.
+    ///
+    /// The handle is passed in rather than looked up here because a
+    /// `MaterialDesc` is a *description* — it has no scene to resolve against,
+    /// and giving it one would drag the whole texture library into every place
+    /// that wants to talk about a material.
+    pub fn to_material_with(&self, texture: Option<TextureHandle>) -> Material {
         let mut variant = MaterialVariant::NONE;
         for (on, flag) in [
             (self.vertex_color, MaterialVariant::VERTEX_COLOR),
-            (self.texture, MaterialVariant::TEXTURE),
+            (texture.is_some(), MaterialVariant::TEXTURE),
             (self.ramp, MaterialVariant::RAMP),
             (self.live_texture, MaterialVariant::LIVE_TEX),
+            (
+                texture.is_some() && self.normal_map,
+                MaterialVariant::NORMAL_MAP,
+            ),
         ] {
             if on {
                 variant |= flag;
@@ -488,8 +543,14 @@ impl MaterialDesc {
         Material {
             base_color: self.base_color,
             params: self.params,
+            texture,
             variant,
         }
+    }
+
+    /// The material of a description that names no texture.
+    pub fn to_material(&self) -> Material {
+        self.to_material_with(None)
     }
 }
 
@@ -654,6 +715,8 @@ pub enum SceneError {
     Parse(String),
     /// An entity named a generator the file does not define.
     UnknownGenerator { entity: usize, name: String },
+    /// An entity's material named a texture the file does not define.
+    UnknownTexture { entity: usize, name: String },
     /// The camera's follow target names no entity.
     UnknownFollowTarget(String),
     /// [`save_scene`] on a world that never loaded one.
@@ -668,6 +731,10 @@ impl std::fmt::Display for SceneError {
             SceneError::UnknownGenerator { entity, name } => write!(
                 f,
                 "entity {entity} references generator {name:?}, which the scene does not define"
+            ),
+            SceneError::UnknownTexture { entity, name } => write!(
+                f,
+                "entity {entity} references texture {name:?}, which the scene does not define"
             ),
             SceneError::UnknownFollowTarget(name) => {
                 write!(f, "camera follows entity {name:?}, which the scene does not define")
@@ -724,6 +791,9 @@ pub struct SceneStats {
     /// Distinct mesh handles the generators resolved to. Lower than
     /// `generators` when two entries produce identical geometry.
     pub meshes: usize,
+    /// Texture entries registered for baking (DESIGN §7). The bake itself
+    /// happens on the render side, so this counts *specs*, not pixels.
+    pub textures: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -742,6 +812,11 @@ pub fn demo_scene() -> SceneDesc {
     parse_scene(DEMO_SCENE_RON).expect("assets/demo.ron must parse")
 }
 
+/// The procedural-texture scene, parsed. Same contract as [`demo_scene`].
+pub fn textured_scene() -> SceneDesc {
+    parse_scene(TEXTURED_SCENE_RON).expect("assets/textured.ron must parse")
+}
+
 /// Parse `ron_src` and build it into `world`.
 pub fn load_scene(world: &mut World, ron_src: &str) -> Result<SceneStats, SceneError> {
     spawn_scene(world, parse_scene(ron_src)?)
@@ -755,6 +830,7 @@ pub fn load_scene(world: &mut World, ron_src: &str) -> Result<SceneStats, SceneE
 /// follow one.
 pub fn spawn_scene(world: &mut World, desc: SceneDesc) -> Result<SceneStats, SceneError> {
     world.init_resource::<MeshLibrary>();
+    world.init_resource::<TextureLibrary>();
     world.init_resource::<GenCache>();
     world.init_resource::<QualityTier>();
     // A scene may spawn colliders, and the overlap pass writes messages.
@@ -769,6 +845,14 @@ pub fn spawn_scene(world: &mut World, desc: SceneDesc) -> Result<SceneStats, Sce
                 entity: i,
                 name: entity.generator.clone(),
             });
+        }
+        if let Some(name) = &entity.material.texture {
+            if !desc.textures.iter().any(|t| &t.name == name) {
+                return Err(SceneError::UnknownTexture {
+                    entity: i,
+                    name: name.clone(),
+                });
+            }
         }
     }
     if let Some(follow) = &desc.camera.follow {
@@ -802,6 +886,25 @@ pub fn spawn_scene(world: &mut World, desc: SceneDesc) -> Result<SceneStats, Sce
             })
         });
 
+    // --- textures: spec → TextureLibrary (DESIGN §7) -----------------------
+    //
+    // Registration only. The bake needs a device, which the world does not
+    // have, so it happens on the render side — eagerly via
+    // `Engine::bake_scene_textures` (which can consult the disk cache) or
+    // lazily on first draw. Scene loading therefore stays GPU-free, and the
+    // sim's tests keep running with no adapter in sight.
+    let resolved_textures: Vec<TextureHandle> =
+        world.resource_scope(|_world, mut library: Mut<TextureLibrary>| {
+            desc.textures
+                .iter()
+                .map(|entry| {
+                    let quality = entry.quality.resolve(tier);
+                    let resolution = entry.spec.resolution(quality);
+                    library.insert(entry.spec.clone(), resolution)
+                })
+                .collect()
+        });
+
     // --- entities ---------------------------------------------------------
 
     let mut spawned = Vec::with_capacity(desc.entities.len());
@@ -812,6 +915,14 @@ pub fn spawn_scene(world: &mut World, desc: SceneDesc) -> Result<SceneStats, Sce
             .position(|g| g.name == placement.generator)
             .expect("validated above");
         let (handle, param_key) = resolved[index];
+        let texture = placement.material.texture.as_ref().map(|name| {
+            let at = desc
+                .textures
+                .iter()
+                .position(|t| &t.name == name)
+                .expect("validated above");
+            resolved_textures[at]
+        });
         let transform = placement.transform.to_transform();
 
         let mut entity = world.spawn((
@@ -821,7 +932,7 @@ pub fn spawn_scene(world: &mut World, desc: SceneDesc) -> Result<SceneStats, Sce
                 name: placement.generator.clone(),
                 param_key,
             },
-            placement.material.to_material(),
+            placement.material.to_material_with(texture),
             transform,
             GlobalTransform(transform.matrix()),
         ));
@@ -932,11 +1043,13 @@ pub fn spawn_scene(world: &mut World, desc: SceneDesc) -> Result<SceneStats, Sce
             handles.dedup();
             handles.len()
         },
+        textures: desc.textures.len(),
     };
     log::info!(
-        "scene: {} generators → {} meshes, {} entities, cache {:?}",
+        "scene: {} generators → {} meshes, {} textures, {} entities, cache {:?}",
         stats.generators,
         stats.meshes,
+        stats.textures,
         stats.entities,
         world.resource::<GenCache>().stats()
     );

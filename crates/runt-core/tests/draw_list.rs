@@ -20,6 +20,7 @@ fn spawn(world: &mut World, mesh: u64, variant: MaterialVariant, x: f32) -> Enti
             Material {
                 base_color: Vec4::ONE,
                 params: Vec4::ZERO,
+                texture: None,
                 variant,
             },
             Transform::from_translation(Vec3::new(x, 0.0, 0.0)),

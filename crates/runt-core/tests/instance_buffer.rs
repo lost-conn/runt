@@ -11,6 +11,7 @@ use bevy_ecs::prelude::World;
 use glam::{Mat4, Vec3, Vec4};
 use runt_core::draw::{DrawItem, FrameParams};
 use runt_core::registry::{MeshHandle, MeshLibrary};
+use runt_core::texture::TextureLibrary;
 use runt_core::{scene, Camera, MaterialVariant, Renderer, Transform};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -46,6 +47,7 @@ fn crowd(world: &mut World, mesh: MeshHandle, count: usize) -> Vec<DrawItem> {
             model: Mat4::from_translation(Vec3::new(i as f32 * 0.1 - 2.0, 0.0, 0.0)),
             base_color: Vec4::ONE,
             params: Vec4::ZERO,
+            texture: None,
         })
         .collect()
 }
@@ -76,6 +78,9 @@ fn instance_slots_are_aligned_and_the_buffer_grows() {
 
     let mut world = World::new();
     let mut library = MeshLibrary::new();
+    // No textures in this scene: the default 1x1 bind group is what every draw
+    // gets, which is exactly the pre-texture path (DESIGN §7).
+    let textures = TextureLibrary::new();
     let mesh = library.insert(scene::ball_mesh());
 
     let camera = Camera::default();
@@ -86,7 +91,7 @@ fn instance_slots_are_aligned_and_the_buffer_grows() {
     };
 
     let start = renderer.instance_capacity();
-    renderer.render(&view, SIZE, SIZE, &frame, &crowd(&mut world, mesh, 4), &library);
+    renderer.render(&view, SIZE, SIZE, &frame, &crowd(&mut world, mesh, 4), &library, &textures);
     assert_eq!(
         renderer.instance_capacity(),
         start,
@@ -96,7 +101,7 @@ fn instance_slots_are_aligned_and_the_buffer_grows() {
     // Past capacity: the buffer grows (geometrically) and the frame still draws
     // — a validation error here would surface as a panic from wgpu.
     let big = (start as usize) * 3 + 1;
-    renderer.render(&view, SIZE, SIZE, &frame, &crowd(&mut world, mesh, big), &library);
+    renderer.render(&view, SIZE, SIZE, &frame, &crowd(&mut world, mesh, big), &library, &textures);
     assert!(
         renderer.instance_capacity() >= big as u32,
         "capacity {} must cover {big} draws",
@@ -108,6 +113,6 @@ fn instance_slots_are_aligned_and_the_buffer_grows() {
 
     // Growth is sticky: shrinking back does not thrash the allocation.
     let grown = renderer.instance_capacity();
-    renderer.render(&view, SIZE, SIZE, &frame, &crowd(&mut world, mesh, 2), &library);
+    renderer.render(&view, SIZE, SIZE, &frame, &crowd(&mut world, mesh, 2), &library, &textures);
     assert_eq!(renderer.instance_capacity(), grown);
 }

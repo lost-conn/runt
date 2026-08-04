@@ -77,6 +77,33 @@ pub trait CacheStore: Send + Sync + 'static {
         let _ = (param_key, content_hash);
     }
 
+    /// Baked texture pixels (DESIGN §7), keyed by
+    /// [`TextureSpec::content_key`](crate::texture::TextureSpec::content_key).
+    ///
+    /// Same contract as the mesh half: `None` means "rebake", which is always
+    /// correct. The returned entry is *untrusted* — the caller re-checks it
+    /// against the spec it actually asked for (see
+    /// [`TextureData::matches`](crate::bake::TextureData::matches)).
+    fn load_texture(&self, content_key: u64) -> Option<crate::bake::TextureData> {
+        let _ = content_key;
+        None
+    }
+
+    fn store_texture(&self, content_key: u64, data: &crate::bake::TextureData) {
+        let _ = (content_key, data);
+    }
+
+    /// Whether this store can hold baked textures.
+    ///
+    /// Persisting a bake means reading the target back off the GPU, which needs
+    /// a **blocking** device poll — something a browser does not have. So this
+    /// is not just "would you like to?": a store that answers `true` is
+    /// promising that a blocking readback is legal where it runs. Default
+    /// `false`, which is what keeps the web path from ever attempting it.
+    fn caches_textures(&self) -> bool {
+        false
+    }
+
     /// Name for logs.
     fn label(&self) -> &'static str {
         "cache"
@@ -123,6 +150,7 @@ mod native {
     /// ```text
     /// <root>/mesh/<content hash>.postcard   layer B
     /// <root>/key/<param key>.hash           layer A
+    /// <root>/texture/<content key>.postcard baked pixels (DESIGN §7)
     /// ```
     pub struct NativeDiskCache {
         root: PathBuf,
@@ -158,6 +186,12 @@ mod native {
 
         fn key_path(&self, param_key: u64) -> PathBuf {
             self.root.join("key").join(format!("{param_key:016x}.hash"))
+        }
+
+        fn texture_path(&self, content_key: u64) -> PathBuf {
+            self.root
+                .join("texture")
+                .join(format!("{content_key:016x}.postcard"))
         }
 
         /// Write via a unique temp file plus a rename, so a reader never sees a
@@ -210,6 +244,32 @@ mod native {
                 &self.key_path(param_key),
                 format!("{content_hash:016x}").as_bytes(),
             );
+        }
+
+        fn load_texture(&self, content_key: u64) -> Option<crate::bake::TextureData> {
+            let bytes = std::fs::read(self.texture_path(content_key)).ok()?;
+            match postcard::from_bytes::<crate::bake::TextureData>(&bytes) {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    log::warn!(
+                        "runt-cache: texture {content_key:016x} failed to decode ({e}); rebaking"
+                    );
+                    None
+                }
+            }
+        }
+
+        fn store_texture(&self, content_key: u64, data: &crate::bake::TextureData) {
+            match postcard::to_stdvec(data) {
+                Ok(bytes) => {
+                    NativeDiskCache::write_atomic(&self.texture_path(content_key), &bytes)
+                }
+                Err(e) => log::warn!("runt-cache: texture {content_key:016x} failed to encode ({e})"),
+            }
+        }
+
+        fn caches_textures(&self) -> bool {
+            true
         }
 
         fn label(&self) -> &'static str {
@@ -297,6 +357,15 @@ impl GenCache {
 
     pub fn store_label(&self) -> &'static str {
         self.store.label()
+    }
+
+    /// The persistent store, for the texture bake (DESIGN §7).
+    ///
+    /// Textures are baked by the *renderer* (they need a device) while the
+    /// store lives here with the rest of the content pipeline, so the bake
+    /// borrows it rather than the cache growing a GPU dependency.
+    pub fn store(&self) -> &dyn CacheStore {
+        self.store.as_ref()
     }
 
     /// Distinct param keys resolved this session.

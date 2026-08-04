@@ -24,21 +24,16 @@ impl Engine {
         queue: wgpu::Queue,
         target_format: wgpu::TextureFormat,
     ) -> Engine {
-        Engine {
-            sim: Sim::new(),
-            renderer: Renderer::new(device, queue, target_format),
-            warned_no_camera: false,
-        }
+        Engine::assembled(Sim::new(), Renderer::new(device, queue, target_format))
     }
 
     /// Build with no surface and no display handle — tests, bakes, the editor
     /// bridge.
     pub async fn headless(target_format: wgpu::TextureFormat) -> Result<Engine, String> {
-        Ok(Engine {
-            sim: Sim::new(),
-            renderer: Renderer::headless(target_format).await?,
-            warned_no_camera: false,
-        })
+        Ok(Engine::assembled(
+            Sim::new(),
+            Renderer::headless(target_format).await?,
+        ))
     }
 
     /// Build with a non-default tick rate (DESIGN §12 step 2's tick-rate
@@ -49,11 +44,10 @@ impl Engine {
         target_format: wgpu::TextureFormat,
         hz: f64,
     ) -> Engine {
-        Engine {
-            sim: Sim::with_tick_rate(hz),
-            renderer: Renderer::new(device, queue, target_format),
-            warned_no_camera: false,
-        }
+        Engine::assembled(
+            Sim::with_tick_rate(hz),
+            Renderer::new(device, queue, target_format),
+        )
     }
 
     /// Build with an explicit [`SimConfig`] — the quality tier, the cache store
@@ -64,11 +58,10 @@ impl Engine {
         target_format: wgpu::TextureFormat,
         config: SimConfig,
     ) -> Engine {
-        Engine {
-            sim: Sim::from_config(config),
-            renderer: Renderer::new(device, queue, target_format),
-            warned_no_camera: false,
-        }
+        Engine::assembled(
+            Sim::from_config(config),
+            Renderer::new(device, queue, target_format),
+        )
     }
 
     /// As [`headless`](Engine::headless), with an explicit [`SimConfig`].
@@ -76,11 +69,59 @@ impl Engine {
         target_format: wgpu::TextureFormat,
         config: SimConfig,
     ) -> Result<Engine, String> {
-        Ok(Engine {
-            sim: Sim::from_config(config),
-            renderer: Renderer::headless(target_format).await?,
+        Ok(Engine::assembled(
+            Sim::from_config(config),
+            Renderer::headless(target_format).await?,
+        ))
+    }
+
+    /// The one place a `Sim` and a `Renderer` become an `Engine`.
+    ///
+    /// Every constructor funnels through here so that the load-time work which
+    /// needs *both* halves — baking the scene's procedural textures (DESIGN §7)
+    /// — cannot be forgotten by whichever constructor a host happens to use.
+    fn assembled(sim: Sim, renderer: Renderer) -> Engine {
+        let mut engine = Engine {
+            sim,
+            renderer,
             warned_no_camera: false,
-        })
+        };
+        engine.bake_scene_textures();
+        engine
+    }
+
+    /// Bake every texture the loaded scene registered (DESIGN §7).
+    ///
+    /// > *Baked (baseline): rendered once to an RGBA8 texture at tier-scaled
+    /// > resolution at **load time**.* — §7
+    ///
+    /// Run automatically at construction. Call it again after loading a scene
+    /// by hand, so the disk cache is consulted before the first frame — without
+    /// it the renderer still bakes lazily on first draw, to the same pixels,
+    /// just without the cache and inside a frame.
+    pub fn bake_scene_textures(&mut self) {
+        let work: Vec<(crate::texture::TextureSpec, u32)> = self
+            .sim
+            .texture_library()
+            .iter()
+            .map(|(_, spec, resolution)| (spec.clone(), resolution))
+            .collect();
+        if work.is_empty() {
+            return;
+        }
+        // Split the borrow by field: the store lives in the sim's `GenCache`
+        // and the bake lives in the renderer, and they are disjoint, so no
+        // cloning (and no unsafe) is needed to hold both.
+        let Engine { sim, renderer, .. } = self;
+        let store = sim.cache_store();
+        for (spec, resolution) in &work {
+            renderer.bake_texture(spec, *resolution, store);
+        }
+        log::info!(
+            "baked {} procedural texture(s), {} resident",
+            work.len(),
+            renderer.textures().len()
+        );
     }
 
     // -- host surface -------------------------------------------------------
@@ -126,6 +167,7 @@ impl Engine {
                 &crate::FrameParams::default(),
                 &[],
                 self.sim.mesh_library(),
+                self.sim.texture_library(),
             );
             return;
         };
@@ -138,6 +180,7 @@ impl Engine {
             &frame,
             &draws,
             self.sim.mesh_library(),
+            self.sim.texture_library(),
         );
     }
 

@@ -12,6 +12,10 @@ use runt_core::Renderer;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// Every combination of the declared flags.
+///
+/// Five flags since §7's texture bits landed, so 32 pipelines rather than 16 —
+/// the count follows `FLAGS` on purpose, so adding a look extends the coverage
+/// automatically instead of leaving a new combination untested.
 fn all_variants() -> Vec<MaterialVariant> {
     let bits = MaterialVariant::FLAGS.len();
     (0..(1u32 << bits)).map(MaterialVariant::from_bits).collect()
@@ -24,6 +28,7 @@ fn variant_source_declares_every_flag_with_the_right_value() {
     assert!(src.contains("const F_TEXTURE: bool = false;"));
     assert!(src.contains("const F_RAMP: bool = false;"));
     assert!(src.contains("const F_LIVE_TEX: bool = false;"));
+    assert!(src.contains("const F_NORMAL_MAP: bool = false;"));
     assert!(src.ends_with(material::BASE_SHADER), "base source is appended verbatim");
 
     let none = material::variant_source(material::BASE_SHADER, MaterialVariant::NONE);
@@ -57,16 +62,30 @@ fn variant_keys_behave_as_bitflags() {
     assert!(!v.contains(MaterialVariant::RAMP));
     assert!(MaterialVariant::NONE.is_empty());
 
-    // v1 implements exactly one flag; the rest are declared but inert.
+    // Vertex colour, the baked texture (§7) and its normal map are implemented;
+    // the ramp and live-eval bits are declared but inert.
+    assert_eq!(v.unimplemented(), MaterialVariant::NONE);
     assert_eq!(
-        MaterialVariant::VERTEX_COLOR.unimplemented(),
+        MaterialVariant::NORMAL_MAP.unimplemented(),
         MaterialVariant::NONE
     );
     assert_eq!(
-        v.unimplemented(),
-        MaterialVariant::TEXTURE,
+        (v | MaterialVariant::RAMP).unimplemented(),
+        MaterialVariant::RAMP,
         "reserved bits must report as unimplemented, not silently pass"
     );
+    assert_eq!(
+        MaterialVariant::LIVE_TEX.unimplemented(),
+        MaterialVariant::LIVE_TEX
+    );
+
+    // Bit positions are permanent — a cache key that meant one thing must never
+    // come to mean another. `NORMAL_MAP` is appended at bit 4 for that reason.
+    assert_eq!(MaterialVariant::VERTEX_COLOR.bits(), 0b00001);
+    assert_eq!(MaterialVariant::TEXTURE.bits(), 0b00010);
+    assert_eq!(MaterialVariant::RAMP.bits(), 0b00100);
+    assert_eq!(MaterialVariant::LIVE_TEX.bits(), 0b01000);
+    assert_eq!(MaterialVariant::NORMAL_MAP.bits(), 0b10000);
 
     // The flag list and the bits agree, so no key can be generated that the
     // preprocessor would not emit a const for.
@@ -75,7 +94,7 @@ fn variant_keys_behave_as_bitflags() {
         assert!(!union.contains(flag), "duplicate flag bit {:#06b}", flag.bits());
         union |= flag;
     }
-    assert_eq!(union.bits(), 0b1111);
+    assert_eq!(union.bits(), 0b11111);
 }
 
 #[test]

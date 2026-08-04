@@ -444,11 +444,15 @@ fn finish(mesh: MeshData, shading: Shading, color: Option<Vec3>) -> MeshData {
     }
 }
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+pub(crate) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// FNV-1a over a byte slice, continuing from `h`.
-fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
+///
+/// `pub(crate)` because [`crate::texture::TextureSpec`] hashes itself the same
+/// way: §6's scheme is the engine's one content-key scheme, not the mesh
+/// pipeline's private habit.
+pub(crate) fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
         h ^= b as u64;
         h = h.wrapping_mul(FNV_PRIME);
