@@ -509,6 +509,30 @@ impl Sim {
         self.world.resource::<crate::texture::TextureLibrary>()
     }
 
+    /// Whether textured draws use §7's live path.
+    pub fn live_textures(&self) -> bool {
+        self.world
+            .get_resource::<crate::texture::TextureLibrary>()
+            .is_some_and(crate::texture::TextureLibrary::live_textures)
+    }
+
+    /// Switch every textured draw between §7's baked and live paths.
+    ///
+    /// Render-side only: it changes which variant bit
+    /// [`draw::resolve_variant`](crate::draw::resolve_variant) hands the
+    /// renderer and nothing a `FixedSim` system can read, so a determinism
+    /// fingerprint cannot move when it flips. See
+    /// [`TextureLibrary::set_live_textures`](crate::texture::TextureLibrary::set_live_textures)
+    /// for why it is v1's whole gate.
+    pub fn set_live_textures(&mut self, live: bool) {
+        if let Some(mut library) = self
+            .world
+            .get_resource_mut::<crate::texture::TextureLibrary>()
+        {
+            library.set_live_textures(live);
+        }
+    }
+
     /// The persistent content store, so the bake can consult it (DESIGN §7).
     pub fn cache_store(&self) -> &dyn CacheStore {
         self.world.resource::<GenCache>().store()

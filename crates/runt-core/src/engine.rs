@@ -124,6 +124,23 @@ impl Engine {
         );
     }
 
+    /// Whether textured draws evaluate their spec per pixel (DESIGN §7's live
+    /// path) instead of sampling its bake.
+    pub fn live_textures(&self) -> bool {
+        self.sim.live_textures()
+    }
+
+    /// Switch every textured draw between §7's baked and live paths — v1's perf
+    /// gate, held open by hand until §11's probe exists to hold it.
+    ///
+    /// Cheap enough to call every frame: both variants live in the same
+    /// pipeline cache and the bind group does not change, so a flip costs one
+    /// pipeline swap the sort order was going to pay anyway. Nothing in the sim
+    /// can observe it.
+    pub fn set_live_textures(&mut self, live: bool) {
+        self.sim.set_live_textures(live);
+    }
+
     // -- host surface -------------------------------------------------------
 
     /// Buffer a host input event; it is consumed at the next tick boundary.

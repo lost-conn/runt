@@ -140,37 +140,16 @@ fn bake_sample(uv: vec2<f32>) -> BakeResult {
     return r;
 }
 
-// Contrast, brightness, clamp — in the original's order.
+// Contrast/brightness and the ramp are `noise.wgsl`'s, fed from this pass's
+// uniform. The live material variant calls the same two functions with
+// `@group(2)`'s numbers, which is what makes DESIGN §7's "one source, two
+// modes" true of the *colour* and not only of the noise.
 fn postprocess(v: f32) -> f32 {
-    let n = clamp((v - 0.5) * bake.shape.y + 0.5, 0.0, 1.0);
-    return clamp(n * bake.shape.z, 0.0, 1.0);
+    return tex_postprocess(v, bake.shape.y, bake.shape.z);
 }
 
-// The gradient ramp. Linear between stops, held flat outside the ends —
-// Godot's `GradientTexture1D` semantics, which is what the authored ramps were
-// drawn against.
 fn ramp_at(t_in: f32) -> vec3<f32> {
-    let t = clamp(t_in, 0.0, 1.0);
-    let count = bake.counts.y;
-    if (count == 0u) {
-        return vec3<f32>(t, t, t);
-    }
-    if (t <= bake.ramp[0].w) {
-        return bake.ramp[0].xyz;
-    }
-    for (var i = 1u; i < count; i = i + 1u) {
-        let a = bake.ramp[i - 1u];
-        let b = bake.ramp[i];
-        if (t <= b.w) {
-            let span = b.w - a.w;
-            var f = 0.0;
-            if (span > 1.0e-6) {
-                f = (t - a.w) / span;
-            }
-            return mix(a.xyz, b.xyz, f);
-        }
-    }
-    return bake.ramp[count - 1u].xyz;
+    return ramp_lookup(bake.ramp, bake.counts.y, t_in);
 }
 
 @fragment

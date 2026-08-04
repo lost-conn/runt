@@ -67,7 +67,10 @@ use serde::{Deserialize, Serialize};
 use crate::cache::CacheStore;
 use crate::texture::{TextureHandle, TextureSpec, MAX_OCTAVES, MAX_RAMP_STOPS};
 
-/// The noise library, shared with any future live-eval variant.
+/// The noise library. Prepended to this pass by [`bake_shader_source`] and to
+/// every material variant by
+/// [`material::variant_source`](crate::material::variant_source), because §7's
+/// live path evaluates the identical field in the fragment shader.
 pub const NOISE_SHADER: &str = include_str!("noise.wgsl");
 
 /// The bake pass. Not standalone — see [`bake_shader_source`].
@@ -176,6 +179,85 @@ impl BakeUniform {
             seed: [offset.x, offset.y, offset.z, 0.0],
             octaves,
             ramp,
+        }
+    }
+}
+
+/// `@group(2) @binding(3)` of the **material** shader: how a texture maps onto
+/// the world, plus the whole spec for §7's live path. Restated in `shader.wgsl`.
+///
+/// One uniform rather than two because `@group(2)`'s layout must not depend on
+/// the variant key — the live/baked toggle swaps a *pipeline* and keeps the
+/// bind group, which is the property that makes it a per-frame decision instead
+/// of a rebuild. A baked-only draw reads [`config`](TextureUniform::config) and
+/// ignores the other 352 bytes; that is 368 bytes per resident texture, of
+/// which there are two in the port.
+///
+/// [`field`](TextureUniform::field) is [`BakeUniform`] verbatim — the same
+/// bytes the bake pass reads out of *its* `@group(0)`. Sharing the struct is
+/// not a coincidence to be tidied away later: it is what guarantees the two
+/// modes cannot be fed different numbers for the same spec.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct TextureUniform {
+    /// x: world units → tile units ([`TextureSpec::world_scale`]), y: triplanar
+    /// sharpness, z: anti-tiling on/off, w: octave-0 lattice cells per world
+    /// metre.
+    ///
+    /// `w` is the live path's entire world→noise map, and it is exactly the
+    /// bake's: the bake samples octave *i* at `uv · span_i`, `uv` is
+    /// `world · world_scale`, so `span_0 · world_scale` is cells per metre and
+    /// `freq_i` scales it per octave. Precomputed here for the same reason the
+    /// octave plan is — so the shader has no rounding rule of its own.
+    pub config: [f32; 4],
+    /// x: `log2` of the quantized lacunarity, y:
+    /// [`LIVE_LOD_CELL_PIXELS`](crate::texture::LIVE_LOD_CELL_PIXELS), zw: pad.
+    pub live: [f32; 4],
+    /// xyz: [`TextureSpec::live_seed_offset`], w: pad.
+    ///
+    /// Not `field.seed`, which the bake wraps and this cannot: folding the
+    /// offset into the tile is what makes the live image and the baked image
+    /// the *same* image rather than two neighbourhoods of one field. See that
+    /// method for the equivalence it leans on.
+    pub live_seed: [f32; 4],
+    /// The spec itself, in the bake pass's own packing.
+    pub field: BakeUniform,
+}
+
+impl TextureUniform {
+    pub fn from_spec(spec: &TextureSpec) -> TextureUniform {
+        let seed = spec.live_seed_offset();
+        TextureUniform {
+            config: [
+                spec.world_scale,
+                spec.triplanar_sharpness,
+                if spec.anti_tiling { 1.0 } else { 0.0 },
+                spec.live_cells_per_metre(),
+            ],
+            live: [
+                spec.log2_lacunarity(),
+                crate::texture::LIVE_LOD_CELL_PIXELS,
+                0.0,
+                0.0,
+            ],
+            live_seed: [seed.x, seed.y, seed.z, 0.0],
+            field: BakeUniform::from_spec(spec),
+        }
+    }
+
+    /// What an untextured draw binds: a legal block that no shader path reads.
+    ///
+    /// `config` restates the pre-texture defaults (unit scale, the default
+    /// sharpness, anti-tiling off) so that a variant key which sets `TEXTURE`
+    /// with no handle degrades to a white 1×1 tap rather than to a divide by
+    /// zero, and zero octaves so the live loop — which such a draw never enters
+    /// — would terminate immediately if it ever did.
+    pub fn inert() -> TextureUniform {
+        TextureUniform {
+            config: [1.0, 4.0, 0.0, 1.0],
+            live: [1.0, crate::texture::LIVE_LOD_CELL_PIXELS, 0.0, 0.0],
+            live_seed: [0.0; 4],
+            field: BakeUniform::zeroed(),
         }
     }
 }
@@ -733,7 +815,9 @@ impl TextureRegistry {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(16),
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<TextureUniform>() as u64,
+                        ),
                     },
                     count: None,
                 },
@@ -784,7 +868,7 @@ impl TextureRegistry {
             std::slice::from_ref(&vec![128, 128, 255, 255]),
             "default normal",
         );
-        let default_params = create_params(device, queue, 1.0, 4.0, false);
+        let default_params = create_params(device, queue, &TextureUniform::inert());
         let default_bind_group = create_bind_group(
             device,
             &layout,
@@ -888,13 +972,7 @@ impl TextureRegistry {
             }
         };
 
-        let params = create_params(
-            device,
-            queue,
-            spec.world_scale,
-            spec.triplanar_sharpness,
-            spec.anti_tiling,
-        );
+        let params = create_params(device, queue, &TextureUniform::from_spec(spec));
         let bind_group = create_bind_group(
             device,
             &self.layout,
@@ -917,31 +995,26 @@ impl TextureRegistry {
     }
 }
 
-/// The per-texture sampling params: `(world_scale, sharpness, anti-tiling, 0)`.
+/// The per-texture uniform ([`TextureUniform`]), uploaded once per resident
+/// texture.
 ///
-/// They live with the *texture*, not the instance, because they describe how
-/// this bake maps onto the world — two entities wearing the same grass want the
-/// same tiling whether or not anyone remembered to copy a number.
+/// It lives with the *texture*, not the instance, because it describes how this
+/// spec maps onto the world — two entities wearing the same grass want the same
+/// tiling whether or not anyone remembered to copy a number — and because §7's
+/// live path needs the whole spec here, where it is written once per bake
+/// rather than once per draw.
 fn create_params(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    world_scale: f32,
-    sharpness: f32,
-    anti_tiling: bool,
+    uniform: &TextureUniform,
 ) -> wgpu::Buffer {
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("texture params"),
-        size: 16,
+        size: std::mem::size_of::<TextureUniform>() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let values: [f32; 4] = [
-        world_scale,
-        sharpness,
-        if anti_tiling { 1.0 } else { 0.0 },
-        0.0,
-    ];
-    queue.write_buffer(&buffer, 0, bytemuck::bytes_of(&values));
+    queue.write_buffer(&buffer, 0, bytemuck::bytes_of(uniform));
     buffer
 }
 

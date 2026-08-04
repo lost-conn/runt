@@ -1,9 +1,17 @@
 // The procedural-noise library (DESIGN §7).
 //
 // A *library*, not a shader: no bindings, no entry points, nothing that assumes
-// a pass. It is prepended to whichever shader needs it (`bake.wgsl` today, the
-// live-eval material variant if §7's perf gate ever opens) by
-// `runt_core::texture_shader_source`.
+// a pass. It is prepended to whichever shader needs it — `bake.wgsl` by
+// `runt_core::bake::bake_shader_source`, and *every* material variant by
+// `runt_core::material::variant_source`, because §7's live path evaluates the
+// same field in the fragment shader.
+//
+// That "every variant" is deliberate. The alternative — prepend it only when
+// `F_LIVE_TEX` is set — would make the generated source depend on the variant
+// key in a second, invisible way, and a variant system's whole value is that
+// one source covers every key. Nothing here is reachable from a baked-only
+// variant, so the backend strips it; what it costs is compile time, not
+// instructions.
 //
 // `src/noise.rs` is the line-for-line CPU twin, the same relationship `sky.rs`
 // has to `sky.wgsl`. `tests/noise_bake.rs` samples real baked texels and holds
@@ -336,4 +344,83 @@ fn fbm_finish(a: FbmAccum) -> f32 {
         return a.sum / a.max_amplitude;
     }
     return 0.0;
+}
+
+// The octave window a *live* fragment should evaluate, as an `octave_weight`
+// pair (DESIGN §7: live eval has no mip chain, so this is its substitute).
+//
+// `footprint` is how many octave-0 lattice cells one pixel covers — the same
+// quantity a mip selector computes, taken from `dpdx`/`dpdy` of the world
+// position rather than of a texture coordinate. An octave whose cells are
+// finer than `cell_pixels` pixels across is under-sampled: evaluating it adds
+// noise the screen cannot resolve, which is exactly the shimmer mipmaps exist
+// to remove, so it fades out instead.
+//
+// Solving `freq_i · footprint · cell_pixels = 1` for `i` gives the top of the
+// window; `min` sits one octave below it, so the fade is a smooth octave wide
+// rather than a popping step. `cell_pixels <= 0` returns the "LOD off"
+// sentinel — every octave at full weight, which is what the bake passes.
+//
+// Distance from the camera is the *cause* of a large footprint and is what the
+// Godot original ramped on; the footprint is the effect, and using it directly
+// also handles a floor seen at a grazing angle, which no distance ramp can.
+fn live_octave_window(footprint: f32, log2_lacunarity: f32, cell_pixels: f32) -> vec2<f32> {
+    if (cell_pixels <= 0.0) {
+        return vec2<f32>(1.0, 0.0); // max < min: octave LOD off.
+    }
+    let top = -log2(max(footprint * cell_pixels, 1.0e-8)) / max(log2_lacunarity, 1.0e-3);
+    return vec2<f32>(top - 1.0, top);
+}
+
+// ---------------------------------------------------------------------------
+// Post-processing and the colour ramp
+// ---------------------------------------------------------------------------
+//
+// DESIGN §7 wants *one* WGSL source behind both texture modes. These two are
+// where that bites: the bake reads its numbers out of `@group(0)`'s bake block
+// and the live material variant reads them out of `@group(2)`'s texture block,
+// so the values differ and the arithmetic must not. Passing them in as
+// arguments is the whole trick — a bake and a live fragment that disagreed
+// about contrast would be a look that changes when the perf gate flips, which
+// is precisely what §11 forbids of a gated feature.
+//
+// `runt_core::texture::TextureSpec::{postprocess, ramp_at}` are the CPU twins.
+
+// Contrast, brightness, clamp — in the original's order.
+fn tex_postprocess(v: f32, contrast: f32, brightness: f32) -> f32 {
+    let n = clamp((v - 0.5) * contrast + 0.5, 0.0, 1.0);
+    return clamp(n * brightness, 0.0, 1.0);
+}
+
+// The gradient ramp. Linear between stops, held flat outside the ends —
+// Godot's `GradientTexture1D` semantics, which is what the authored ramps were
+// drawn against. `count == 0` is greyscale.
+//
+// `stops` is taken **by value**. A fixed-size array parameter is a copy, which
+// is what lets one function serve two different uniform blocks; at eight
+// `vec4`s it is 128 bytes of registers on a path that already carries a
+// nineteen-cell Voronoi loop, and it is the price of not having the ramp
+// written twice. `runt_core::texture::MAX_RAMP_STOPS` fixes the 8.
+fn ramp_lookup(stops: array<vec4<f32>, 8>, count: u32, t_in: f32) -> vec3<f32> {
+    let t = clamp(t_in, 0.0, 1.0);
+    if (count == 0u) {
+        return vec3<f32>(t, t, t);
+    }
+    var s = stops;
+    if (t <= s[0].w) {
+        return s[0].xyz;
+    }
+    for (var i = 1u; i < count; i = i + 1u) {
+        let a = s[i - 1u];
+        let b = s[i];
+        if (t <= b.w) {
+            let span = b.w - a.w;
+            var f = 0.0;
+            if (span > 1.0e-6) {
+                f = (t - a.w) / span;
+            }
+            return mix(a.xyz, b.xyz, f);
+        }
+    }
+    return s[count - 1u].xyz;
 }

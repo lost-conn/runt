@@ -176,8 +176,43 @@ Same philosophy as meshes, one level down the pipeline.
   large-argument `sin` hashes) — cheap mobile GPUs run "highp" as fp24
   internally, on either backend.
 - Bake outputs are content-addressed like meshes (params hash → texture).
-- v1 ships baked-only; the material variant key already reserves a bit for
-  live eval so shaders don't need restructuring later.
+
+**Live path landed (2026-08-04).** `MaterialVariant::LIVE_TEX` is implemented,
+and the reserved bit paid off exactly as intended: no new flag, no new pipeline
+shape, 32 variants before and after.
+
+- **One source, both modes, enforced.** `noise.wgsl` is now prepended to every
+  material variant as well as to the bake, and the contrast/brightness curve and
+  the gradient ramp moved into it as *parameterized* functions so the two modes
+  read the same code from different uniforms. A live fragment and a baked texel
+  of one spec are the same number — `tests/live_texture.rs` holds the shader to
+  the CPU twin at **sub-LSB** (median 0.36/255, better than the bake, which has
+  a texel and a filter in the way).
+- **Live is the original's semantics, not a per-pixel bake.** Unbounded 3D
+  world-space noise at the shading point: no tile, no wrap, and **no triplanar
+  projection** — a 3D field is defined everywhere, so projecting it would throw
+  away the third dimension and then pay nine anti-tiling taps per plane to
+  disguise the loss. One octave loop, not three.
+- **Octave LOD replaces the mip chain.** Live has nothing pre-filtered to fall
+  back to, so an octave whose cells are finer than `LIVE_LOD_CELL_PIXELS` across
+  fades out and is *skipped*. Driven by `dpdx`/`dpdy` of the world position —
+  the footprint, which is what a mip selector uses — rather than by camera
+  distance, which is only its cause and cannot see a grazing angle.
+- **Normals** accumulate the boundary gradient against the pixel footprint in
+  the same octave loop, then perturb the geometric normal in a screen-derived
+  tangent frame. The tangent offset is built by normalizing against the bake's
+  own packed `z = 0.5`, which bounds it exactly as the bake's packing does — an
+  unbounded analytic gradient turns rock's authored `strength: 29.6` inside out.
+- **The gate is a per-frame flag** (`Engine::set_live_textures`), and the draw
+  list applies it (`draw::resolve_variant`); the material stays declarative.
+  `TEXTURE` and `LIVE_TEX` are mutually exclusive on a draw, resolved in live's
+  favour in both the draw list and the shader.
+- **Cost, measured** (3dimenshift `test_level.ron`, RADV RAPHAEL_MENDOCINO
+  iGPU, 300 frames/mode, wall clock with a device drain per frame):
+  8.4 ms → 41.6 ms at 1080p (**4.9×**), 17.9 ms → 74.9 ms at 1440p (**4.2×**).
+  The octave window is worth ~4% of that on a close third-person framing and
+  would be worth more on a vista. All 32 variants emit valid GLSL ES 300, so
+  WebGL2 can run it — which is why §11 gates it on tier and not on backend.
 
 ## 8. Audio — synthesized, worklet-resident
 
@@ -391,12 +426,37 @@ immutable for the session:
 | Limits requested | backend | `downlevel_webgl2_defaults` | full adapter limits |
 | Mesh quality default | perf | tier-scaled `Quality` | higher default quality |
 | Live texture eval (§7) | perf | baked only | live variants allowed |
+| *(v1: an explicit `set_live_textures` flag, default off — see below)* | | | |
 | Bake resolution | both | ≤2048², tier-scaled | up to 4096² |
 | Particles | backend (compute) | CPU, modest counts | GPU compute |
 | Shadows | perf | off or 512² single cascade | 2048² |
 
 Gates select *data and variants*, never divergent engine code paths. A gated
 feature must have a baseline degradation story before it merges.
+
+**There is no perf probe yet.** The tier column above describes where the
+decisions belong, not machinery that exists: nothing measures the device at
+startup. Live texture eval (§7) is the first feature to actually need it, and
+what shipped instead is the API the probe will eventually drive —
+`Engine::set_live_textures(bool)`, default **off**, flipped by hand (the port
+binds it to **T**). When the probe lands it sets that flag at startup and no
+call site moves.
+
+**Recommended policy for when it does**, from §7's measured 4–5× fragment cost:
+
+- **Off by default at every tier.** Baked already carries a mip chain and
+  anti-tiling and looks the same; live's payoff is *animation and param
+  morphing*, and no content asks for either yet. A gate that costs 4× and buys
+  nothing visible should be closed however fast the part is.
+- **A tier is a necessary condition, not a sufficient one.** Live belongs on
+  High as an opt-in the *content* asks for (`MaterialDesc::live_texture`), with
+  the tier able to refuse. That is what the "gate can only say yes to more"
+  rule in `draw::resolve_variant` is holding a place for.
+- **The High bar, if anyone wants a number**: this iGPU spends 42 ms of a 1080p
+  frame on live and would need roughly 5× that throughput to spend live's cost
+  where baked spends its own. So the honest threshold is "a discrete GPU, at
+  1080p, for a scene where live is not covering most of the screen" — which is
+  another way of saying the gate wants to be per-material rather than global.
 
 ## 12. Build order
 

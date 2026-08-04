@@ -120,6 +120,21 @@ pub const MAX_RESOLUTION: u32 = 2048;
 /// [`world_scale`]: TextureSpec::world_scale
 pub const NORMAL_REFERENCE_TEXELS: f32 = 1024.0;
 
+/// How many pixels wide a lattice cell must stay before §7's **live** path
+/// stops evaluating its octave.
+///
+/// The live path has no mip chain — there is nothing pre-filtered to fall back
+/// to — so this is its substitute, and it is the same rule a mip selector uses:
+/// detail finer than the sampling rate is not detail, it is noise. Two pixels
+/// per cell is one octave below the Nyquist limit of a point-sampled field,
+/// which leaves the fade a whole octave to happen in before aliasing would
+/// start.
+///
+/// Raising it blurs distant surfaces and makes them cheaper; lowering it is how
+/// you buy shimmer. Zero turns the window off entirely (every octave at full
+/// weight, the bake's behaviour), which is what the CPU twin compares against.
+pub const LIVE_LOD_CELL_PIXELS: f32 = 2.0;
+
 // ---------------------------------------------------------------------------
 // The spec
 // ---------------------------------------------------------------------------
@@ -493,6 +508,135 @@ impl TextureSpec {
         plan
     }
 
+    /// Octave-0 lattice cells per world metre — §7's live path's entire
+    /// world → noise map, and the `config.w` of
+    /// [`TextureUniform`](crate::bake::TextureUniform).
+    ///
+    /// It is the bake's map with the tile divided out. The bake evaluates
+    /// octave *i* at `uv · span_i`, and `uv = world · world_scale`, so a live
+    /// fragment at `world · (span_0 · world_scale) · freq_i` is sampling the
+    /// *same field* — which is why the two modes can be A/B'd at all, and why
+    /// `tests/live_texture.rs` can hold the live shader against
+    /// [`sample_at`](TextureSpec::sample_at) directly.
+    pub fn live_cells_per_metre(&self) -> f32 {
+        self.octave_plan().first().map(|o| o.span).unwrap_or(1.0) * self.world_scale
+    }
+
+    /// The seed offset §7's **live** path samples at: the bake's, folded into
+    /// the tile.
+    ///
+    /// # Why it is not just the bake's offset
+    ///
+    /// [`seed_offset_3d`](crate::noise::seed_offset_3d) hands out offsets in
+    /// the *thousands*, and the finest octave multiplies them by its frequency
+    /// — `grass`'s octave 4 lands around 25 000 cells out. The bake survives
+    /// that because it wraps every cell index back into the tile before
+    /// hashing; live has no wrap by definition, so it would be taking a `floor`
+    /// at a magnitude where `f32` resolves about 0.002 of a cell. That is
+    /// precisely the failure `wrap_axis` was hardened against (see
+    /// `noise.wgsl`), one step earlier in the pipeline and with no wrap to
+    /// absorb it. Folding puts the live evaluation back where floats are dense.
+    ///
+    /// The second benefit is that it makes the two modes the *same picture*
+    /// rather than two neighbourhoods of one field — see
+    /// [`live_agreement_window`](TextureSpec::live_agreement_window), which
+    /// bounds where that holds and is exact inside it.
+    ///
+    /// # Why folding is allowed
+    ///
+    /// Octave *i* sees the offset as `offset · freq_i` and wraps modulo
+    /// `span_i = span_0 · freq_i`, so shifting the offset by a whole `span_0`
+    /// moves every octave by a whole period at once: wrapped cell keys
+    /// unchanged, feature-point *offsets* unchanged, baked image unchanged. On
+    /// FCC the shift is a multiple of an even number, so lattice parity
+    /// survives it too. Which window of an unbounded field the world maps onto
+    /// is free; this picks the one the bake was already showing.
+    ///
+    /// Only x and y fold. The bake gives z no period at all (a 2D tile through
+    /// a 3D field), so there is no wrap to be equivalent to and folding z would
+    /// genuinely move the slice.
+    ///
+    /// The result is centred on zero rather than left in `[0, span_0)`, which
+    /// keeps the magnitudes smallest and the agreement window widest.
+    pub fn live_seed_offset(&self) -> Vec3 {
+        let offset = noise::seed_offset_3d(self.seed_offset);
+        let span = self.octave_plan().first().map(|o| o.span).unwrap_or(1.0);
+        let fold = |v: f32| {
+            let r = v.rem_euclid(span);
+            if r >= span * 0.5 {
+                r - span
+            } else {
+                r
+            }
+        };
+        Vec3::new(fold(offset.x), fold(offset.y), offset.z)
+    }
+
+    /// The tile-space window over which the live field and the baked tile are
+    /// the *same* pixels, as `(min, max)` in uv.
+    ///
+    /// The fold above lines the two up; this says where the alignment holds.
+    /// The baked wrap is the identity only while a cell index stays inside
+    /// `[0, span_i)`, which — because the fold is by `span_0` and every octave
+    /// scales together — is one condition for all octaves:
+    /// `uv + offset/span_0 ∈ [0, 1)`. Outside it the bake repeats and live does
+    /// not, which is the whole difference between the two modes and not a bug
+    /// in either.
+    ///
+    /// The window is a full tile wide before margin, shifted by at most half a
+    /// tile, so at least half of any tile is always inside it.
+    pub fn live_agreement_window(&self) -> (Vec2, Vec2) {
+        let span = self.octave_plan().first().map(|o| o.span).unwrap_or(1.0);
+        let offset = self.live_seed_offset();
+        // The lattice neighbourhood reaches two cells out (`FCC_OFFSETS`), so a
+        // sample within two cells of the tile edge has neighbours the bake
+        // wraps and live does not. Two cells is `2/span_0` of the tile at the
+        // *coarsest* octave, which is the binding one — every finer octave's
+        // two cells are a smaller fraction. A base octave holding four cells or
+        // fewer therefore has no window at all, which is a real statement about
+        // that material and not a limitation here.
+        let margin = 2.0 / span;
+        // Deliberately not clamped to `[0, 1]`: the baked tile is exactly
+        // periodic, so a uv outside the unit square is a legitimate way to name
+        // a point in it, and clamping would throw away most of the window
+        // whenever the folded offset is not near zero.
+        let lo = |o: f32| margin - o / span;
+        let hi = |o: f32| 1.0 - margin - o / span;
+        (
+            Vec2::new(lo(offset.x), lo(offset.y)),
+            Vec2::new(hi(offset.x), hi(offset.y)),
+        )
+    }
+
+    /// `log2` of the *quantized* lacunarity — the average octave-to-octave
+    /// frequency step the plan actually uses, not the authored number.
+    ///
+    /// Quantized, because that is what the shader is sampling: rounding each
+    /// span to a whole (even, on FCC) number bends the chain, and the live
+    /// octave window has to place its cutoff on the real one or it fades the
+    /// wrong octave. Single-octave specs report the authored value, since a
+    /// chain of one has no step to measure.
+    pub fn log2_lacunarity(&self) -> f32 {
+        let plan = self.octave_plan();
+        match plan.len() {
+            0 | 1 => self.lacunarity.max(1.0 + 1e-3).log2(),
+            n => (plan[n - 1].freq.max(1e-6).log2() / (n - 1) as f32).max(1e-3),
+        }
+    }
+
+    /// The octave window a live fragment covering `footprint` octave-0 cells
+    /// should evaluate — the CPU twin of `noise.wgsl`'s `live_octave_window`.
+    ///
+    /// Returns `(min, max)` for [`noise::octave_weight`]; `cell_pixels <= 0`
+    /// gives [`OCTAVE_LOD_OFF`](crate::noise::OCTAVE_LOD_OFF).
+    pub fn live_octave_window(&self, footprint: f32, cell_pixels: f32) -> (f32, f32) {
+        if cell_pixels <= 0.0 {
+            return OCTAVE_LOD_OFF;
+        }
+        let top = -(footprint * cell_pixels).max(1e-8).log2() / self.log2_lacunarity();
+        (top - 1.0, top)
+    }
+
     /// The largest relative distance between an octave's authored frequency and
     /// the quantized one it is actually baked at.
     ///
@@ -609,6 +753,46 @@ impl TextureSpec {
         self.ramp_at(self.postprocess(n))
     }
 
+    /// The **live** field at a world-space point: unbounded 3D noise, no tile,
+    /// no wrap, every octave at full weight (DESIGN §7's live path).
+    ///
+    /// The CPU twin of `shader.wgsl`'s `live_sample`, minus the boundary
+    /// gradient — that one differentiates against a pixel footprint and there
+    /// is no pixel here. Returns the value **before** contrast/brightness, like
+    /// [`sample_at`](TextureSpec::sample_at).
+    ///
+    /// Held against the shader by `tests/live_texture.rs`, and against the
+    /// *bake* by `the_live_field_and_the_baked_tile_are_one_field` below — the
+    /// second is the load-bearing one, because a live path that quietly sampled
+    /// a different field would still look fine on its own.
+    pub fn live_value_at(&self, world: Vec3) -> f32 {
+        let q = world * self.live_cells_per_metre() + self.live_seed_offset();
+        let lattice = self.noise.lattice();
+        let ret = self.noise.return_type();
+        let jitter = self.noise.jitter();
+
+        let mut accum = FbmAccum::new();
+        for octave in &self.octave_plan() {
+            let cell = noise::cellular(q * octave.freq, lattice, ret, jitter, Vec3::ZERO);
+            accum.push(
+                cell.value,
+                octave.amplitude,
+                octave.weight,
+                self.fractal,
+                self.weighted_strength,
+            );
+        }
+        accum.finish()
+    }
+
+    /// The live albedo at a world-space point: [`live_value_at`] through
+    /// contrast/brightness and the ramp.
+    ///
+    /// [`live_value_at`]: TextureSpec::live_value_at
+    pub fn live_albedo_at(&self, world: Vec3) -> Vec3 {
+        self.ramp_at(self.postprocess(self.live_value_at(world)))
+    }
+
     /// The baked normal at a tile coordinate, **packed** to `[0,1]` exactly as
     /// the texture stores it.
     pub fn packed_normal_at(&self, uv: Vec2) -> Vec3 {
@@ -672,14 +856,56 @@ pub struct TextureHandle(pub u64);
 /// scene loader fills it, and the renderer bakes from it lazily the first time
 /// a draw actually asks for the texture. Scene load therefore stays a
 /// device-free operation and the sim's tests never need an adapter.
+/// It also carries §7's live/baked switch, because the draw-list builder needs
+/// it and this is the one texture-shaped resource already in the world. That is
+/// a render-side flag living on a content resource, which is a small
+/// impurity — but the alternative is a second resource whose entire content is
+/// one bool that only ever changes with this one.
 #[derive(Resource, Default, Clone, Debug)]
 pub struct TextureLibrary {
     entries: Vec<(TextureHandle, TextureSpec, u32)>,
+    live: bool,
 }
 
 impl TextureLibrary {
     pub fn new() -> TextureLibrary {
         TextureLibrary::default()
+    }
+
+    /// Whether textured draws evaluate their spec per pixel (§7's live path)
+    /// instead of sampling its bake. Default `false` — baked is the baseline.
+    pub fn live_textures(&self) -> bool {
+        self.live
+    }
+
+    /// Switch every textured draw between §7's two modes.
+    ///
+    /// **This is v1's gate.** DESIGN §11 files live eval under the *perf* tier
+    /// and there is no perf probe yet, so what ships is the manual override the
+    /// probe would eventually drive: off by default, on when a host says so.
+    /// When the probe lands it sets this at startup and the API does not move.
+    ///
+    /// It is a per-frame decision and costs nothing to flip: the bind group is
+    /// the same either way ([`TextureUniform`](crate::bake::TextureUniform)
+    /// carries both modes' data), so only the pipeline changes — and both
+    /// pipelines are already in the variant cache after one frame of each.
+    ///
+    /// It changes **no simulation state**. Live evaluation happens in the
+    /// fragment shader; nothing in `FixedSim` can observe it, so a determinism
+    /// fingerprint cannot move when it flips.
+    ///
+    /// # It does not skip the bake
+    ///
+    /// A live draw still resolves its [`TextureHandle`] through the renderer's
+    /// texture registry, because that is what owns the `@group(2)` uniform the
+    /// live path reads its spec out of — so the bake still runs at load, and its
+    /// pixels go unread. That is deliberate rather than pending: the flag is a
+    /// per-frame decision, and a mode you can turn off has to have something to
+    /// turn off *to*. An app that knew it would never bake could skip the two
+    /// render passes and keep the uniform, but it would give up the toggle, and
+    /// the toggle is the whole of v1's gate.
+    pub fn set_live_textures(&mut self, live: bool) {
+        self.live = live;
     }
 
     /// Register `spec` at `resolution`, returning its handle. Idempotent.

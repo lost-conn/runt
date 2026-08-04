@@ -51,7 +51,9 @@ pub use audio::{
     AudioBackend, AudioEvent, AudioOut, Listener, ParamId, PatchId, RecordingBackend, Rolloff,
     SilentBackend, VoiceId,
 };
-pub use bake::{BakeUniform, GpuTexture, TextureBaker, TextureData, TextureRegistry};
+pub use bake::{
+    BakeUniform, GpuTexture, TextureBaker, TextureData, TextureRegistry, TextureUniform,
+};
 pub use cache::{CacheStats, CacheStore, GenCache, NoopCache};
 pub use camera::{Camera, FollowCamera};
 pub use collide::{

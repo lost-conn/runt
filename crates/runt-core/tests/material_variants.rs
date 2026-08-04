@@ -16,6 +16,14 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Five flags since §7's texture bits landed, so 32 pipelines rather than 16 —
 /// the count follows `FLAGS` on purpose, so adding a look extends the coverage
 /// automatically instead of leaving a new combination untested.
+///
+/// §7's live path did **not** add a flag — `LIVE_TEX` was reserved at bit 3
+/// from the start, which is exactly what reserving it was for — so the count
+/// stays 32. It does add four combinations the draw list will never emit
+/// (`TEXTURE | LIVE_TEX`, with and without the other two bits); they stay in
+/// this sweep on purpose. "Unreachable" is a property of `draw::resolve_variant`
+/// today and of nothing in the shader, and a key that cannot be built is a
+/// better guarantee than a key nobody currently builds.
 fn all_variants() -> Vec<MaterialVariant> {
     let bits = MaterialVariant::FLAGS.len();
     (0..(1u32 << bits)).map(MaterialVariant::from_bits).collect()
@@ -62,21 +70,22 @@ fn variant_keys_behave_as_bitflags() {
     assert!(!v.contains(MaterialVariant::RAMP));
     assert!(MaterialVariant::NONE.is_empty());
 
-    // Vertex colour, the baked texture (§7) and its normal map are implemented;
-    // the ramp and live-eval bits are declared but inert.
+    // Vertex colour, both texture paths (§7) and the normal map are
+    // implemented; only the ramp bit is declared and inert.
     assert_eq!(v.unimplemented(), MaterialVariant::NONE);
     assert_eq!(
         MaterialVariant::NORMAL_MAP.unimplemented(),
         MaterialVariant::NONE
     );
     assert_eq!(
+        MaterialVariant::LIVE_TEX.unimplemented(),
+        MaterialVariant::NONE,
+        "live eval landed; the bit is no longer reserved"
+    );
+    assert_eq!(
         (v | MaterialVariant::RAMP).unimplemented(),
         MaterialVariant::RAMP,
         "reserved bits must report as unimplemented, not silently pass"
-    );
-    assert_eq!(
-        MaterialVariant::LIVE_TEX.unimplemented(),
-        MaterialVariant::LIVE_TEX
     );
 
     // Bit positions are permanent — a cache key that meant one thing must never

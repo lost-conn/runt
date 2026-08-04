@@ -491,7 +491,17 @@ pub struct MaterialDesc {
     /// Reserved (§5).
     #[serde(default)]
     pub ramp: bool,
-    /// Reserved (§7).
+    /// Evaluate this material's texture per pixel instead of sampling its bake
+    /// (DESIGN §7's live path).
+    ///
+    /// Like [`normal_map`](MaterialDesc::normal_map) it is **only consulted
+    /// when `texture` names one** — there is nothing to evaluate otherwise, so
+    /// a textureless entity's variant key is untouched by this field existing.
+    ///
+    /// A scene file asking for live is a *request*; the render side decides
+    /// (`Engine::set_live_textures`, and eventually §11's perf probe), and it
+    /// can only ever say yes to more, never to less. See
+    /// [`draw::resolve_variant`](crate::draw::resolve_variant).
     #[serde(default)]
     pub live_texture: bool,
     /// Crinkle the shading normal with the texture's normal map.
@@ -530,7 +540,10 @@ impl MaterialDesc {
             (self.vertex_color, MaterialVariant::VERTEX_COLOR),
             (texture.is_some(), MaterialVariant::TEXTURE),
             (self.ramp, MaterialVariant::RAMP),
-            (self.live_texture, MaterialVariant::LIVE_TEX),
+            (
+                texture.is_some() && self.live_texture,
+                MaterialVariant::LIVE_TEX,
+            ),
             (
                 texture.is_some() && self.normal_map,
                 MaterialVariant::NORMAL_MAP,

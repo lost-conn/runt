@@ -4,6 +4,12 @@
 //! [`DrawItem`]s plus one [`FrameParams`], which is what keeps the GPU side
 //! testable, the ECS side GPU-free, and the sort order an ordinary unit test.
 //!
+//! The one decision this layer makes rather than copies is §7's live/baked
+//! variant bit — see [`resolve_variant`]. It belongs here because it is a
+//! *render* policy (DESIGN §11's gate) applied to a *declarative* material:
+//! putting it on `Material` would mean every entity carrying a copy of a
+//! host-wide switch, and flipping it would mean a world mutation.
+//!
 //! Sorting is by `(variant, texture, mesh, entity)`: variant first because a
 //! pipeline swap is the expensive state change, texture second because a
 //! bind-group swap is the next one, mesh third because vertex/index buffer
@@ -17,7 +23,7 @@ use glam::{Mat4, Vec4};
 use crate::ecs::{Interpolated, Lighting, MeshRef, Transform};
 use crate::material::{Material, MaterialVariant};
 use crate::registry::MeshHandle;
-use crate::texture::TextureHandle;
+use crate::texture::{TextureHandle, TextureLibrary};
 
 /// One indexed draw: which pipeline, which buffers, and the instance uniform to
 /// write for it.
@@ -92,17 +98,63 @@ pub fn build_draw_list(world: &mut World, alpha: f32) -> Vec<DrawItem> {
     extract_draw_list(&mut query, world, alpha)
 }
 
+/// Which variant a textured draw actually gets, once §7's live/baked gate has
+/// had its say (DESIGN §11: *gates select data and variants*).
+///
+/// [`TEXTURE`] and [`LIVE_TEX`] are **mutually exclusive on a draw**. Live
+/// evaluates the spec per pixel and never reads the bake, so a key carrying
+/// both would compile a pipeline half of which is unreachable — and would leave
+/// the sort order with two populations that are really one. Live wins when both
+/// are asked for, here and in the shader, so the resolution is the same wherever
+/// you look.
+///
+/// An **untextured** material is returned untouched. Its `TEXTURE` /
+/// `LIVE_TEX` bits (if a hand-built `Material` set them) are already inert —
+/// there is no handle to sample and no spec to evaluate, so the bind group is
+/// the 1×1 default either way — and rewriting them would make this function
+/// change the look of a draw it has no business having an opinion about.
+///
+/// [`TEXTURE`]: MaterialVariant::TEXTURE
+/// [`LIVE_TEX`]: MaterialVariant::LIVE_TEX
+pub fn resolve_variant(
+    variant: MaterialVariant,
+    textured: bool,
+    live_textures: bool,
+) -> MaterialVariant {
+    if !textured {
+        return variant;
+    }
+    let exclusive = MaterialVariant::TEXTURE.bits() | MaterialVariant::LIVE_TEX.bits();
+    // The gate is a promotion, not a mask: a material that asked for live in
+    // its scene file keeps it whether or not the host flipped the global
+    // switch. v1 has no perf probe, so there is no tier to demote against —
+    // when §11's probe lands, *it* becomes the thing that can say no, and the
+    // per-material request goes back to being a request.
+    let wants_live = live_textures || variant.contains(MaterialVariant::LIVE_TEX);
+    let mode = if wants_live {
+        MaterialVariant::LIVE_TEX
+    } else {
+        MaterialVariant::TEXTURE
+    };
+    MaterialVariant::from_bits((variant.bits() & !exclusive) | mode.bits())
+}
+
 /// As [`build_draw_list`], reusing a cached query state.
 pub fn extract_draw_list(
     query: &mut QueryState<DrawQuery>,
     world: &World,
     alpha: f32,
 ) -> Vec<DrawItem> {
+    // A world with no texture library (a bare `World` in a unit test) has no
+    // textures either, so the flag it would have carried cannot matter.
+    let live = world
+        .get_resource::<TextureLibrary>()
+        .is_some_and(TextureLibrary::live_textures);
     let mut items: Vec<DrawItem> = query
         .iter(world)
         .map(|(entity, mesh, material, transform, interpolated)| DrawItem {
             entity,
-            variant: material.variant,
+            variant: resolve_variant(material.variant, material.texture.is_some(), live),
             mesh: mesh.0,
             model: match interpolated {
                 Some(prev) => prev.blend(transform, alpha),

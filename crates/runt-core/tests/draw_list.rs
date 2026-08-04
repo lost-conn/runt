@@ -8,8 +8,9 @@
 
 use bevy_ecs::prelude::*;
 use glam::{Quat, Vec3, Vec4};
-use runt_core::draw::{build_draw_list, DrawItem};
+use runt_core::draw::{build_draw_list, resolve_variant, DrawItem};
 use runt_core::registry::MeshHandle;
+use runt_core::texture::{TextureHandle, TextureLibrary};
 use runt_core::{Interpolated, Material, MaterialVariant, MeshRef, Transform};
 
 /// Spawn a drawable with an explicit mesh handle and variant.
@@ -139,6 +140,130 @@ fn interpolated_entities_blend_and_the_rest_do_not() {
     for alpha in [0.0, 0.5, 1.0] {
         assert_eq!(at(&mut world, alpha, still), 0.0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// §7's live/baked gate
+// ---------------------------------------------------------------------------
+
+const TEX: MaterialVariant = MaterialVariant::TEXTURE;
+const LIVE: MaterialVariant = MaterialVariant::LIVE_TEX;
+const VC: MaterialVariant = MaterialVariant::VERTEX_COLOR;
+const NM: MaterialVariant = MaterialVariant::NORMAL_MAP;
+
+#[test]
+fn the_two_texture_paths_are_mutually_exclusive_on_a_draw() {
+    // Whatever goes in, exactly one of the two bits comes out — never both,
+    // never neither. Live evaluates the spec and never reads the bake, so a
+    // draw carrying both would be paying for a pipeline half of which is dead.
+    for authored in [
+        MaterialVariant::NONE,
+        TEX,
+        LIVE,
+        TEX | LIVE,
+        TEX | NM,
+        LIVE | NM,
+        TEX | LIVE | VC | NM,
+    ] {
+        for gate in [false, true] {
+            let got = resolve_variant(authored, true, gate);
+            assert!(
+                got.contains(TEX) != got.contains(LIVE),
+                "authored {:#07b} + gate {gate} gave {:#07b}",
+                authored.bits(),
+                got.bits()
+            );
+            // Everything else survives untouched.
+            let others = MaterialVariant::from_bits(
+                got.bits() & !(TEX.bits() | LIVE.bits()),
+            );
+            let authored_others = MaterialVariant::from_bits(
+                authored.bits() & !(TEX.bits() | LIVE.bits()),
+            );
+            assert_eq!(others, authored_others, "the gate touched an unrelated bit");
+        }
+    }
+}
+
+#[test]
+fn the_gate_promotes_but_a_material_that_asked_for_live_keeps_it() {
+    assert_eq!(resolve_variant(TEX | NM, true, false), TEX | NM);
+    assert_eq!(resolve_variant(TEX | NM, true, true), LIVE | NM);
+    // A scene file that asked for live is not demoted by the global default —
+    // v1 has no perf tier to demote *against* (DESIGN §11's probe is future
+    // work), so the gate can only ever say yes to more.
+    assert_eq!(resolve_variant(LIVE | NM, true, false), LIVE | NM);
+    assert_eq!(resolve_variant(LIVE | NM, true, true), LIVE | NM);
+}
+
+#[test]
+fn an_untextured_material_is_returned_untouched() {
+    // No handle means no bake to sample and no spec to evaluate; both bits are
+    // already inert, and rewriting them would be this function having an
+    // opinion about a draw it has no business touching.
+    for gate in [false, true] {
+        assert_eq!(resolve_variant(VC, false, gate), VC);
+        assert_eq!(resolve_variant(MaterialVariant::NONE, false, gate), MaterialVariant::NONE);
+        assert_eq!(resolve_variant(TEX | NM, false, gate), TEX | NM);
+    }
+}
+
+/// A textured drawable, plus a library the gate can be flipped on.
+fn textured_world(authored: MaterialVariant) -> World {
+    let mut world = World::new();
+    world.insert_resource(TextureLibrary::new());
+    world.spawn((
+        MeshRef(MeshHandle(1)),
+        Material {
+            base_color: Vec4::ONE,
+            params: Vec4::ZERO,
+            texture: Some(TextureHandle(0xABCD)),
+            variant: authored,
+        },
+        Transform::IDENTITY,
+    ));
+    world
+}
+
+#[test]
+fn the_toggle_switches_the_variant_bit_in_the_draw_list() {
+    let mut world = textured_world(TEX | NM);
+
+    let baked = build_draw_list(&mut world, 0.0);
+    assert_eq!(baked[0].variant, TEX | NM, "off is baked, and off is default");
+
+    world
+        .resource_mut::<TextureLibrary>()
+        .set_live_textures(true);
+    let live = build_draw_list(&mut world, 0.0);
+    assert_eq!(live[0].variant, LIVE | NM);
+
+    // …and back, byte for byte. The whole value of the toggle is that flipping
+    // it twice is a no-op, so an A/B comparison is comparing two renders of one
+    // scene rather than two scenes.
+    world
+        .resource_mut::<TextureLibrary>()
+        .set_live_textures(false);
+    assert_eq!(build_draw_list(&mut world, 0.0), baked);
+}
+
+#[test]
+fn a_world_with_no_texture_library_draws_baked() {
+    // A bare `World` (every unit test in this file) has no library and no
+    // textures, so the flag it would have carried cannot matter — but the
+    // extraction must not panic reaching for a resource that is not there.
+    let mut world = World::new();
+    world.spawn((
+        MeshRef(MeshHandle(1)),
+        Material {
+            base_color: Vec4::ONE,
+            params: Vec4::ZERO,
+            texture: Some(TextureHandle(7)),
+            variant: TEX,
+        },
+        Transform::IDENTITY,
+    ));
+    assert_eq!(build_draw_list(&mut world, 0.0)[0].variant, TEX);
 }
 
 #[test]
