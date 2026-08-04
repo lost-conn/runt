@@ -71,6 +71,30 @@
       }
     </style>
     <link data-trunk rel="rust" href="Cargo.toml" data-target-name="runt_ball" data-type="main" data-wasm-opt="s" />
+
+    <!-- Audio (DESIGN §8). Three files, none of them touched by wasm-bindgen:
+
+         · runt_audio_worklet.wasm    the synth — a raw cdylib with zero imports,
+                                      built by Trunk.toml's pre_build hook and
+                                      fetched lazily, on the first user gesture.
+         · runt-audio-processor.js    the AudioWorkletProcessor that hosts it.
+         · runt-audio.js              the main-thread loader, which compiles the
+                                      module and passes it through
+                                      processorOptions (structured-cloneable —
+                                      no SharedArrayBuffer, no COOP/COEP, which
+                                      is what lets this ship on GitHub Pages).
+
+         `copy-file` hrefs resolve relative to *this* file and land in dist with
+         unhashed names, so the relative URLs inside runt-audio.js hold.
+
+         The script tag is ordinary and synchronous, so `window.runtAudio` exists
+         before trunk's deferred module runs. Delete it and the game still works:
+         the Rust side finds no `window.runtAudio`, logs once, and installs the
+         silent backend. -->
+    <link data-trunk rel="copy-file" href="../../target/wasm32-unknown-unknown/wasm-worklet/runt_audio_worklet.wasm" />
+    <link data-trunk rel="copy-file" href="../../crates/runt-audio-worklet/web/runt-audio-processor.js" />
+    <link data-trunk rel="copy-file" href="../../crates/runt-app/web/runt-audio.js" />
+    <script src="runt-audio.js"></script>
   </head>
   <body>
     <div id="runt-status">runt ball</div>

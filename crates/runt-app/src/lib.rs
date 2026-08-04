@@ -38,6 +38,12 @@ use winit::window::{Window, WindowId};
 /// mapping without going through [`run_with`].
 pub mod input;
 
+/// The audio pump (DESIGN §8): a cpal stream natively, an `AudioWorklet` on web,
+/// and silence when a game does not ask for either.
+pub mod audio;
+
+pub use audio::AudioConfig;
+
 // ---------------------------------------------------------------------------
 // What to run
 // ---------------------------------------------------------------------------
@@ -75,6 +81,13 @@ pub struct RunConfig {
     /// the last word. Anything that must survive on web has to be written as it
     /// happens.
     pub on_exit: Option<SetupFn>,
+    /// Sound, or `None` for a silent program (DESIGN §8).
+    ///
+    /// Opt-in per program rather than per build: `runt-native` and the engine
+    /// demo leave it `None` and never open a device, `demo/ball` sets it and
+    /// gets the same [`AudioEvent`](runt_core::AudioEvent) stream pumped into
+    /// whatever the platform has. The engine cannot tell which it got.
+    pub audio: Option<AudioConfig>,
 }
 
 impl RunConfig {
@@ -86,6 +99,7 @@ impl RunConfig {
             quality: None,
             setup: None,
             on_exit: None,
+            audio: None,
         }
     }
 
@@ -109,6 +123,16 @@ impl RunConfig {
     /// See [`on_exit`](RunConfig::on_exit). Native only; ignored on web.
     pub fn with_on_exit(mut self, on_exit: impl FnOnce(&mut Sim) + 'static) -> RunConfig {
         self.on_exit = Some(Box::new(on_exit));
+        self
+    }
+
+    /// Play this program's audio through the platform's mixer (DESIGN §8).
+    ///
+    /// `bank` is a postcard-encoded `runt_audio::PatchBank` — bytes rather than
+    /// a type, because this crate's wasm build deliberately does not link the
+    /// synthesizer that would understand it.
+    pub fn with_audio(mut self, audio: AudioConfig) -> RunConfig {
+        self.audio = Some(audio);
         self
     }
 
@@ -146,6 +170,10 @@ struct Host {
     /// The last [`StatusLine`](runt_core::StatusLine) painted, so an unchanged
     /// line costs nothing per frame.
     shown_status: String,
+    /// Where sound goes (DESIGN §8). [`SilentBackend`](runt_core::SilentBackend)
+    /// for a program that asked for none — the engine cannot tell the
+    /// difference, and neither can a determinism test.
+    audio: Box<dyn runt_core::AudioBackend>,
 }
 
 impl Host {
@@ -216,6 +244,14 @@ impl Host {
             setup(engine.sim_mut());
         }
 
+        // After `setup`, so a game that builds its bank in the setup hook has
+        // already done so — and before the first frame, so no tick's events are
+        // dropped for want of a backend.
+        let audio = match &run.audio {
+            Some(config) => audio::start(config),
+            None => Box::new(runt_core::SilentBackend) as Box<dyn runt_core::AudioBackend>,
+        };
+
         let mut host = Host {
             window,
             surface,
@@ -227,6 +263,7 @@ impl Host {
             stick: input::VirtualStick::new(),
             title: run.title,
             shown_status: String::new(),
+            audio,
         };
         host.sync_status();
         Ok(host)
@@ -308,6 +345,12 @@ impl Host {
         // The host owns the clock; the engine is handed wall time and does its
         // own fixed-tick accounting (DESIGN §4).
         self.engine.update(self.start.elapsed().as_secs_f64());
+        // One submit per frame carrying however many ticks that frame ran, in
+        // tick order — the tick already batched them (DESIGN §8; see
+        // `runt_core::audio` for why the flush sits where it does). Before the
+        // render rather than after, so a sound is on its way while the picture
+        // is still being drawn.
+        self.engine.sim_mut().drain_audio(self.audio.as_mut());
         self.engine
             .render(&view, self.config.width, self.config.height);
 

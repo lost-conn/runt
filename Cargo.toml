@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/runt-mesh", "crates/runt-core", "crates/runt-app", "demo/*"]
+members = [
+    "crates/runt-mesh",
+    "crates/runt-core",
+    "crates/runt-audio",
+    "crates/runt-audio-worklet",
+    "crates/runt-app",
+    "demo/*",
+]
 # `cargo run` / `cargo build` from the root act on the player host.
 default-members = ["crates/runt-app"]
 
@@ -11,6 +18,14 @@ edition = "2021"
 [workspace.dependencies]
 runt-mesh = { path = "crates/runt-mesh" }
 runt-core = { path = "crates/runt-core" }
+runt-audio = { path = "crates/runt-audio" }
+
+# DESIGN §8. `default-features = false` + `std` is what the spike measured; the
+# extra features (fft/convolve) are reverb machinery we are explicitly not doing.
+fundsp = { version = "0.23", default-features = false, features = ["std"] }
+# The native audio device. 0.18, **not** the 0.15 every tutorial documents —
+# see `spikes/audio/FINDINGS.md` for the API deltas.
+cpal = "0.18"
 
 wgpu = "30"
 winit = "0.30"
@@ -34,3 +49,17 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 opt-level = "s"
 lto = true
 codegen-units = 1
+
+# The AudioWorklet module (`crates/runt-audio-worklet`) is downloaded before the
+# first sound and runs on the audio render thread, so it wants the opposite
+# trade from the rest of the wasm build: speed over size, and no unwinding
+# machinery at all (a panic in a worklet is unrecoverable regardless — the
+# processor is dead either way).
+#
+# It is a *profile* rather than settings on `[profile.release]` because
+# `panic = "abort"` there would break `cargo test --release` workspace-wide.
+[profile.wasm-worklet]
+inherits = "release"
+opt-level = 3
+panic = "abort"
+strip = true

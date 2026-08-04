@@ -13,6 +13,8 @@ use bytemuck::{Pod, Zeroable};
 pub use runt_mesh as mesh;
 use runt_mesh::MeshData;
 
+/// The sim-side audio seam (DESIGN §8). No synthesizer: see the module docs.
+pub mod audio;
 pub mod cache;
 pub mod camera;
 pub mod draw;
@@ -36,6 +38,10 @@ pub mod trace;
 /// [`material::BASE_SHADER`].
 pub const SKY_SHADER: &str = include_str!("sky.wgsl");
 
+pub use audio::{
+    AudioBackend, AudioEvent, AudioOut, Listener, ParamId, PatchId, RecordingBackend, Rolloff,
+    SilentBackend, VoiceId,
+};
 pub use cache::{CacheStats, CacheStore, GenCache, NoopCache};
 pub use camera::{Camera, FollowCamera};
 pub use draw::{DrawItem, FrameParams};

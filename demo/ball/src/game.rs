@@ -17,6 +17,7 @@
 //! roll_spin                       ├──▶ win_check         all collected → Won
 //! follow_camera  ◀────────────────┤    pickup_bob        cosmetic float
 //! propagate_transforms            └──  update_status     the "HUD"
+//! flush_audio    ◀──────── game_audio (after the camera; see `crate::audio`)
 //! advance_tick_count
 //! ```
 //!
@@ -53,6 +54,8 @@ use runt_core::ecs::{FixedTick, TerrainSurface, TickCount};
 use runt_core::physics::{self, Ball, OverlapEvent, Velocity};
 use runt_core::scene::LoadedScene;
 use runt_core::{camera, Input, Key, Sim, StatusLine, Transform};
+
+use crate::audio::{game_audio, GameAudio};
 
 /// The scene generator whose entities are collectibles. The one piece of shared
 /// vocabulary between `level1.ron` and this file.
@@ -262,6 +265,8 @@ pub fn setup(sim: &mut Sim) {
         tick_dt,
     });
 
+    sim.world_mut().insert_resource(GameAudio::default());
+
     // --- install the rules -------------------------------------------------
     //
     // See the module docs for why the chain sits exactly here.
@@ -279,6 +284,15 @@ pub fn setup(sim: &mut Sim) {
             .after(physics::resolve_overlaps)
             .after(physics::roll_spin)
             .before(camera::follow_camera),
+    );
+
+    // Sound goes *after* the camera has settled, so a pan is computed against
+    // this tick's viewpoint, and before the engine's `flush_audio` so the batch
+    // leaves on the tick that produced it. See `crate::audio`.
+    sim.fixed_sim_mut().add_systems(
+        game_audio
+            .after(camera::follow_camera)
+            .before(runt_core::audio::flush_audio),
     );
 }
 
@@ -328,10 +342,15 @@ fn terrain_floor(sim: &mut Sim) -> f32 {
 /// the reader's cursor guarantees each overlap is seen exactly once. The
 /// `collected` flag is the second guard, and the load-bearing one now that the
 /// entity survives being taken — see [`Pickup::collected`] for why it does.
+/// It also **records** what it took, for [`game_audio`] to place a sound at.
+/// The ring is about to be parked a kilometre underground, so the position has
+/// to be captured here or it is gone; and the sound cannot be emitted here,
+/// because the camera has not moved yet this tick (see [`crate::audio`]).
 pub fn collect_pickups(
     mut reader: MessageReader<OverlapEvent>,
     mut pickups: Query<(&mut Pickup, &mut Transform)>,
     mut state: ResMut<GameState>,
+    mut audio: ResMut<GameAudio>,
 ) {
     for event in reader.read() {
         if !event.trigger {
@@ -344,6 +363,7 @@ pub fn collect_pickups(
             continue; // Already taken; a parked ring cannot be scored twice.
         }
         pickup.collected = true;
+        audio.collected.push((transform.translation, state.score));
         transform.translation.y = HIDDEN_Y;
         state.score += 1;
     }

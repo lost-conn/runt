@@ -17,6 +17,10 @@ path = "src/main.rs"
 # crate is the wasm target and declares its own. See runt-app's `wasm-entry`.
 runt-app = { path = "../../crates/runt-app", default-features = false }
 runt-core.workspace = true
+# Default features only: the patch bank and its byte form. The game *describes*
+# its sounds; it never synthesizes them, so no fundsp lands in the game's wasm
+# module (DESIGN §8 — the synth is a separate module fetched on first sound).
+runt-audio.workspace = true
 bevy_ecs.workspace = true
 glam.workspace = true
 log.workspace = true

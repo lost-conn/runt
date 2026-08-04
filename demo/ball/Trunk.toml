@@ -7,3 +7,17 @@
 [build]
 target = "index.html"
 dist = "dist"
+
+# The AudioWorklet's wasm module (DESIGN §8) is a *second* wasm artifact trunk
+# knows nothing about: a raw `cdylib` with no wasm-bindgen glue, which trunk has
+# no rule for. So it is built here, before trunk's own build, and placed in
+# `dist/` by the `copy-file` links in index.html.
+#
+# This is the recipe verified in `spikes/audio/FINDINGS.md` ("Trunk integration").
+# Two gotchas it records are load-bearing: `copy-file` hrefs resolve relative to
+# index.html, and copied files keep **unhashed** names — which is what lets
+# `runt-audio.js` name `runt_audio_worklet.wasm` as a plain relative URL.
+[[hooks]]
+stage = "pre_build"
+command = "bash"
+command_arguments = ["build-worklet.sh"]

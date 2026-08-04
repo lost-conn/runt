@@ -181,6 +181,7 @@ impl Sim {
         world.insert_resource(MeshLibrary::new());
         world.insert_resource(Lighting::default());
         world.insert_resource(StatusLine::default());
+        world.insert_resource(crate::audio::AudioOut::new());
         world.insert_resource(quality);
         world.insert_resource(GenCache::new(cache));
         world.insert_resource(PendingScene(scene));
@@ -304,6 +305,46 @@ impl Sim {
             .get_resource::<StatusLine>()
             .map(|s| s.as_str())
             .unwrap_or("")
+    }
+
+    // -- audio (DESIGN §8) ---------------------------------------------------
+
+    /// The audio queue, for a host or a test.
+    ///
+    /// Game code reaches it as an ordinary `ResMut<AudioOut>` inside a `FixedSim`
+    /// system; this accessor is for the two places that live *outside* the tick.
+    pub fn audio_out(&self) -> &crate::audio::AudioOut {
+        self.world.resource::<crate::audio::AudioOut>()
+    }
+
+    pub fn audio_out_mut(&mut self) -> &mut crate::audio::AudioOut {
+        self.world.resource_mut::<crate::audio::AudioOut>().into_inner()
+    }
+
+    /// The `(tick, event)` pairs flushed and not yet drained.
+    ///
+    /// Tick-indexed on purpose: it lines up with an
+    /// [`InputTrace`](crate::InputTrace) without an off-by-one, which is what
+    /// makes "replay the trace, compare the audio log" a one-line assertion.
+    pub fn audio_events(&self) -> &[(u64, crate::audio::AudioEvent)] {
+        self.audio_out().outbox()
+    }
+
+    /// Hand everything the sim has produced to `backend` and clear the queue.
+    ///
+    /// The whole host-side audio API. Called once per frame, after
+    /// [`update`](Sim::update) — so one call carries however many ticks that
+    /// frame ran, in tick order, as a single batch.
+    pub fn drain_audio(&mut self, backend: &mut dyn crate::audio::AudioBackend) {
+        let events: Vec<crate::audio::AudioEvent> = self
+            .world
+            .resource_mut::<crate::audio::AudioOut>()
+            .drain()
+            .map(|(_, event)| event)
+            .collect();
+        if !events.is_empty() {
+            backend.submit(&events);
+        }
     }
 
     // -- input traces (DESIGN §4) -------------------------------------------

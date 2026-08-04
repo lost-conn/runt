@@ -22,6 +22,11 @@ wasm-entry = []
 
 [dependencies]
 runt-core.workspace = true
+# **Default features only here**: the wire codec and the patch bank, no fundsp.
+# The wasm build of this crate must not link a synthesizer — on web the synth is
+# a *separate* module the browser fetches on first sound (DESIGN §8). The native
+# target section below turns `dsp` on, because there the synth is in-process.
+runt-audio.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 glam.workspace = true
@@ -31,6 +36,8 @@ log.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster.workspace = true
 env_logger = "0.11"
+runt-audio = { workspace = true, features = ["dsp"] }
+cpal.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # The WebGL2 fallback lives with the host: it is a backend/presentation
@@ -41,3 +48,7 @@ wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
 console_log = "1"
 web-sys = { version = "0.3", features = ["Document", "Window", "Element", "HtmlElement", "Node"] }
+# The audio backend calls two functions on `window.runtAudio` (see
+# `web/runt-audio.js`). That needs `Reflect` and `Uint8Array` and nothing else —
+# no `AudioContext` bindings, because the browser plumbing is JavaScript.
+js-sys = "0.3"

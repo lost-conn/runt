@@ -504,6 +504,7 @@ pub fn post_sim_schedule() -> Schedule {
 /// roll_spin                 cosmetic ball rotation, reads velocity only (§9)
 /// follow_camera             cameras chase where things ended up
 /// propagate_transforms      local → world
+/// flush_audio               this tick's sound leaves, as one batch (§8)
 /// advance_tick_count        the tick is now complete
 /// ```
 ///
@@ -511,7 +512,11 @@ pub fn post_sim_schedule() -> Schedule {
 /// survives into the next one intact (see [`OverlapEvent`](crate::OverlapEvent));
 /// the integrator produces a position before the overlap pass corrects it;
 /// `roll_spin` reads the *final* velocity; cameras follow *after* the things they
-/// follow have moved, so a follow is never a tick behind its target.
+/// follow have moved, so a follow is never a tick behind its target; audio
+/// flushes after the camera has settled (so a pan is computed against this
+/// tick's pose) and before the tick counter turns over (so an event is stamped
+/// with the index of the tick that produced it) — see
+/// [`crate::audio`] for the full argument.
 ///
 /// Every physics system is a no-op on a world with no `Ball` and no collider —
 /// `assets/demo.ron` has neither, and `tests/physics.rs` pins its tick output to
@@ -527,6 +532,7 @@ pub fn fixed_sim_schedule() -> Schedule {
             crate::physics::roll_spin,
             crate::camera::follow_camera,
             propagate_transforms,
+            crate::audio::flush_audio,
             advance_tick_count,
         )
             .chain(),

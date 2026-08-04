@@ -1,0 +1,17 @@
+[package]
+name = "runt-audio-worklet"
+version.workspace = true
+edition.workspace = true
+description = "runt audio: the raw C-ABI wasm module that runs inside an AudioWorklet (DESIGN §8)."
+
+# A raw `cdylib`: **no wasm-bindgen**, no JS glue, a C ABI over linear memory.
+#
+# `AudioWorkletGlobalScope` has no `TextEncoder`/`TextDecoder` and no `fetch`.
+# wasm-bindgen's glue needs the first two (rustwasm/wasm-bindgen#2367, open since
+# 2020) and its `--target web` loader needs the third; exporting plain functions
+# needs none of them. See `spikes/audio/FINDINGS.md`.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+runt-audio = { workspace = true, features = ["dsp"] }
