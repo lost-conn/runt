@@ -197,8 +197,10 @@ dumb pump.
   of them and has zero imports. The main thread compiles the module and
   passes the structured-cloneable `WebAssembly.Module` through
   `processorOptions`; the processor instantiates it synchronously and is live
-  on its first `process()`. Measured: 200 KB raw / 84 KB gzip, 6 ms compile,
-  fetched lazily on first audio start.
+  on its first `process()`. Measured: 200 KB raw / 84 KB gzip at two patch
+  models (2026-08-01); 343 KB / 125 KB gzip at six (with drums + additive
+  bass, 2026-08-04) — still fetched lazily on first audio start, never
+  blocking first frame.
 - **Cost:** 12 µs per 128-frame stereo quantum in wasm (1.19× native) against
   a 2 666 µs budget — 0.45% of one core. Voice count is bounded by design
   taste, not CPU.
