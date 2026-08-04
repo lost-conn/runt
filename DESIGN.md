@@ -351,13 +351,22 @@ demo's pinned 240-tick fingerprint is unchanged.
   rays. The scan is linear over an `Entity`-sorted `Vec`; the one method it goes
   through is the seam a spatial index would replace.
 
+- **Trimesh colliders (static only), 2026-08-04 — the full-port revisit.**
+  Previously refused here; green-lit for the playground port. CSG-baked
+  geometry has no analytic form, and the N64 port's verdict (triangle soup +
+  BVH for the static world, `dimenshift64/src/world.c`) was already
+  acknowledged as the endgame. Constraints that keep §9's properties intact:
+  a `Trimesh` is immutable after `build()` (welded verts, degenerates
+  dropped); the BVH is built once at load, deterministically — median split
+  on the longest centroid axis, stable sort keyed `(axis value, tri index)`,
+  fixed leaf size; traversal uses a fixed-size explicit stack and visits
+  children in a fixed order; contact and raycast ties resolve to the lowest
+  triangle index. Contacts feed the same `Contact` pipeline —
+  classification, snap, and `floor_stop_on_slope` are untouched downstream.
+  Dynamic trimeshes, convex decomposition, and mesh-vs-mesh stay refused.
+
 **Still refused:**
 
-- **Trimesh / BVH colliders.** Acknowledged as the eventual need — the shipped
-  `playground.tscn` is CSG-baked and cannot port without either re-authoring or
-  triangle-soup collision, and the N64 port of the same game (`dimenshift64`)
-  landed on exactly that. Deliberately out of scope: the PoC level is 16 boxes
-  and 5 pitched ramps, which convex primitives cover exactly.
 - Dynamic-dynamic response, impulse exchange, stacking, joints. A solve moves
   the character and only the character; the other body never learns it was hit.
 - Swept CCD. Motion is capped per sub-step at the moving shape's radius, which is
