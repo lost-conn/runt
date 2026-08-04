@@ -12,27 +12,55 @@
 //! bytes*, which is the §8 property that matters: "the same patch code serves
 //! both hosts; the host is a dumb pump".
 //!
-//! ## Fixed slots, no allocation after construction
+//! ## Fixed slots, no allocation after construction — **per model** since 2026-08-04
 //!
-//! [`MAX_VOICES`] slots are built up front, and **each slot owns one of every
-//! patch model**. A `Play` re-triggers the model it needs; it never builds a
-//! graph, so nothing on the audio thread allocates. The cost is memory —
-//! 16 plucks and 16 drones resident whether or not they sound — and it is small,
-//! because fundsp's wavetable oscillators share one global table (the per-voice
-//! state is a phase and a filter).
+//! Slots are built up front and a `Play` never builds a graph, so nothing on the
+//! audio thread allocates. That invariant has not changed. What changed is *how
+//! the slots are laid out*, and the old comment here explained a rule that no
+//! longer holds, so here is the new one and why.
 //!
-//! The alternative, boxing a fresh patch per note, is the ordinary way to do
-//! this and it allocates on the audio thread. That is the thing you are not
-//! allowed to do.
+//! **Before:** [`MAX_VOICES`] slots, each owning **one of every patch model** —
+//! 16 plucks and 16 drones resident, 32 graphs. That is fine at two models. The
+//! comment it replaced said as much, and it also said "adding a third model is
+//! one variant in [`crate::bank`]", which was true right up until there were
+//! six. Six models times sixteen slots is **96 resident graphs**, of which 80 can
+//! never sound at once, and one of the new models ([`Bass`]) carries twelve sine
+//! oscillators — so the old rule would have built 192 oscillators to play a
+//! bassline that is nearly monophonic.
+//!
+//! **Now:** slots are **grouped by model**, each slot owns exactly one engine,
+//! and each group is sized for what that model is *for*:
+//!
+//! | group | slots | why that number |
+//! |---|---|---|
+//! | [`PLUCK_VOICES`] | 16 | the SFX workhorse; unchanged, so every steal test still means what it did |
+//! | [`DRONE_VOICES`] | 2 | ambience is one voice and a crossfade |
+//! | [`KICK_VOICES`] | 2 | a kick that overlaps itself is a flam, and one is the most a bar wants |
+//! | [`SNARE_VOICES`] | 2 | same |
+//! | [`HIHAT_VOICES`] | 3 | hats are the fastest thing a pattern plays |
+//! | [`BASS_VOICES`] | 3 | a bassline is monophonic plus its own release tail |
+//!
+//! 28 graphs, not 96 — and *fewer than the 32 the two-model version built*,
+//! while playing four more instruments. The groups are contiguous index ranges
+//! in one flat `Vec`, so [`slot_voice`](VoicePool::slot_voice) and
+//! [`active_voices`](VoicePool::active_voices) still see one pool.
+//!
+//! ### What this costs
+//!
+//! A model can only steal from **its own group**. A burst of sixteen plucks can
+//! no longer eat the bassline, which is the point; but sixteen is now a hard
+//! ceiling on simultaneous plucks rather than a soft one that could borrow an
+//! idle drone slot. Given that the previous arrangement's ceiling was also
+//! sixteen — `MAX_VOICES` slots, one voice each — nothing actually got smaller.
 //!
 //! ## Stealing
 //!
-//! With every slot busy, a new `Play` takes the **quietest** one, ties going to
-//! the **oldest**. Quietest first because the discontinuity a steal introduces is
-//! proportional to what was cut: taking the voice already 60 dB down is nearly
-//! inaudible, while taking the loudest is a click by construction. Age only
-//! breaks ties, which in practice means a rank of silent-but-not-yet-freed
-//! voices is consumed oldest-first.
+//! With every slot **in a model's group** busy, a new `Play` takes the
+//! **quietest** one, ties going to the **oldest**. Quietest first because the
+//! discontinuity a steal introduces is proportional to what was cut: taking the
+//! voice already 60 dB down is nearly inaudible, while taking the loudest is a
+//! click by construction. Age only breaks ties, which in practice means a rank of
+//! silent-but-not-yet-freed voices is consumed oldest-first.
 //!
 //! ## The master bus
 //!
@@ -50,14 +78,42 @@
 
 use crate::bank::{PatchBank, PatchDef, PatchId};
 use crate::params::ParamId;
-use crate::patches::{Drone, Pluck};
+use crate::patches::{Bass, Drone, Hihat, Kick, Pluck, Snare};
 use crate::wire::{Event, VoiceId, EVENT_SIZE};
 
-/// Simultaneous voices. DESIGN §8: *"voice count is bounded by design taste, not
-/// CPU"* — the spike measured 0.45% of a core for one patch, so sixteen is
-/// roughly 7% in the worst case and the real limit is how much a listener can
-/// pick apart.
-pub const MAX_VOICES: usize = 16;
+/// Simultaneous [`Pluck`] voices — the SFX group.
+///
+/// DESIGN §8: *"voice count is bounded by design taste, not CPU"* — the spike
+/// measured 0.45% of a core for one patch, so sixteen is roughly 7% in the worst
+/// case and the real limit is how much a listener can pick apart. This is the
+/// number `MAX_VOICES` used to be, kept because nothing about the SFX case
+/// changed when the music models arrived.
+pub const PLUCK_VOICES: usize = 16;
+
+/// Simultaneous [`Drone`] voices. Ambience is one voice; two exist so a
+/// crossfade between two beds is expressible.
+pub const DRONE_VOICES: usize = 2;
+
+/// Simultaneous [`Kick`] voices.
+pub const KICK_VOICES: usize = 2;
+
+/// Simultaneous [`Snare`] voices.
+pub const SNARE_VOICES: usize = 2;
+
+/// Simultaneous [`Hihat`] voices. The fastest thing a drum pattern plays, so it
+/// gets the largest percussion group.
+pub const HIHAT_VOICES: usize = 3;
+
+/// Simultaneous [`Bass`] voices. A bassline is monophonic; the extra two carry
+/// the release tail of the note before and one steal's worth of slack.
+pub const BASS_VOICES: usize = 3;
+
+/// Total slots in the pool — the sum of the per-model groups above.
+///
+/// Note what this is *not*: it is no longer the number of voices a single patch
+/// can sound at once. See the module docs.
+pub const MAX_VOICES: usize =
+    PLUCK_VOICES + DRONE_VOICES + KICK_VOICES + SNARE_VOICES + HIHAT_VOICES + BASS_VOICES;
 
 /// Largest block a single `render` call will accept. A worklet quantum is 128;
 /// cpal asks for whatever the device wants, commonly 512 or 1024. Requests above
@@ -72,17 +128,122 @@ pub const MAX_BLOCK: usize = 1024;
 /// prevent, not a feature.
 const SMOOTH_SECS: f32 = 0.005;
 
-/// Which model a slot is currently running.
+/// Which synthesis model a group of slots runs.
+///
+/// One-to-one with [`PatchDef`], and the *only* mapping between a preset and the
+/// slots that can play it. `Model::of` is total, so a new `PatchDef` variant is a
+/// compile error here rather than a sound that silently never plays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+pub enum Model {
     Pluck,
     Drone,
+    Kick,
+    Snare,
+    Hihat,
+    Bass,
+}
+
+impl Model {
+    /// Which model a preset needs.
+    fn of(def: &PatchDef) -> Model {
+        match def {
+            PatchDef::Pluck(_) => Model::Pluck,
+            PatchDef::Drone(_) => Model::Drone,
+            PatchDef::Kick(_) => Model::Kick,
+            PatchDef::Snare(_) => Model::Snare,
+            PatchDef::Hihat(_) => Model::Hihat,
+            PatchDef::Bass(_) => Model::Bass,
+        }
+    }
+
+    /// How many slots this model owns.
+    pub fn voices(self) -> usize {
+        match self {
+            Model::Pluck => PLUCK_VOICES,
+            Model::Drone => DRONE_VOICES,
+            Model::Kick => KICK_VOICES,
+            Model::Snare => SNARE_VOICES,
+            Model::Hihat => HIHAT_VOICES,
+            Model::Bass => BASS_VOICES,
+        }
+    }
+
+    /// The contiguous slot range this model owns, in pool order.
+    ///
+    /// Written as a running sum rather than as six literals so the constants
+    /// above are the single source of truth and a group cannot be resized
+    /// without the ranges following.
+    pub fn slots(self) -> std::ops::Range<usize> {
+        let mut start = 0;
+        for model in Model::ALL {
+            if model == self {
+                return start..start + model.voices();
+            }
+            start += model.voices();
+        }
+        unreachable!("Model::ALL contains every model")
+    }
+
+    /// Every model, in pool order. Layout order *is* this order.
+    pub const ALL: [Model; 6] = [
+        Model::Pluck,
+        Model::Drone,
+        Model::Kick,
+        Model::Snare,
+        Model::Hihat,
+        Model::Bass,
+    ];
+}
+
+/// The one engine a slot owns. Exactly one model per slot — see the module docs
+/// on why this is no longer "one of each".
+enum Engine {
+    Pluck(Pluck),
+    Drone(Drone),
+    Kick(Kick),
+    Snare(Snare),
+    Hihat(Hihat),
+    Bass(Bass),
+}
+
+impl Engine {
+    fn new(model: Model, sample_rate: f32) -> Engine {
+        match model {
+            Model::Pluck => Engine::Pluck(Pluck::new(sample_rate)),
+            Model::Drone => Engine::Drone(Drone::new(sample_rate)),
+            Model::Kick => Engine::Kick(Kick::new(sample_rate)),
+            Model::Snare => Engine::Snare(Snare::new(sample_rate)),
+            Model::Hihat => Engine::Hihat(Hihat::new(sample_rate)),
+            Model::Bass => Engine::Bass(Bass::new(sample_rate)),
+        }
+    }
+}
+
+/// Dispatch one method name across every engine variant.
+///
+/// Six models times five forwarded methods is thirty match arms that say the
+/// same thing; this says it once. Written as a macro rather than as a trait
+/// object because the patches are concrete types with no shared vtable and
+/// adding one would put a dynamic call in the per-sample path.
+macro_rules! engine {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            Engine::Pluck(p) => p.$method($($arg),*),
+            Engine::Drone(p) => p.$method($($arg),*),
+            Engine::Kick(p) => p.$method($($arg),*),
+            Engine::Snare(p) => p.$method($($arg),*),
+            Engine::Hihat(p) => p.$method($($arg),*),
+            Engine::Bass(p) => p.$method($($arg),*),
+        }
+    };
 }
 
 struct Slot {
-    pluck: Pluck,
-    drone: Drone,
-    kind: Option<Kind>,
+    engine: Engine,
+    /// Whether this slot has ever been triggered. Distinct from
+    /// `engine.active()` only for the very first note, and needed because an
+    /// untriggered engine's `active()` is already `false`.
+    armed: bool,
     voice: VoiceId,
     /// Monotonic counter at the moment this slot was last triggered. Ties in the
     /// steal ranking break towards the smaller value.
@@ -97,11 +258,10 @@ struct Slot {
 }
 
 impl Slot {
-    fn new(sample_rate: f32) -> Slot {
+    fn new(model: Model, sample_rate: f32) -> Slot {
         Slot {
-            pluck: Pluck::new(sample_rate),
-            drone: Drone::new(sample_rate),
-            kind: None,
+            engine: Engine::new(model, sample_rate),
+            armed: false,
             voice: VoiceId(u32::MAX),
             started: 0,
             gain: 1.0,
@@ -112,21 +272,17 @@ impl Slot {
     }
 
     fn active(&self) -> bool {
-        match self.kind {
-            Some(Kind::Pluck) => self.pluck.active(),
-            Some(Kind::Drone) => self.drone.active(),
-            None => false,
-        }
+        self.armed && engine!(&self.engine, active)
     }
 
     /// Envelope level scaled by the slot's own gain — the quantity a steal
     /// compares, and therefore a measure of *how loud this voice is right now*
     /// rather than of how loud it was asked to be.
     fn level(&self) -> f32 {
-        let env = match self.kind {
-            Some(Kind::Pluck) => self.pluck.level(),
-            Some(Kind::Drone) => self.drone.level(),
-            None => 0.0,
+        let env = if self.armed {
+            engine!(&self.engine, level)
+        } else {
+            0.0
         };
         env * self.gain
     }
@@ -144,10 +300,10 @@ impl Slot {
     }
 
     fn render_mono(&mut self, out: &mut [f32]) {
-        match self.kind {
-            Some(Kind::Pluck) => self.pluck.render_mono(out),
-            Some(Kind::Drone) => self.drone.render_mono(out),
-            None => out.fill(0.0),
+        if self.armed {
+            engine!(&mut self.engine, render_mono, out)
+        } else {
+            out.fill(0.0)
         }
     }
 
@@ -155,20 +311,32 @@ impl Slot {
         match id {
             ParamId::GAIN => self.set_mix(value, self.pan, false),
             ParamId::PAN => self.set_mix(self.gain, value, false),
-            _ => match self.kind {
-                Some(Kind::Pluck) => self.pluck.set_param(id, value),
-                Some(Kind::Drone) => self.drone.set_param(id, value),
-                None => {}
-            },
+            _ if self.armed => engine!(&mut self.engine, set_param, id, value),
+            _ => {}
         }
     }
 
     fn release(&mut self) {
-        match self.kind {
-            Some(Kind::Pluck) => self.pluck.release(),
-            Some(Kind::Drone) => self.drone.release(),
-            None => {}
+        if self.armed {
+            engine!(&mut self.engine, release)
         }
+    }
+
+    /// Aim this slot at `def`. The engine and the preset are guaranteed to
+    /// agree, because [`Model::of`] chose the group this slot lives in.
+    fn trigger(&mut self, def: &PatchDef, seed: u64) {
+        match (&mut self.engine, def) {
+            (Engine::Pluck(e), PatchDef::Pluck(p)) => e.trigger(p, seed),
+            (Engine::Drone(e), PatchDef::Drone(p)) => e.trigger(p, seed),
+            (Engine::Kick(e), PatchDef::Kick(p)) => e.trigger(p, seed),
+            (Engine::Snare(e), PatchDef::Snare(p)) => e.trigger(p, seed),
+            (Engine::Hihat(e), PatchDef::Hihat(p)) => e.trigger(p, seed),
+            (Engine::Bass(e), PatchDef::Bass(p)) => e.trigger(p, seed),
+            // Unreachable by construction; silence rather than a panic, because
+            // this code runs where a panic is a dead audio thread.
+            _ => return,
+        }
+        self.armed = true;
     }
 }
 
@@ -218,7 +386,12 @@ impl VoicePool {
         } else {
             crate::REFERENCE_SAMPLE_RATE as f32
         };
-        let slots = (0..MAX_VOICES).map(|_| Slot::new(sample_rate)).collect();
+        // Grouped by model, in `Model::ALL` order — which is the order
+        // `Model::slots` computes its ranges in, so the two cannot disagree.
+        let slots = Model::ALL
+            .iter()
+            .flat_map(|model| (0..model.voices()).map(|_| Slot::new(*model, sample_rate)))
+            .collect();
         VoicePool {
             slots,
             bank,
@@ -336,11 +509,14 @@ impl VoicePool {
     }
 
     fn play(&mut self, voice: VoiceId, patch: PatchId, seed: u64, gain: f32, pan: f32) {
+        // Cloned because `claim` takes `&mut self`. A `PatchDef` is a few dozen
+        // bytes plus one small `Vec` and this is once per note, not per sample;
+        // the alternative is an index dance that buys nothing measurable.
         let Some(def) = self.bank.get(patch).cloned() else {
             self.stats.dropped_unknown += 1;
             return;
         };
-        let (at, stolen) = self.claim();
+        let (at, stolen) = self.claim(Model::of(&def));
         self.age += 1;
 
         let slot = &mut self.slots[at];
@@ -350,16 +526,7 @@ impl VoicePool {
         // from whatever the slot's previous occupant was doing is audible and
         // wrong.
         slot.set_mix(gain, pan, true);
-        match def {
-            PatchDef::Pluck(params) => {
-                slot.kind = Some(Kind::Pluck);
-                slot.pluck.trigger(&params, seed);
-            }
-            PatchDef::Drone(params) => {
-                slot.kind = Some(Kind::Drone);
-                slot.drone.trigger(&params, seed);
-            }
-        }
+        slot.trigger(&def, seed);
 
         self.stats.played += 1;
         if stolen {
@@ -367,16 +534,20 @@ impl VoicePool {
         }
     }
 
-    /// A slot to start a voice in, and whether taking it interrupted one.
+    /// A slot to start a `model` voice in, and whether taking it interrupted one.
     ///
-    /// Free slots first (in order, so a quiet scene reuses slot 0 and the rest
-    /// stay cold); otherwise the quietest, ties to the oldest.
-    fn claim(&mut self) -> (usize, bool) {
-        if let Some(at) = self.slots.iter().position(|s| !s.active()) {
-            return (at, false);
+    /// The search is confined to `model`'s group (module docs): a hi-hat cannot
+    /// take the bass's slot, however quiet the bass happens to be. Within the
+    /// group the policy is unchanged — free slots first (in order, so a quiet
+    /// scene reuses the first slot and the rest stay cold); otherwise the
+    /// quietest, ties to the oldest.
+    fn claim(&mut self, model: Model) -> (usize, bool) {
+        let group = model.slots();
+        if let Some(at) = self.slots[group.clone()].iter().position(|s| !s.active()) {
+            return (group.start + at, false);
         }
-        let mut best = 0usize;
-        for at in 1..self.slots.len() {
+        let mut best = group.start;
+        for at in group.start + 1..group.end {
             let (a, b) = (&self.slots[at], &self.slots[best]);
             let quieter = a.level() < b.level();
             let tied_and_older = a.level() == b.level() && a.started < b.started;

@@ -26,7 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::params::{DroneParams, PluckParams};
+use crate::params::{BassParams, DroneParams, HihatParams, KickParams, PluckParams, SnareParams};
 
 /// A patch preset's stable identity: FNV-1a over its name.
 ///
@@ -57,14 +57,60 @@ impl PatchId {
 ///
 /// An enum rather than a trait object because a bank is *data* — it round-trips
 /// through postcard and (phase 4) through scene RON, and a serialized trait
-/// object is a plugin system nobody asked for. Adding a third model is one
-/// variant here, one arm in [`crate::voice`], and one struct in
-/// [`crate::params`].
+/// object is a plugin system nobody asked for. Adding a model is one variant
+/// here, one arm in [`crate::voice`], and one struct in [`crate::params`].
+///
+/// ## The variant order is the wire format
+///
+/// postcard encodes an enum as a leading varint discriminant, so **the order of
+/// these variants is part of the bank's byte format** and new models go on the
+/// end, never in the middle. That rule is what makes growing this enum a
+/// non-breaking change: a bank written before [`Kick`](PatchDef::Kick) existed
+/// still decodes byte-for-byte, because nothing it contains moved.
+///
+/// The reverse direction — a *newer* bank handed to an *older* synth — fails
+/// cleanly rather than silently: postcard rejects the unknown discriminant,
+/// `PatchBank::from_bytes` returns `Err`, and `runt_audio_load_bank` returns 0
+/// instead of panicking on an audio thread. There is no version field because
+/// there is nothing a version field could do that this does not already do; see
+/// [`SCHEMA`](PatchBank::SCHEMA) for the number a test pins.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub enum PatchDef {
     Pluck(PluckParams),
     Drone(DroneParams),
+    // -- appended 2026-08-04 with the BGM models. Order is the wire format. --
+    Kick(KickParams),
+    Snare(SnareParams),
+    Hihat(HihatParams),
+    Bass(BassParams),
+}
+
+impl PatchDef {
+    /// The postcard discriminant this variant serializes as. Pinned by
+    /// `tests/wire.rs`; see the type docs for why it is load-bearing.
+    pub fn discriminant(&self) -> u32 {
+        match self {
+            PatchDef::Pluck(_) => 0,
+            PatchDef::Drone(_) => 1,
+            PatchDef::Kick(_) => 2,
+            PatchDef::Snare(_) => 3,
+            PatchDef::Hihat(_) => 4,
+            PatchDef::Bass(_) => 5,
+        }
+    }
+
+    /// A short stable name for the model, for diagnostics and test messages.
+    pub fn model(&self) -> &'static str {
+        match self {
+            PatchDef::Pluck(_) => "pluck",
+            PatchDef::Drone(_) => "drone",
+            PatchDef::Kick(_) => "kick",
+            PatchDef::Snare(_) => "snare",
+            PatchDef::Hihat(_) => "hihat",
+            PatchDef::Bass(_) => "bass",
+        }
+    }
 }
 
 /// One named entry.
@@ -86,6 +132,15 @@ pub struct PatchBank {
 }
 
 impl PatchBank {
+    /// How many synthesis models [`PatchDef`] knows about.
+    ///
+    /// This is the closest thing to a bank *version* the format has, and it is
+    /// deliberately a count rather than a number somebody has to remember to
+    /// bump: adding a variant changes it, and `tests/wire.rs` pins both it and
+    /// the individual discriminants. Read [`PatchDef`] for why appending is
+    /// enough and a version field would not add anything.
+    pub const SCHEMA: u32 = 6;
+
     pub fn new() -> PatchBank {
         PatchBank::default()
     }
@@ -93,10 +148,18 @@ impl PatchBank {
     /// The presets this crate ships. Generic on purpose — a game names its own
     /// (`"pickup"`, `"thud"`) with its own params; these are what the
     /// `audition` example plays and what the tests measure.
+    ///
+    /// One per model, so `builtin()` doubles as the answer to "does every
+    /// variant in [`PatchDef`] actually make a sound" — which is what
+    /// `tests/patches.rs` asks it.
     pub fn builtin() -> PatchBank {
         PatchBank::new()
             .with("pluck", PatchDef::Pluck(PluckParams::default()))
             .with("drone", PatchDef::Drone(DroneParams::default()))
+            .with("kick", PatchDef::Kick(KickParams::default()))
+            .with("snare", PatchDef::Snare(SnareParams::default()))
+            .with("hihat", PatchDef::Hihat(HihatParams::default()))
+            .with("bass", PatchDef::Bass(BassParams::default()))
     }
 
     /// Builder form of [`insert`](PatchBank::insert).

@@ -11,10 +11,20 @@
 //!
 //! | | default build | `--features dsp` |
 //! |---|---|---|
-//! | [`PatchId`], [`PatchBank`], [`PluckParams`], [`DroneParams`] | yes | yes |
+//! | [`PatchId`], [`PatchBank`], and the six `*Params` structs | yes | yes |
 //! | [`wire`] — the byte codec both hosts speak | yes | yes |
 //! | [`analyze`] — measurement, for tests with no speakers | yes | yes |
 //! | [`VoicePool`], the fundsp graphs | — | yes |
+//!
+//! ## The six models
+//!
+//! [`PluckParams`] and [`DroneParams`] are the originals — a pitched ping and a
+//! pad, which is what a demo with a pickup sound needs. [`KickParams`],
+//! [`SnareParams`], [`HihatParams`] and [`BassParams`] arrived with the
+//! 3dimenshift port's background music, which needs instruments a pluck cannot
+//! impersonate: a four-octave pitch drop, a noise burst, and a note that
+//! *sustains until it is told to stop*. Each is documented against the
+//! `addons/godot_synth` patch it was read out of.
 //!
 //! The default half has two dependencies (serde, postcard) and no float DSP in
 //! it at all. That is deliberate: `demo/ball`'s **wasm module** links the
@@ -65,13 +75,15 @@ pub mod patches;
 pub mod voice;
 
 pub use bank::{PatchBank, PatchDef, PatchEntry, PatchId};
-pub use params::{DroneParams, ParamId, PluckParams};
+pub use params::{
+    BassParams, DroneParams, HihatParams, KickParams, ParamId, PluckParams, SnareParams,
+};
 pub use wire::{Event, VoiceId, EVENT_SIZE};
 
 #[cfg(feature = "dsp")]
 pub use voice::{
-    canonical_render, canonical_script, hash_samples, render_offline, PoolStats, VoicePool,
-    MAX_VOICES,
+    canonical_render, canonical_script, hash_samples, render_offline, Model, PoolStats, VoicePool,
+    BASS_VOICES, DRONE_VOICES, HIHAT_VOICES, KICK_VOICES, MAX_VOICES, PLUCK_VOICES, SNARE_VOICES,
 };
 
 /// The sample rate everything offline is measured at. Real hosts use whatever

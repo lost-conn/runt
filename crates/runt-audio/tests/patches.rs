@@ -1,4 +1,4 @@
-//! What the two patches actually *sound* like, measured rather than heard.
+//! What the six patches actually *sound* like, measured rather than heard.
 //!
 //! Nobody can listen on a CI box, so this is the spike's `analyze` command
 //! turned into assertions: does the pluck land on the pitch the params asked
@@ -19,7 +19,8 @@ use runt_audio::analyze;
 use runt_audio::voice::render_offline;
 use runt_audio::wire::{Event, VoiceId};
 use runt_audio::{
-    DroneParams, PatchBank, PatchDef, PatchId, PluckParams, VoicePool, REFERENCE_SAMPLE_RATE,
+    BassParams, DroneParams, HihatParams, KickParams, PatchBank, PatchDef, PatchId, PluckParams,
+    SnareParams, VoicePool, REFERENCE_SAMPLE_RATE,
 };
 
 const SR: f32 = REFERENCE_SAMPLE_RATE as f32;
@@ -354,4 +355,347 @@ fn a_live_cutoff_change_takes_effect_mid_stream() {
         analyze::spectral_centroid(&after[8_000..], SR),
     );
     assert!(a > b * 4.0, "the edit must be audible ({b} → {a})");
+}
+
+// ---------------------------------------------------------------------------
+// Kick, Snare, Hihat, Bass — the BGM models
+// ---------------------------------------------------------------------------
+//
+// These four came from `addons/godot_synth`'s patches (see each `*Params` doc)
+// and each has one property that *is* the instrument. A kick without a pitch
+// drop is a low sine; a snare without noise is a tom; a hi-hat that is not
+// bright is a shaker; a bass that does not sustain is a pluck. So that is what
+// each test below measures — the defining property, in the direction that makes
+// it defining, never a float to four places.
+
+/// Mono samples in `[from_s, to_s)` of a rendered stereo buffer.
+fn window(buf: &[f32], from_s: f32, to_s: f32) -> Vec<f32> {
+    let frame = |s: f32| ((s * SR) as usize * 2).min(buf.len());
+    analyze::to_mono(&buf[frame(from_s)..frame(to_s)])
+}
+
+#[test]
+fn the_kick_starts_high_and_lands_on_its_note() {
+    // `pitch_drop_semitones` is the whole instrument. 36 semitones is three
+    // octaves, so the first few milliseconds sit at 8x the destination and the
+    // tail sits on it. The click is off: this measurement is about the body, and
+    // a noise burst is exactly what a pitch tracker cannot read.
+    let params = KickParams {
+        base_hz: 55.0,
+        pitch_drop_semitones: 36.0,
+        pitch_drop_s: 0.08,
+        triangle_gain: 0.0,
+        click_gain: 0.0,
+        decay_s: 0.6,
+        ..KickParams::default()
+    };
+    let buf = strike(PatchDef::Kick(params), 1, 24_000);
+
+    // 5–15 ms: the sweep has fallen a little from 440 Hz but is still up there.
+    let early = analyze::detect_pitch(&window(&buf, 0.005, 0.015), SR, 40.0, 1200.0);
+    // 200–400 ms: long past the 80 ms sweep, so this is the note itself.
+    let late = analyze::detect_pitch(&window(&buf, 0.20, 0.40), SR, 30.0, 1200.0);
+
+    println!("kick: early {early:.1} Hz, late {late:.1} Hz");
+    assert!(
+        early > late * 4.0,
+        "the drop must be audible as a drop (early {early:.1}, late {late:.1})"
+    );
+    assert!(
+        (late - 55.0).abs() < 55.0 * 0.08,
+        "and it must land on base_hz, not near it (got {late:.1})"
+    );
+}
+
+#[test]
+fn the_kicks_click_is_the_only_thing_it_has_above_a_kilohertz() {
+    // The click is this crate's addition, not Godot's (`kick.tres` is
+    // `noise_mix = 0`), and it exists so a 55 Hz drum survives a laptop speaker.
+    // What it must not do is change the body — so measure only the top end.
+    let quiet = KickParams {
+        click_gain: 0.0,
+        triangle_gain: 0.0,
+        ..KickParams::default()
+    };
+    let loud = KickParams {
+        click_gain: 1.0,
+        ..quiet.clone()
+    };
+
+    let without = strike(PatchDef::Kick(quiet), 3, 12_000);
+    let with = strike(PatchDef::Kick(loud), 3, 12_000);
+
+    // The measurement window is the *click's* window. `click_decay_s` is 4 ms by
+    // default and the body rings for 280, so averaging over 30 ms would dilute a
+    // real difference into a 1.5x one — which is what the first version of this
+    // test measured before the window was tightened to match the thing measured.
+    let top = |buf: &[f32]| analyze::band_energy(&window(buf, 0.0, 0.006), SR, 1500.0, 9000.0);
+    let (a, b) = (top(&without), top(&with));
+    println!("kick click (first 6 ms): {a:.6} -> {b:.6}");
+    assert!(b > a * 3.0, "the click must add real high end ({a:.6} -> {b:.6})");
+
+    // …and it is over almost immediately: nothing of it survives to 200 ms.
+    let tail_a = analyze::band_energy(&window(&without, 0.2, 0.3), SR, 1500.0, 9000.0);
+    let tail_b = analyze::band_energy(&window(&with, 0.2, 0.3), SR, 1500.0, 9000.0);
+    assert!(
+        tail_b < tail_a * 2.0 + 1e-6,
+        "the click must not still be ringing at 200 ms ({tail_a:.8} vs {tail_b:.8})"
+    );
+}
+
+#[test]
+fn the_snare_is_a_tuned_body_when_the_mix_says_body_and_noise_when_it_says_noise() {
+    // `noise_mix` is Godot's crossfade (`synth_engine.gd:744`) and it is the
+    // parameter that decides whether this patch is a snare or a tom. Both ends
+    // of it are measurable and they are measurable in *different* ways, which is
+    // the point: a body has a pitch, and noise has a spectrum.
+    let base = SnareParams {
+        base_hz: 200.0,
+        pitch_drop_semitones: 0.0, // a fixed pitch, so the tracker has one answer
+        decay_s: 0.5,
+        cutoff_hz: 8000.0,
+        ..SnareParams::default()
+    };
+
+    let body_only = strike(
+        PatchDef::Snare(SnareParams {
+            noise_mix: 0.0,
+            ..base.clone()
+        }),
+        5,
+        24_000,
+    );
+    let pitch = analyze::detect_pitch(&window(&body_only, 0.02, 0.30), SR, 80.0, 900.0);
+    println!("snare body pitch: {pitch:.1} Hz");
+    assert!(
+        (pitch - 200.0).abs() < 200.0 * 0.05,
+        "the body is four partials on base_hz (got {pitch:.1})"
+    );
+
+    // The noise half: white noise is flat, four partials of a 200 Hz tone are
+    // not, so the high/low ratio has to climb monotonically with the mix.
+    let mut previous = 0.0f32;
+    for mix in [0.0f32, 0.35, 0.7, 1.0] {
+        let buf = strike(
+            PatchDef::Snare(SnareParams {
+                noise_mix: mix,
+                ..base.clone()
+            }),
+            5,
+            12_000,
+        );
+        let brightness = analyze::brightness(&window(&buf, 0.0, 0.15), SR);
+        println!("snare noise_mix {mix:.2}: brightness {brightness:.4}");
+        assert!(
+            brightness > previous,
+            "more noise must mean more top end ({mix}: {brightness:.4} vs {previous:.4})"
+        );
+        previous = brightness;
+    }
+}
+
+#[test]
+fn the_hihat_is_the_brightest_thing_in_the_kit_and_the_shortest() {
+    // Two claims, and the ordering one is the interesting half: "bright" is only
+    // meaningful next to the two drums it shares a bar with.
+    let kick = strike(PatchDef::Kick(KickParams::default()), 9, 24_000);
+    let snare = strike(PatchDef::Snare(SnareParams::default()), 9, 24_000);
+    let hihat = strike(PatchDef::Hihat(HihatParams::default()), 9, 24_000);
+
+    let centroid = |buf: &[f32]| analyze::spectral_centroid(&window(buf, 0.0, 0.06), SR);
+    let (k, s, h) = (centroid(&kick), centroid(&snare), centroid(&hihat));
+    println!("centroid: kick {k:.0} Hz, snare {s:.0} Hz, hihat {h:.0} Hz");
+    assert!(k < s, "a kick is darker than a snare ({k:.0} < {s:.0})");
+    assert!(s < h, "and a snare is darker than a hat ({s:.0} < {h:.0})");
+    assert!(h > 3000.0, "a closed hat lives in the top octaves (got {h:.0})");
+
+    // Short: the default `decay_s` is 60 ms, so nothing survives to 300 ms.
+    let head = analyze::rms(&window(&hihat, 0.0, 0.03));
+    let tail = analyze::rms(&window(&hihat, 0.3, 0.4));
+    println!("hihat rms: {head:.5} -> {tail:.8}");
+    assert!(head > 0.01, "a hat has to be audible at all (got {head:.5})");
+    assert!(tail < head * 1e-3, "and gone by 300 ms ({tail:.8})");
+}
+
+#[test]
+fn the_hihat_has_no_pitch_and_says_so() {
+    // `HihatParams` documents that PITCH is ignored, because Godot's hat is
+    // `noise_mix = 1.0` and has no oscillator to retune. A test rather than a
+    // comment, because "silently ignored" is exactly the kind of claim that rots.
+    let bank = bank_of(PatchDef::Hihat(HihatParams::default()));
+    let script = |pitch: f32| {
+        vec![
+            (
+                0,
+                Event::Play {
+                    voice: VoiceId(0),
+                    patch: ONE,
+                    seed: 4,
+                    gain: 1.0,
+                    pan: 0.0,
+                },
+            ),
+            (
+                0,
+                Event::SetParam {
+                    voice: VoiceId(0),
+                    id: runt_audio::ParamId::PITCH,
+                    value: pitch,
+                },
+            ),
+        ]
+    };
+    let a = render_offline(&bank, &script(1.0), 6_000, 128, SR);
+    let b = render_offline(&bank, &script(4.0), 6_000, 128, SR);
+    assert_eq!(a, b, "a hat two octaves up must be the same hat");
+}
+
+#[test]
+fn the_bass_holds_at_its_sustain_level_and_plays_the_note_it_was_given() {
+    // The property no other model in this crate has. `sustain: 0.6` means the
+    // envelope settles at 60 % of its peak and stays there — not "decays
+    // slowly", which is what a `Pluck` with a long `decay_s` would give.
+    let params = BassParams {
+        base_hz: 73.42, // D2
+        jitter_semitones: 0.0,
+        pitch_drop_semitones: 0.0,
+        sustain: 0.6,
+        phaser_depth: 0.0, // the sweep is measured separately; here it is noise
+        // …and so is the unison. Two stacks two cents apart beat against each
+        // other at f * (2^(2/1200) - 1) ~= 0.085 Hz — a twelve-second cycle,
+        // which is real, wanted, and completely swamps a "is the level flat"
+        // measurement taken over three seconds. Turn it off to measure the
+        // envelope; `the_bass_unison_beats` measures it on its own.
+        unison_cents: 0.0,
+        ..BassParams::default()
+    };
+    let buf = strike(PatchDef::Bass(params), 2, 48_000 * 3);
+
+    let pitch = analyze::detect_pitch(&window(&buf, 0.5, 1.0), SR, 40.0, 500.0);
+    println!("bass pitch: {pitch:.2} Hz");
+    assert!(
+        (pitch - 73.42).abs() < 73.42 * 0.04,
+        "the additive stack's fundamental is base_hz (got {pitch:.2})"
+    );
+
+    let peak = analyze::rms(&window(&buf, 0.0, 0.05));
+    let held = analyze::rms(&window(&buf, 1.0, 1.5));
+    let later = analyze::rms(&window(&buf, 2.4, 2.9));
+    println!("bass rms: peak {peak:.4}, 1 s {held:.4}, 2.5 s {later:.4}");
+    assert!(held > peak * 0.35, "it must still be there at a second");
+    assert!(
+        (later / held - 1.0).abs() < 0.05,
+        "and flat between one and two and a half ({held:.4} vs {later:.4})"
+    );
+}
+
+#[test]
+fn the_bass_phaser_sweeps_and_does_nothing_at_zero_depth() {
+    // `phaser_depth` is Godot's `AudioEffectPhaser.depth`. Its audible signature
+    // is a slow *amplitude* wobble as the notches move through the harmonics —
+    // so measure the spread of short-window RMS across two LFO periods, which is
+    // flat on a sustaining note and is not flat once the notches move.
+    let dry = BassParams {
+        jitter_semitones: 0.0,
+        phaser_depth: 0.0,
+        phaser_rate_hz: 0.5,
+        // The unison beat is a second slow amplitude modulator (see
+        // `the_bass_unison_beats`); with it on, "the level wobbles" would not
+        // isolate the phaser.
+        unison_cents: 0.0,
+        ..BassParams::default()
+    };
+    let wet = BassParams {
+        phaser_depth: 0.7,
+        ..dry.clone()
+    };
+
+    let spread = |params: BassParams| {
+        let buf = strike(PatchDef::Bass(params), 2, 48_000 * 4);
+        // Windows over 0.5–4.0 s: past the attack, across two 2 s LFO cycles.
+        let levels: Vec<f32> = (0..14)
+            .map(|i| {
+                let from = 0.5 + i as f32 * 0.25;
+                analyze::rms(&window(&buf, from, from + 0.25))
+            })
+            .collect();
+        let mean = levels.iter().sum::<f32>() / levels.len() as f32;
+        let hi = levels.iter().cloned().fold(0.0f32, f32::max);
+        let lo = levels.iter().cloned().fold(f32::MAX, f32::min);
+        (hi - lo) / mean.max(1e-9)
+    };
+
+    let flat = spread(dry);
+    let swept = spread(wet);
+    println!("bass phaser: dry spread {flat:.4}, wet spread {swept:.4}");
+    assert!(flat < 0.02, "a sustaining note with no phaser is flat ({flat:.4})");
+    assert!(
+        swept > flat * 5.0 && swept > 0.05,
+        "the phaser must actually sweep ({flat:.4} -> {swept:.4})"
+    );
+}
+
+#[test]
+fn the_bass_pitch_drop_is_a_pluck_and_not_a_glissando() {
+    // Godot's `bass.tres` drops 5 semitones over 34 ms — short enough to read as
+    // an attack transient rather than as a slide. Both halves of that are
+    // measurable: the start is sharp, and by 100 ms it is over.
+    let params = BassParams {
+        base_hz: 73.42,
+        // One partial, no unison: an additive stack whose second partial is at
+        // 0.65 is exactly the signal an autocorrelation tracker reports an
+        // octave high on (see `analyze::detect_pitch`'s "octave trap"), and this
+        // test is about the sweep, not about the tracker.
+        partials: vec![1.0],
+        unison_cents: 0.0,
+        jitter_semitones: 0.0,
+        pitch_drop_semitones: 5.0,
+        pitch_drop_s: 0.034,
+        phaser_depth: 0.0,
+        ..BassParams::default()
+    };
+    let buf = strike(PatchDef::Bass(params), 2, 48_000);
+    let early = analyze::detect_pitch(&window(&buf, 0.0, 0.02), SR, 40.0, 500.0);
+    let late = analyze::detect_pitch(&window(&buf, 0.2, 0.6), SR, 40.0, 500.0);
+    println!("bass drop: {early:.2} -> {late:.2} Hz");
+    assert!(early > late * 1.10, "five semitones is 33 % ({early:.2} -> {late:.2})");
+    assert!((late - 73.42).abs() < 73.42 * 0.04, "and it lands (got {late:.2})");
+}
+
+#[test]
+fn the_bass_unison_beats() {
+    // `unison_cents` is Godot's `detune_voices = 2` / `detune_cents = 2.0`, and
+    // what two cents *does* is put a slow beat on a held note: two tones a
+    // ratio r apart beat at `f * (r - 1)`, which at D2 and two cents is about
+    // 0.085 Hz — a twelve-second cycle. Two other tests turn it off to measure
+    // something else; this one is why it is there.
+    let held = |cents: f32| {
+        let buf = strike(
+            PatchDef::Bass(BassParams {
+                base_hz: 73.42,
+                jitter_semitones: 0.0,
+                pitch_drop_semitones: 0.0,
+                phaser_depth: 0.0,
+                unison_cents: cents,
+                ..BassParams::default()
+            }),
+            2,
+            48_000 * 6,
+        );
+        let levels: Vec<f32> = (0..10)
+            .map(|i| {
+                let from = 1.0 + i as f32 * 0.5;
+                analyze::rms(&window(&buf, from, from + 0.5))
+            })
+            .collect();
+        let hi = levels.iter().cloned().fold(0.0f32, f32::max);
+        let lo = levels.iter().cloned().fold(f32::MAX, f32::min);
+        (hi - lo) / hi.max(1e-9)
+    };
+
+    let single = held(0.0);
+    let unison = held(2.0);
+    println!("bass unison: 0 cents {single:.4}, 2 cents {unison:.4}");
+    assert!(single < 0.02, "one stack holds a flat level ({single:.4})");
+    assert!(unison > 0.05, "two cents apart, it breathes ({unison:.4})");
 }

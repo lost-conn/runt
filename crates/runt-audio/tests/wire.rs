@@ -8,7 +8,7 @@
 
 use runt_audio::params::ParamId;
 use runt_audio::wire::{self, Event, VoiceId, EVENT_SIZE};
-use runt_audio::PatchId;
+use runt_audio::{PatchBank, PatchDef, PatchId};
 
 #[test]
 fn the_record_is_thirty_two_little_endian_bytes() {
@@ -102,4 +102,104 @@ fn patch_ids_are_the_fnv_of_the_name() {
     assert_eq!(PatchId::new("pluck"), PatchId(0x980a_104d_ddba_6b6a));
     assert_eq!(PatchId::new("drone"), PatchId(0x6d09_40c9_3eca_e8d1));
     assert_ne!(PatchId::new("pluck"), PatchId::new("drone"));
+}
+
+// ---------------------------------------------------------------------------
+// The bank's schema
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_patch_def_discriminants_are_the_bank_format_and_do_not_move() {
+    // postcard writes an enum as a leading varint discriminant, so the *order*
+    // of `PatchDef`'s variants is part of the bank's byte format. New models go
+    // on the end; inserting one in the middle silently reinterprets every bank
+    // ever written. This is the test that turns that from a convention into a
+    // rule — and it is why there is no version field (see `PatchDef`'s docs).
+    use runt_audio::{
+        BassParams, DroneParams, HihatParams, KickParams, PluckParams, SnareParams,
+    };
+    let expected = [
+        (0u32, PatchDef::Pluck(PluckParams::default()), "pluck"),
+        (1, PatchDef::Drone(DroneParams::default()), "drone"),
+        (2, PatchDef::Kick(KickParams::default()), "kick"),
+        (3, PatchDef::Snare(SnareParams::default()), "snare"),
+        (4, PatchDef::Hihat(HihatParams::default()), "hihat"),
+        (5, PatchDef::Bass(BassParams::default()), "bass"),
+    ];
+    for (index, def, model) in &expected {
+        assert_eq!(def.discriminant(), *index, "{model} moved");
+        assert_eq!(def.model(), *model);
+        // …and the claim is about the *bytes*, so check them: a one-entry bank
+        // encodes as [count][name len][name][discriminant][params…].
+        let bytes = PatchBank::new()
+            .with("x", def.clone())
+            .to_bytes()
+            .expect("encode");
+        assert_eq!(bytes[0], 1, "one entry");
+        assert_eq!(&bytes[1..3], b"\x01x", "the name, length-prefixed");
+        assert_eq!(bytes[3] as u32, *index, "{model}'s discriminant on the wire");
+    }
+    assert_eq!(
+        PatchBank::SCHEMA as usize,
+        expected.len(),
+        "SCHEMA counts the models"
+    );
+}
+
+#[test]
+fn a_bank_written_before_the_music_models_still_decodes() {
+    // The forward-compatibility half, from the other side: appending variants
+    // must not change what an *existing* blob means. Rather than paste a hex
+    // dump that nobody can check, this reconstructs the pre-BGM schema as a
+    // shadow enum — two variants, exactly what `PatchDef` was — serializes a
+    // bank with it, and hands the bytes to the real decoder.
+    use runt_audio::{DroneParams, PluckParams};
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    enum OldPatchDef {
+        Pluck(PluckParams),
+        Drone(DroneParams),
+    }
+    #[derive(Serialize)]
+    struct OldEntry {
+        name: String,
+        def: OldPatchDef,
+    }
+    #[derive(Serialize)]
+    struct OldBank {
+        entries: Vec<OldEntry>,
+    }
+
+    // Sorted by `PatchId`, which is the invariant `PatchBank::insert` maintains
+    // and which `get` binary-searches on.
+    let mut entries = vec![
+        ("drone", OldPatchDef::Drone(DroneParams::default())),
+        ("pluck", OldPatchDef::Pluck(PluckParams::default())),
+    ];
+    entries.sort_by_key(|(name, _)| PatchId::new(name));
+    let old = OldBank {
+        entries: entries
+            .into_iter()
+            .map(|(name, def)| OldEntry {
+                name: name.to_string(),
+                def,
+            })
+            .collect(),
+    };
+    let bytes = postcard::to_stdvec(&old).expect("encode with the old schema");
+
+    let decoded = PatchBank::from_bytes(&bytes).expect("a pre-BGM bank must still decode");
+    assert_eq!(decoded.len(), 2);
+    assert_eq!(
+        decoded.get_by_name("pluck"),
+        Some(&PatchDef::Pluck(PluckParams::default())),
+        "the old Pluck bytes still mean Pluck"
+    );
+    assert_eq!(
+        decoded.get_by_name("drone"),
+        Some(&PatchDef::Drone(DroneParams::default())),
+    );
+    // …and it round-trips back to the same bytes, so nothing shifted.
+    assert_eq!(decoded.to_bytes().expect("re-encode"), bytes);
 }

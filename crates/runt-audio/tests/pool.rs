@@ -12,7 +12,7 @@
 
 use runt_audio::analyze;
 use runt_audio::params::ParamId;
-use runt_audio::voice::MAX_VOICES;
+use runt_audio::voice::{Model, MAX_VOICES, PLUCK_VOICES};
 use runt_audio::wire::{self, Event, VoiceId};
 use runt_audio::{PatchBank, PatchId, VoicePool, REFERENCE_SAMPLE_RATE};
 
@@ -81,25 +81,25 @@ fn the_pool_fills_to_its_cap_and_then_steals_the_quietest() {
     // Sixteen voices at descending gains. Voice 0 is the quietest by a factor of
     // sixteen, so once the envelopes have moved it is unambiguously the one a
     // steal should take.
-    for i in 0..MAX_VOICES as u32 {
+    for i in 0..PLUCK_VOICES as u32 {
         p.apply(play(i, PLUCK, i as u64, 0.05 + i as f32 * 0.06, 0.0));
     }
-    assert_eq!(p.active_voices(), MAX_VOICES);
+    assert_eq!(p.active_voices(), PLUCK_VOICES);
     render(&mut p, 2_400); // 50 ms: past every attack, before any decay is done
 
-    for i in 0..MAX_VOICES as u32 {
+    for i in 0..PLUCK_VOICES as u32 {
         assert!(p.is_playing(VoiceId(i)), "voice {i} should still be sounding");
     }
 
     p.apply(play(99, PLUCK, 99, 1.0, 0.0));
     assert_eq!(p.stats().stolen, 1);
-    assert_eq!(p.active_voices(), MAX_VOICES, "the cap is a cap");
+    assert_eq!(p.active_voices(), PLUCK_VOICES, "the cap is a cap");
     assert!(p.is_playing(VoiceId(99)));
     assert!(
         !p.is_playing(VoiceId(0)),
         "the quietest voice is the one that should have been taken"
     );
-    for i in 1..MAX_VOICES as u32 {
+    for i in 1..PLUCK_VOICES as u32 {
         assert!(p.is_playing(VoiceId(i)), "voice {i} was not the quietest");
     }
 }
@@ -109,7 +109,7 @@ fn a_tie_on_loudness_goes_to_the_oldest() {
     let mut p = pool();
     // Identical gains and identical seeds → identical levels at every sample, so
     // only the age tiebreak can decide. Voice 0 was triggered first.
-    for i in 0..MAX_VOICES as u32 {
+    for i in 0..PLUCK_VOICES as u32 {
         p.apply(play(i, PLUCK, 7, 1.0, 0.0));
     }
     render(&mut p, 2_400);
@@ -121,7 +121,7 @@ fn a_tie_on_loudness_goes_to_the_oldest() {
 #[test]
 fn a_free_slot_is_always_preferred_to_a_steal() {
     let mut p = pool();
-    for i in 0..MAX_VOICES as u32 {
+    for i in 0..PLUCK_VOICES as u32 {
         p.apply(play(i, PLUCK, i as u64, 1.0, 0.0));
     }
     render(&mut p, 96_000); // everything decays away
@@ -138,7 +138,7 @@ fn a_free_slot_is_always_preferred_to_a_steal() {
 fn no_sample_leaves_the_bus_outside_plus_or_minus_one() {
     let mut p = pool();
     p.set_master_gain(8.0); // the hard cap on master gain
-    for i in 0..MAX_VOICES as u32 {
+    for i in 0..PLUCK_VOICES as u32 {
         // Sixteen voices at four times unity, deliberately absurd.
         p.apply(play(i, PLUCK, i as u64, 4.0, 0.0));
     }
@@ -367,4 +367,134 @@ fn a_block_larger_than_the_internal_maximum_still_renders() {
     p.render_interleaved(&mut out);
     assert!(analyze::rms(&out) > 0.0);
     assert_eq!(analyze::anomalies(&out), (0, 0));
+}
+
+// ---------------------------------------------------------------------------
+// Per-model slot groups (the 2026-08-04 restructure — see `voice.rs` docs)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_groups_tile_the_pool_exactly_once() {
+    // `Model::slots` is computed as a running sum over `Model::ALL`, so the only
+    // way it can be wrong is if it stops being a partition. Assert that
+    // directly: every slot belongs to exactly one model, and every model's range
+    // is the size it claims.
+    let mut owner: Vec<Option<Model>> = vec![None; MAX_VOICES];
+    for model in Model::ALL {
+        let range = model.slots();
+        assert_eq!(range.len(), model.voices(), "{model:?} range vs voices()");
+        for at in range {
+            assert!(owner[at].is_none(), "slot {at} claimed twice");
+            owner[at] = Some(model);
+        }
+    }
+    assert!(owner.iter().all(Option::is_some), "a slot belongs to nobody");
+}
+
+#[test]
+fn the_restructure_costs_fewer_graphs_than_the_arrangement_it_replaced() {
+    // The whole argument for grouping. The old rule was MAX_VOICES slots each
+    // owning one of every model; with six models that is 96 engines. This is the
+    // number that has to stay small, and it is smaller than the *two*-model
+    // version's 32.
+    let one_of_each = 16 * Model::ALL.len();
+    // 16 slots x 2 models is what the pool built before the music models
+    // arrived; `one_of_each` is what the *old rule* would build now.
+    let two_model_pool = 16 * 2;
+    assert_eq!(MAX_VOICES, 28);
+    assert!(MAX_VOICES < one_of_each / 3, "{MAX_VOICES} vs {one_of_each}");
+    assert!(
+        MAX_VOICES < two_model_pool,
+        "{MAX_VOICES} is not fewer than the {two_model_pool} the two-model pool built"
+    );
+}
+
+#[test]
+fn a_drum_burst_cannot_steal_the_bass() {
+    // The reason grouping exists. A hi-hat pattern firing far more notes than it
+    // has slots must not be able to interrupt a bass note that is sustaining
+    // underneath it — under the old flat pool it eventually would have.
+    let mut p = pool();
+    p.apply(play(1, PatchId::new("bass"), 0, 0.8, 0.0));
+    render(&mut p, 4_800);
+    assert!(p.is_playing(VoiceId(1)), "the bass is sustaining");
+
+    for i in 0..64u32 {
+        p.apply(play(100 + i, PatchId::new("hihat"), i as u64, 1.0, 0.0));
+        render(&mut p, 128);
+    }
+
+    assert!(
+        p.is_playing(VoiceId(1)),
+        "64 hats stole {} voices and the bass must not be one of them",
+        p.stats().stolen
+    );
+    assert!(p.stats().stolen > 0, "this test is only meaningful if hats did steal");
+}
+
+#[test]
+fn every_model_in_the_builtin_bank_makes_a_sound_and_frees_its_slot() {
+    // `PatchBank::builtin()` ships one preset per `PatchDef` variant, so this is
+    // the check that a newly added variant was wired all the way through: bank →
+    // `Model::of` → a slot group → an engine that renders.
+    for name in ["pluck", "drone", "kick", "snare", "hihat", "bass"] {
+        let mut p = pool();
+        p.apply(play(0, PatchId::new(name), 7, 1.0, 0.0));
+        assert_eq!(p.stats().dropped_unknown, 0, "{name} is not in the bank");
+        assert_eq!(p.active_voices(), 1, "{name} did not start");
+
+        let buf = render(&mut p, 24_000);
+        assert!(analyze::rms(&buf) > 1e-4, "{name} rendered silence");
+        assert_eq!(analyze::anomalies(&buf), (0, 0), "{name} produced bad floats");
+        assert!(analyze::peak(&buf) <= 1.0, "{name} left the bus");
+
+        // Everything but the two sustaining models ends on its own.
+        p.apply(Event::Stop { voice: VoiceId(0) });
+        render(&mut p, 48_000 * 3);
+        assert_eq!(p.active_voices(), 0, "{name} never freed its slot");
+    }
+}
+
+#[test]
+fn a_bass_sustains_until_it_is_stopped_and_then_releases() {
+    // The property no other model in the crate has, and the reason `Bass` exists:
+    // a sequencer notates a note's *end*, and only a sustain stage can honour it.
+    let mut p = pool();
+    p.apply(play(1, PatchId::new("bass"), 0, 0.8, 0.0));
+    render(&mut p, 48_000 * 2);
+    assert_eq!(p.active_voices(), 1, "a bass note holds");
+
+    p.apply(Event::Stop { voice: VoiceId(1) });
+    render(&mut p, 48_000);
+    assert_eq!(p.active_voices(), 0, "and releases when told to");
+}
+
+#[test]
+fn the_music_models_survive_a_saturated_pool_without_clipping_or_nan() {
+    // Every group full at once, which is what a bar of BGM plus an SFX burst
+    // looks like. The limiter bound and the NaN guard are the two claims the
+    // whole mixer rests on and they have to hold for the new models too.
+    let mut p = pool();
+    p.set_master_gain(4.0);
+    let mut voice = 0u32;
+    for (name, count) in [
+        ("pluck", PLUCK_VOICES),
+        ("drone", 2),
+        ("kick", 2),
+        ("snare", 2),
+        ("hihat", 3),
+        ("bass", 3),
+    ] {
+        for i in 0..count {
+            p.apply(play(voice, PatchId::new(name), i as u64, 2.0, 0.0));
+            voice += 1;
+        }
+    }
+    assert_eq!(p.active_voices(), MAX_VOICES, "every group is full");
+
+    let buf = render(&mut p, 48_000);
+    assert!(analyze::peak(&buf) <= 1.0, "peak {}", analyze::peak(&buf));
+    assert_eq!(analyze::anomalies(&buf), (0, 0));
+    assert_eq!(p.stats().nan_guarded, 0);
+    assert!(p.stats().peak_pre_clip > 1.0, "the limiter had work to do");
 }

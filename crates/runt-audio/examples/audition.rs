@@ -32,9 +32,14 @@ fn main() {
         None | Some("play") => play(),
         Some("wav") => wav(args.get(1).map(String::as_str).unwrap_or("audition.wav")),
         Some("analyze") => report(),
-        Some("bench") => bench(),
+        Some("bench") => match args.get(1).map(String::as_str) {
+            Some("bgm") => bench_bgm(),
+            _ => bench(),
+        },
         Some(other) => {
-            eprintln!("unknown command {other:?}; try play | wav <path> | analyze | bench")
+            eprintln!(
+                "unknown command {other:?}; try play | wav <path> | analyze | bench [bgm]"
+            )
         }
     }
 }
@@ -84,7 +89,7 @@ fn bench() {
 
     let per_quantum_us = elapsed.as_secs_f64() * 1e6 / QUANTA as f64;
     let budget_us = QUANTUM as f64 / SR as f64 * 1e6;
-    println!("voices           : {}", runt_audio::MAX_VOICES);
+    println!("voices           : {} plucks in a {}-slot pool", runt_audio::PLUCK_VOICES, runt_audio::MAX_VOICES);
     println!("quanta           : {QUANTA} x {QUANTUM} frames stereo");
     println!("per quantum      : {per_quantum_us:.2} us");
     println!("realtime budget  : {budget_us:.2} us");
@@ -93,6 +98,153 @@ fn bench() {
         per_quantum_us / budget_us * 100.0
     );
     println!("stats            : {:?}", pool.stats());
+}
+
+/// CPU cost of a **full background-music load**, against the realtime budget.
+///
+/// This is the measurement the BGM work exists to justify. `bench` above
+/// saturates the pool with sixteen copies of the cheapest model; this one runs
+/// the expensive ones at the density a song actually produces:
+///
+/// ```text
+/// 3 bass      sustained, retriggered every bar   12 sine oscillators + a
+///                                                4-stage allpass chain each
+/// 2 kick   \
+/// 2 snare   >  every group full, on an 8th-note grid at 170.35 bpm
+/// 3 hihat  /
+/// 16 pluck    an SFX burst on top of all of it
+/// ```
+///
+/// So it is the **worst case and then some**: every one of the pool's 28 slots
+/// sounding at once, which a real game reaches only if a player triggers sixteen
+/// overlapping SFX during a bar. The number to read is the per-quantum figure
+/// against the 2 666 µs budget a 128-frame quantum has at 48 kHz.
+fn bench_bgm() {
+    const SR: f32 = 48_000.0;
+    const QUANTUM: usize = 128;
+    const QUANTA: usize = 20_000; // ~53 s of audio
+    /// 170.35 bpm, in quanta. One beat is 48000 * 60 / 170.35 / 128 = 165.1
+    /// quanta; the eighth-note grid the drums live on is half of that.
+    const EIGHTH_QUANTA: usize = 83;
+
+    // `PatchBank::builtin()`'s music presets, not the 3dimenshift port's. They
+    // are the same models with the same partial counts and the same phaser
+    // stage count, which is what the cost is made of; the port's numbers differ
+    // only in frequencies and envelope times.
+    let (bass, kick, snare, hihat, pluck) = (
+        PatchId::new("bass"),
+        PatchId::new("kick"),
+        PatchId::new("snare"),
+        PatchId::new("hihat"),
+        PatchId::new("pluck"),
+    );
+    let budget_us = QUANTUM as f64 / SR as f64 * 1e6;
+
+    // Three phases, each on a **fresh pool**. Sharing one would leak the
+    // previous phase's voices into the next — and a `Bass` sustains until it is
+    // stopped, so the first phase's bass would still be sounding through the
+    // third and every number after the first would be the same number.
+    let run = |label: &str, basses: u32, drums: u32, sfx: u32| -> f64 {
+        let mut pool = VoicePool::new(PatchBank::builtin(), SR);
+        let mut buf = vec![0.0f32; QUANTUM * 2];
+        let mut voice = 0u32;
+        let mut live: Vec<(usize, VoiceId)> = Vec::new(); // (release quantum, voice)
+
+        let fire = |pool: &mut VoicePool,
+                        voice: &mut u32,
+                        patch,
+                        count: u32,
+                        gain: f32,
+                        hold: Option<(usize, &mut Vec<(usize, VoiceId)>)>| {
+            let mut held = hold;
+            for i in 0..count {
+                let id = VoiceId(*voice);
+                pool.apply(Event::Play {
+                    voice: id,
+                    patch,
+                    seed: (*voice as u64).wrapping_mul(0x9e37_79b9),
+                    gain,
+                    pan: (i as f32 / count.max(2) as f32) * 1.4 - 0.7,
+                });
+                if let Some((due, ref mut queue)) = held {
+                    queue.push((due, id));
+                }
+                *voice = voice.wrapping_add(1);
+            }
+        };
+
+        // Warm the caches without counting them.
+        fire(&mut pool, &mut voice, pluck, 4, 0.3, None);
+        for _ in 0..1_000 {
+            pool.render_interleaved(&mut buf);
+        }
+
+        let start = std::time::Instant::now();
+        let mut peak_active = 0usize;
+        for block in 0..QUANTA {
+            // The sequencer stops a bass note at its notated end; without that
+            // the bass group fills up and stays full, which is a different
+            // (and quietly heavier) instrument.
+            live.retain(|(due, id)| {
+                if *due <= block {
+                    pool.apply(Event::Stop { voice: *id });
+                    false
+                } else {
+                    true
+                }
+            });
+            if block % EIGHTH_QUANTA == 0 {
+                fire(&mut pool, &mut voice, hihat, drums, 0.4, None);
+                fire(&mut pool, &mut voice, kick, drums, 0.9, None);
+                fire(&mut pool, &mut voice, snare, drums, 0.7, None);
+            }
+            // A bass note every half-bar, held for a half-bar — the density
+            // `bassline.tres` averages.
+            if block % (EIGHTH_QUANTA * 4) == 0 {
+                fire(
+                    &mut pool,
+                    &mut voice,
+                    bass,
+                    basses,
+                    0.5,
+                    Some((block + EIGHTH_QUANTA * 4, &mut live)),
+                );
+            }
+            if sfx > 0 && block % (EIGHTH_QUANTA * 8) == 0 {
+                fire(&mut pool, &mut voice, pluck, sfx, 0.3, None);
+            }
+            pool.render_interleaved(&mut buf);
+            peak_active = peak_active.max(pool.active_voices());
+        }
+        let per_quantum_us = start.elapsed().as_secs_f64() * 1e6 / QUANTA as f64;
+        println!(
+            "{label:<28} {per_quantum_us:>7.2} us   {:>5.2} % of one core   peak {peak_active:>2} voices   peak pre-clip {:.2}",
+            per_quantum_us / budget_us * 100.0,
+            pool.stats().peak_pre_clip
+        );
+        per_quantum_us
+    };
+
+    println!("quanta           : {QUANTA} x {QUANTUM} frames stereo, {SR} Hz");
+    println!("realtime budget  : {budget_us:.2} us per quantum");
+    println!("slots            : {}", runt_audio::MAX_VOICES);
+    println!();
+    let idle = run("silence (an empty pool)", 0, 0, 0);
+    // The song as written: the bassline is monophonic and the three drum
+    // patterns never collide, so one voice per group is what it asks for.
+    let song = run("the song as written", 1, 1, 0);
+    // Every music group full at once. The song cannot produce this; a denser
+    // one could.
+    let music = run("every BGM group full", 3, 3, 0);
+    let everything = run("...+ a 16-voice SFX burst", 3, 3, runt_audio::PLUCK_VOICES as u32);
+    println!();
+    println!("the song costs      {:.2} us over silence", song - idle);
+    println!("the SFX burst adds  {:.2} us over the full BGM", everything - music);
+    println!(
+        "worst case is       {:.2} % of the {:.0} us budget",
+        everything / budget_us * 100.0,
+        budget_us
+    );
 }
 
 /// The script both `play` and `wav` render: a drone under a run of plucks that
