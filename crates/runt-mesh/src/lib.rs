@@ -21,6 +21,23 @@ pub mod poly2d;
 pub mod primitives;
 pub mod terrain;
 
+/// Salt for every content-cache key that names generated geometry.
+///
+/// The cache (DESIGN §6) is keyed on generator params, and params alone cannot
+/// tell a warm entry that the *code* which turned them into triangles has
+/// changed. Mixing this constant into the key does: bump it and every stale
+/// entry misses instead of resurrecting geometry the current pipeline would
+/// never produce.
+///
+/// **Bump this on any change to a generator or cleanup op that alters output
+/// bytes** — a new primitive's winding, a different UV convention, a tweak to
+/// [`ops::weld`]/[`ops::cull_slivers`]/[`ops::decimate`], anything that would
+/// move a [`MeshData::content_hash`]. Purely additive changes (a new generator
+/// nothing existing calls) do not need it. When in doubt, bump: the cost is one
+/// cold bake, and the cost of not bumping is a level that renders differently
+/// depending on whether the user has played before.
+pub const MESH_PIPELINE_VERSION: u32 = 1;
+
 pub use csg::Csg;
 pub use curve::{Curve3, CurvePoint, PathFrame};
 pub use extrude::{extrude, lathe, path_extrude};
@@ -183,6 +200,27 @@ impl MeshData {
     /// `1.0` at the min. Does not update normals — recompute after deforming.
     pub fn taper(self, factor: f32, axis: Vec3) -> Self {
         ops::taper(self, factor, axis)
+    }
+
+    /// Merge vertices agreeing within `eps` on position *and* normal *and* uv
+    /// *and* colour, dropping the triangles that pinch shut. Creases survive.
+    pub fn weld(self, eps: f32) -> Self {
+        ops::weld(self, eps)
+    }
+
+    /// Drop triangles that are both smaller than `min_area` and more
+    /// needle-shaped than `max_aspect` — see [`ops::cull_slivers`] for the
+    /// metric and [`ops::SLIVER_MIN_AREA`]/[`ops::SLIVER_MAX_ASPECT`] for the
+    /// recommended settings.
+    pub fn cull_slivers(self, min_area: f32, max_aspect: f32) -> Self {
+        ops::cull_slivers(self, min_area, max_aspect)
+    }
+
+    /// Quadric-error edge collapse down to a `max_error` world-unit budget.
+    /// [`weld`](Self::weld) first: welding is what decides where the attribute
+    /// seams are, and seams are preserved.
+    pub fn decimate(self, max_error: f32) -> Self {
+        ops::decimate(self, max_error)
     }
 }
 
