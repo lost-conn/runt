@@ -159,6 +159,41 @@ one action produce one press instead of two.
 - **Limits:** everything above fits `downlevel_webgl2_defaults()`. Compute,
   storage buffers, and texture arrays live behind the capability gate.
 
+**The transparent pass and instancing landed (2026-08-04, for the 3dimenshift
+port).** Both were written above as "later" and both are now the only path.
+
+- **Blend and depth state come out of the variant key** (`render_state`), which
+  is what "a new look is a new flag, never a new pipeline architecture" was
+  always supposed to mean. Five bits appended permanently from 5: `TRANSPARENT`,
+  `ADDITIVE`, `DEPTH_GREATER`, `PHASE_CIRCLE`, `BILLBOARD_UNLIT`. The first two
+  are also a *scheduling* mask: `DrawItem::sort_key` leads with a `pass` field,
+  extraction partitions blended draws to the end, and the renderer re-orders
+  that suffix back-to-front once it holds the camera. Both halves still ride one
+  loop, one render pass, one submit — the "transparent-sorted pass" is a
+  partition of the pass list, not a second one.
+- **Draw path v2 is per-instance vertex data, wholesale.** `InstanceRaw` (96 B:
+  model, colour, params) on buffer slot 1, `step_mode: Instance`, shader
+  locations 4–9 alongside the mesh's 0–3 — ten attributes of the sixteen WebGL2
+  guarantees. The dynamic-uniform-offset path and its 256-byte striding are
+  gone, `@group(1)` is now an unused hole so `@group(2)` keeps its number, and
+  the fragment stage reads colour and params as `flat` varyings. Adjacent items
+  in the sorted list agreeing on (variant, mesh, texture) coalesce into one
+  `draw_indexed` over a range of the frame's instance buffer; a singleton is a
+  run of one, so there is no second code path and the golden opaque frame is
+  byte-identical across the change.
+- **`Visibility` and CPU frustum culling** filter either side of the camera.
+  `Visibility { visible }` is absent-means-visible and is applied in extraction
+  (it is world state, so a replay hides the same things at the same ticks); the
+  frustum is applied by the renderer, against a per-mesh object-space AABB
+  measured at upload, centre-and-extent against six unnormalized planes pulled
+  from `view_proj`. Conservative in the only direction that matters: it may cost
+  a draw call, never a pixel. A mesh with no measured bounds is kept.
+- **What it bought.** `demo/ball`'s level: 21 draw items → 13 culled → **4 draw
+  calls** where there were 21. The 5 000-instance submit microbench costs
+  ~0.24 ms of CPU (~48 ns/instance) against a ~1 ms budget. Both filters and the
+  coalescer are pure functions of (list, camera, transforms), so the command
+  stream is as reproducible as it was — there is simply less of it.
+
 ## 6. Content pipeline — params → cache → GPU
 
 **Decision:** generation is always *ahead of* the frame, never in it.

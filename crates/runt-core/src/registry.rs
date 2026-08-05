@@ -22,6 +22,7 @@ use bevy_ecs::prelude::Resource;
 use runt_mesh::MeshData;
 use wgpu::util::DeviceExt;
 
+use crate::draw::Aabb;
 use crate::interleave;
 
 /// A content-addressed mesh key: literally `MeshData::content_hash()`.
@@ -38,12 +39,20 @@ impl MeshHandle {
     }
 }
 
-/// Uploaded geometry: one vertex buffer, one index buffer, one draw range.
+/// Uploaded geometry: one vertex buffer, one index buffer, one draw range —
+/// and the object-space box the frustum test asks about (DESIGN §5, D5).
 pub struct GpuMesh {
     pub vertices: wgpu::Buffer,
     pub indices: wgpu::Buffer,
     pub index_count: u32,
     pub vertex_count: u32,
+    /// Object-space bounds, measured once at upload. `None` for geometry with
+    /// no vertices, which the culler reads as "keep it" rather than "cull it".
+    ///
+    /// Here rather than recomputed per frame because it is O(vertices) and the
+    /// answer is immutable: the handle *is* the content hash, so two meshes
+    /// with the same handle have the same box by definition.
+    pub bounds: Option<Aabb>,
 }
 
 /// Handle → GPU buffers. Owned by the [`Renderer`](crate::Renderer).
@@ -89,6 +98,7 @@ impl MeshRegistry {
                 indices,
                 index_count: mesh.indices.len() as u32,
                 vertex_count: verts.len() as u32,
+                bounds: Aabb::of_mesh(mesh),
             },
         );
         handle
@@ -96,6 +106,16 @@ impl MeshRegistry {
 
     pub fn get(&self, handle: MeshHandle) -> Option<&GpuMesh> {
         self.meshes.get(&handle)
+    }
+
+    /// The object-space bounds of a resident mesh — the culler's whole input
+    /// (see [`crate::draw::cull_draw_list`]).
+    ///
+    /// `None` for a handle that is not resident *and* for one whose geometry is
+    /// empty. The culler treats both the same way, and it is the same answer:
+    /// there is nothing here that can be proven off screen.
+    pub fn bounds(&self, handle: MeshHandle) -> Option<Aabb> {
+        self.meshes.get(&handle)?.bounds
     }
 
     pub fn contains(&self, handle: MeshHandle) -> bool {

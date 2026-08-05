@@ -71,11 +71,11 @@ pub use collide::{
     move_and_slide, CharacterBody, CharacterShape, CollisionLayers, CollisionWorld, Contact,
     ContactKind, MoveResult, ObbCollider, OverlapHit, RayHit, ALL_LAYERS,
 };
-pub use draw::{DrawItem, FrameParams};
+pub use draw::{Aabb, DrawItem, DrawStats, FrameParams, Frustum, InstanceRun};
 pub use ecs::{
     default_horizon, DemoScene, FixedSim, GeneratorRef, GlobalTransform, Interpolated, Lighting,
     MeshRef, PostSim, QualityTier, RenderScale, Spin, Startup, StatusLine, TerrainSurface,
-    TickCount, Transform,
+    TickCount, Transform, Visibility,
 };
 pub use engine::Engine;
 pub use gen::{GeneratorSpec, Shading};
@@ -220,20 +220,69 @@ pub struct FrameUniform {
     pub viewport: [f32; 4],
 }
 
-/// `@group(1)`: one slot per drawn entity, addressed with a dynamic offset.
+/// Per-instance vertex data: one of these per drawn entity, in a vertex buffer
+/// on slot 1 (DESIGN §5's "first sanctioned optimization", D3).
 ///
-/// Model matrix plus the material's uniform block, exactly as DESIGN §5
-/// specifies. 96 bytes; the buffer strides them by the device's
-/// `min_uniform_buffer_offset_alignment` (256 under WebGL2 limits).
+/// **96 bytes, tightly packed, no alignment tax.** That is the point of the
+/// move: the old path put the same three values in a *uniform* buffer and
+/// addressed them with a dynamic offset, which the device rounds up to
+/// `min_uniform_buffer_offset_alignment` — 256 bytes under WebGL2 limits, so
+/// 62% of the buffer was padding and every entity cost a `set_bind_group`.
+/// Here the stride is the struct, the buffer is written once per frame, and a
+/// run of entities sharing a pipeline, a mesh and a texture is *one*
+/// `draw_indexed` over a range of it.
+///
+/// There is no singleton special case. An entity nothing else matches draws as
+/// a run of length one — same pipeline, same buffer, same call shape — which is
+/// what keeps this one code path rather than two (and what makes the golden
+/// screenshot byte-identical across the change).
+///
+/// Field order is duplicated in `shader.wgsl`'s `vs_main` signature; see
+/// [`InstanceRaw::LAYOUT`] for the attribute numbering.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
-pub struct InstanceUniform {
+pub struct InstanceRaw {
     pub model: [[f32; 4]; 4],
-    pub base_color: [f32; 4],
+    pub color: [f32; 4],
     pub params: [f32; 4],
 }
 
-/// Instance slots allocated up front; the buffer doubles from here as needed.
+impl InstanceRaw {
+    /// Slot 1, stepped per instance, attributes 4–9.
+    ///
+    /// The mesh stream (slot 0, [`Vertex::LAYOUT`]) owns 0–3, so the two
+    /// together declare **10** attributes. `downlevel_webgl2_defaults` grants
+    /// `max_vertex_attributes = 16` and `max_vertex_buffers = 8`, so this is
+    /// still the baseline path with six attributes and six buffers to spare
+    /// (DESIGN §11) — a mat4 costs four locations because a vertex attribute
+    /// cannot be wider than a `vec4` on any backend we target.
+    pub const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &wgpu::vertex_attr_array![
+            4 => Float32x4, // model column 0
+            5 => Float32x4, // model column 1
+            6 => Float32x4, // model column 2
+            7 => Float32x4, // model column 3 (translation)
+            8 => Float32x4, // base colour
+            9 => Float32x4, // material params
+        ],
+    };
+
+    /// Pack a draw item. Column-major, exactly as `glam` stores a `Mat4` and
+    /// exactly as the old uniform wrote it — so the four attributes the vertex
+    /// shader reassembles are the same sixteen floats the uniform held, in the
+    /// same order, and the multiply that follows is bit for bit the same one.
+    pub fn from_item(item: &DrawItem) -> InstanceRaw {
+        InstanceRaw {
+            model: item.model.to_cols_array_2d(),
+            color: item.base_color.to_array(),
+            params: item.params.to_array(),
+        }
+    }
+}
+
+/// Instances allocated up front; the buffer doubles from here as needed.
 const INITIAL_INSTANCE_CAPACITY: u32 = 32;
 
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -271,7 +320,6 @@ pub struct Renderer {
     /// it. Never iterated — only looked up — so hashing is harmless (DESIGN §3).
     pipelines: HashMap<MaterialVariant, wgpu::RenderPipeline>,
     pipeline_layout: wgpu::PipelineLayout,
-    instance_layout: wgpu::BindGroupLayout,
 
     frame_buffer: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
@@ -291,15 +339,21 @@ pub struct Renderer {
     /// there is exactly one sky and it has no key to look up.
     sky_pipeline: wgpu::RenderPipeline,
 
-    /// One uniform buffer for every entity drawn this frame, indexed with
-    /// dynamic offsets. `instance_stride` is the device's minimum uniform offset
-    /// alignment (256 under WebGL2 limits), not the struct size.
+    /// One [`InstanceRaw`] per draw item this frame, in list order, as a
+    /// **vertex** buffer on slot 1. Written once per frame; every draw is a
+    /// range of it.
     instance_buffer: wgpu::Buffer,
-    instance_bind_group: wgpu::BindGroup,
-    instance_stride: u32,
+    /// Instances the buffer holds before it has to grow. Doubling, sticky.
     instance_capacity: u32,
-    /// Staging bytes for the instance upload, reused across frames.
-    instance_scratch: Vec<u8>,
+    /// Staging for the instance upload, reused across frames.
+    instance_scratch: Vec<InstanceRaw>,
+
+    /// The visible half of this frame's draw list, and the instanced draws it
+    /// coalesces into. Both are per-frame working sets kept between frames so a
+    /// steady scene allocates nothing at all.
+    visible: Vec<DrawItem>,
+    runs: Vec<draw::InstanceRun>,
+    stats: draw::DrawStats,
 
     meshes: MeshRegistry,
 
@@ -361,35 +415,18 @@ impl Renderer {
                 count: None,
             }],
         });
-        let instance_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("instance bind layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    // The whole point: one buffer, one bind group, an offset per
-                    // entity. No storage buffers, so this is WebGL2-safe (§11).
-                    has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(
-                        std::mem::size_of::<InstanceUniform>() as u64,
-                    ),
-                },
-                count: None,
-            }],
-        });
-        // Three groups: frame, instance, texture. `max_bind_groups` is 4 under
-        // `downlevel_webgl2_defaults`, so this is still the baseline path
-        // (DESIGN §11). Group 2 is unconditional — see `TextureRegistry`'s
-        // default bind group for why one layout beats two.
+        // Two groups now: frame at 0 and texture at 2. Group 1 is a **hole** —
+        // it held the per-entity uniform until instancing (D3) moved that data
+        // into a vertex buffer, and leaving the gap is what lets `@group(2)`
+        // keep its number in `shader.wgsl`, in `bake.rs`'s documentation, and
+        // in the `TextureRegistry` layout all three pipelines share. Renumbering
+        // to close a hole nothing binds would have been churn with a bug in it.
+        // `max_bind_groups` is 4 under `downlevel_webgl2_defaults`, so an
+        // unused index costs nothing (DESIGN §11).
         let textures = bake::TextureRegistry::new(&device, &queue);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline_layout"),
-            bind_group_layouts: &[
-                Some(&frame_layout),
-                Some(&instance_layout),
-                Some(textures.layout()),
-            ],
+            bind_group_layouts: &[Some(&frame_layout), None, Some(textures.layout())],
             immediate_size: 0,
         });
 
@@ -408,16 +445,7 @@ impl Renderer {
             }],
         });
 
-        // Every dynamic offset must be a multiple of this; the struct is 96
-        // bytes but the slots are strided by whatever the device demands.
-        let align = device.limits().min_uniform_buffer_offset_alignment.max(1);
-        let instance_stride = align_up(std::mem::size_of::<InstanceUniform>() as u32, align);
-        let (instance_buffer, instance_bind_group) = create_instance_buffer(
-            &device,
-            &instance_layout,
-            instance_stride,
-            INITIAL_INSTANCE_CAPACITY,
-        );
+        let instance_buffer = create_instance_buffer(&device, INITIAL_INSTANCE_CAPACITY);
 
         let sky_pipeline = create_sky_pipeline(&device, &frame_layout, target_format);
         let baker = bake::TextureBaker::new(&device);
@@ -428,17 +456,17 @@ impl Renderer {
             target_format,
             pipelines: HashMap::new(),
             pipeline_layout,
-            instance_layout,
             frame_buffer,
             frame_bind_group,
             phase: [0.0; 4],
             time: [0.0; 4],
             sky_pipeline,
             instance_buffer,
-            instance_bind_group,
-            instance_stride,
             instance_capacity: INITIAL_INSTANCE_CAPACITY,
             instance_scratch: Vec::new(),
+            visible: Vec::new(),
+            runs: Vec::new(),
+            stats: draw::DrawStats::default(),
             meshes: MeshRegistry::new(),
             baker,
             textures,
@@ -510,14 +538,18 @@ impl Renderer {
         self.pipelines.len()
     }
 
-    /// Byte stride between per-entity uniform slots.
-    pub fn instance_stride(&self) -> u32 {
-        self.instance_stride
-    }
-
-    /// Entities the instance buffer can hold before it has to grow.
+    /// Instances the instance buffer can hold before it has to grow.
     pub fn instance_capacity(&self) -> u32 {
         self.instance_capacity
+    }
+
+    /// What the last [`render_scaled`](Renderer::render_scaled) cost: items in,
+    /// items culled, instances written, draw calls issued.
+    ///
+    /// Zeroed by a frame with an empty list, so it always describes the most
+    /// recent frame rather than the most recent interesting one.
+    pub fn draw_stats(&self) -> draw::DrawStats {
+        self.stats
     }
 
     /// Aim the screen-space phase circle (see [`FrameUniform::phase`]).
@@ -593,7 +625,10 @@ impl Renderer {
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_main"),
-                    buffers: &[Some(Vertex::LAYOUT)],
+                    // Slot 0 the mesh, slot 1 the instances. Every variant gets
+                    // both, unconditionally: an entity drawn alone is a run of
+                    // one, so there is no non-instanced path to keep working.
+                    buffers: &[Some(Vertex::LAYOUT), Some(InstanceRaw::LAYOUT)],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -628,12 +663,12 @@ impl Renderer {
     /// Draw one frame into `view`, which must be `target_format` and
     /// `width` × `height`.
     ///
-    /// Frame anatomy: order the blended draws against this camera (only if
-    /// there are any) → upload any newly-referenced geometry → bake any
+    /// Frame anatomy: upload any newly-referenced geometry → drop what this
+    /// camera cannot see → order the blended remainder against it (only if
+    /// there is any) → coalesce the runs into instanced draws → bake any
     /// newly-referenced texture → write the frame uniform → write one instance
-    /// slot per draw → compile any missing variant → clear → paint the sky →
-    /// walk the sorted list, changing pipeline, texture and vertex buffers only
-    /// when the sort key says they changed.
+    /// per surviving draw → compile any missing variant → clear → paint the sky
+    /// → issue one `draw_indexed` per run.
     ///
     /// One loop covers both passes, because the sort put the blended items
     /// last: the opaque half is state-ordered and the tail is back-to-front,
@@ -709,30 +744,28 @@ impl Renderer {
 
         self.ensure_depth(render_width, render_height);
 
-        // The blended half of the list has to be ordered by the camera, and the
-        // camera is here rather than in `Extract` (see `draw`'s module docs).
-        //
-        // A frame with nothing blended in it never copies, never re-sorts, and
-        // hands the loop below the caller's own slice — which is the whole of
-        // "the opaque path is byte-identical to what it was".
-        let depth_sorted: Vec<DrawItem>;
-        let draws: &[DrawItem] = if draw::has_blended(draws) {
-            depth_sorted = {
-                let mut items = draws.to_vec();
-                draw::sort_draw_list_for_view(&mut items, &frame.view_proj);
-                items
-            };
-            &depth_sorted
-        } else {
-            draws
-        };
-
+        // Geometry first: the frustum test needs each mesh's object-space box,
+        // and that is measured at upload (`MeshRegistry::bounds`). A handle with
+        // no bounds yet is kept rather than culled, so this ordering is an
+        // accuracy choice, not a correctness one — but culling from the first
+        // frame is worth one pass over a list we are about to walk anyway.
         self.upload_missing_meshes(draws, library);
-        self.bake_missing_textures(draws, textures);
+
+        // The two working sets are moved out of `self` for the duration of the
+        // frame. `take` leaves an empty `Vec` behind and costs nothing; putting
+        // them back at the end is what keeps their capacity, so a steady scene
+        // allocates on neither. It also splits the borrow: filling `visible`
+        // reads `self.meshes`, and these being locals is what makes that legal
+        // without a clone.
+        let mut visible = std::mem::take(&mut self.visible);
+        let mut runs = std::mem::take(&mut self.runs);
+        self.stats = self.prepare_frame(frame, draws, &mut visible, &mut runs);
+
+        self.bake_missing_textures(&visible, textures);
         self.write_frame_uniform(frame, render_width, render_height);
-        self.write_instances(draws);
-        for item in draws {
-            self.ensure_pipeline(item.variant);
+        self.write_instances(&visible);
+        for run in &runs {
+            self.ensure_pipeline(run.variant);
         }
         if scaled {
             self.ensure_blit();
@@ -745,6 +778,7 @@ impl Renderer {
             _ => view,
         };
         let depth_view = &self.depth.as_ref().expect("depth ensured").2;
+        let mut issued = 0u32;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -784,27 +818,35 @@ impl Renderer {
             pass.set_pipeline(&self.sky_pipeline);
             pass.draw(0..3, 0..1);
 
+            // Slot 1 is set once for the whole frame. Every material pipeline
+            // declares the same instance layout and every draw is a *range* of
+            // the one buffer, so there is nothing per-draw to rebind — which is
+            // exactly what the dynamic-offset bind group used to cost.
+            if !runs.is_empty() {
+                pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            }
+
             let mut bound_variant: Option<MaterialVariant> = None;
             let mut bound_mesh: Option<MeshHandle> = None;
             // `None` here means "nothing bound yet", which is distinct from
             // `Some(None)` — the default 1×1 group being bound on purpose.
             let mut bound_texture: Option<Option<texture::TextureHandle>> = None;
-            for (slot, item) in draws.iter().enumerate() {
-                let Some(gpu) = self.meshes.get(item.mesh) else {
+            for run in &runs {
+                let Some(gpu) = self.meshes.get(run.mesh) else {
                     continue; // Geometry the library could not supply; warned about above.
                 };
-                if bound_variant != Some(item.variant) {
+                if bound_variant != Some(run.variant) {
                     let pipeline = self
                         .pipelines
-                        .get(&item.variant)
+                        .get(&run.variant)
                         .expect("variant compiled above");
                     pass.set_pipeline(pipeline);
-                    bound_variant = Some(item.variant);
+                    bound_variant = Some(run.variant);
                 }
                 // Group 2 is in the layout for every variant, so it is bound for
                 // every draw — the sort order (texture is the second key)
                 // collapses that to one set per texture per frame.
-                let wanted = item
+                let wanted = run
                     .texture
                     .filter(|handle| self.textures.contains(*handle));
                 if bound_texture != Some(wanted) {
@@ -817,16 +859,19 @@ impl Renderer {
                     pass.set_bind_group(2, group, &[]);
                     bound_texture = Some(wanted);
                 }
-                if bound_mesh != Some(item.mesh) {
+                if bound_mesh != Some(run.mesh) {
                     pass.set_vertex_buffer(0, gpu.vertices.slice(..));
                     pass.set_index_buffer(gpu.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    bound_mesh = Some(item.mesh);
+                    bound_mesh = Some(run.mesh);
                 }
-                let offset = slot as u32 * self.instance_stride;
-                pass.set_bind_group(1, &self.instance_bind_group, &[offset]);
-                pass.draw_indexed(0..gpu.index_count, 0, 0..1);
+                pass.draw_indexed(0..gpu.index_count, 0, run.first..run.first + run.count);
+                issued += 1;
             }
         }
+
+        self.stats.draws = issued;
+        self.visible = visible;
+        self.runs = runs;
 
         if scaled {
             let blit = self.blit.as_ref().expect("blit ensured");
@@ -951,50 +996,91 @@ impl Renderer {
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
-    /// Pack one aligned instance slot per draw and upload them in one go.
+    /// Turn the caller's sorted list into this frame's *visible* list and the
+    /// instanced draws it collapses to (D3, D5).
+    ///
+    /// Three steps, in the only order that works:
+    ///
+    /// 1. **Cull.** Every item whose mesh has a measured box and whose box
+    ///    cannot reach this camera's frustum is dropped. Conservative — see
+    ///    [`Frustum::intersects`](draw::Frustum::intersects) — so this can cost
+    ///    a draw call and never a pixel, which is why the golden frame does not
+    ///    move when it is switched on.
+    /// 2. **Depth-order the blended tail**, if there is one. The cull comes
+    ///    first because sorting items that are about to be thrown away is work
+    ///    for nothing, and the two commute: culling is order-preserving.
+    /// 3. **Coalesce.** Adjacent items agreeing on (variant, mesh, texture)
+    ///    become one instanced draw over a contiguous instance range.
+    ///
+    /// All three are pure functions of (list, camera, mesh bounds), so two
+    /// frames from the same world state still produce byte-identical command
+    /// streams — the determinism claim survives intact, with fewer commands in
+    /// it.
+    ///
+    /// Returns the frame's [`DrawStats`](draw::DrawStats) with everything but
+    /// `draws` filled in — that one is the pass's to count.
+    fn prepare_frame(
+        &self,
+        frame: &FrameParams,
+        draws: &[DrawItem],
+        visible: &mut Vec<DrawItem>,
+        runs: &mut Vec<draw::InstanceRun>,
+    ) -> draw::DrawStats {
+        visible.clear();
+        visible.extend_from_slice(draws);
+
+        let frustum = draw::Frustum::from_view_proj(&frame.view_proj);
+        let culled = draw::cull_draw_list(visible, &frustum, |handle| self.meshes.bounds(handle));
+
+        // The blended half has to be ordered by the camera, and the camera is
+        // here rather than in `Extract` (see `draw`'s module docs). A frame with
+        // nothing blended in it never re-sorts.
+        if draw::has_blended(visible) {
+            draw::sort_draw_list_for_view(visible, &frame.view_proj);
+        }
+        draw::coalesce_draws_into(visible, runs);
+
+        draw::DrawStats {
+            items: draws.len() as u32,
+            culled: culled as u32,
+            instances: visible.len() as u32,
+            draws: 0,
+        }
+    }
+
+    /// Pack one [`InstanceRaw`] per visible draw and upload them in one go.
+    ///
+    /// One `write_buffer` for the whole frame, tightly packed — no 256-byte
+    /// striding, no per-entity bind group, and the draw ranges index straight
+    /// into it because the order is the list's order.
     fn write_instances(&mut self, draws: &[DrawItem]) {
         if draws.is_empty() {
             return;
         }
         self.grow_instances(draws.len() as u32);
-
-        let stride = self.instance_stride as usize;
         self.instance_scratch.clear();
-        self.instance_scratch.resize(draws.len() * stride, 0);
-        for (slot, item) in draws.iter().enumerate() {
-            let uniform = InstanceUniform {
-                model: item.model.to_cols_array_2d(),
-                base_color: item.base_color.to_array(),
-                params: item.params.to_array(),
-            };
-            let bytes = bytemuck::bytes_of(&uniform);
-            let start = slot * stride;
-            self.instance_scratch[start..start + bytes.len()].copy_from_slice(bytes);
-        }
-        self.queue
-            .write_buffer(&self.instance_buffer, 0, &self.instance_scratch);
+        self.instance_scratch
+            .extend(draws.iter().map(InstanceRaw::from_item));
+        self.queue.write_buffer(
+            &self.instance_buffer,
+            0,
+            bytemuck::cast_slice(&self.instance_scratch),
+        );
     }
 
     /// Geometric growth: doubling keeps reallocation amortized O(1) as a scene
-    /// fills up, and the bind group is rebuilt with the buffer because it names
-    /// it directly.
+    /// fills up. Nothing names the buffer but the pass, so unlike the uniform
+    /// path there is no bind group to rebuild with it.
     fn grow_instances(&mut self, needed: u32) {
         if needed <= self.instance_capacity {
             return;
         }
         let capacity = needed.max(self.instance_capacity.saturating_mul(2));
-        let (buffer, bind_group) = create_instance_buffer(
-            &self.device,
-            &self.instance_layout,
-            self.instance_stride,
-            capacity,
-        );
         log::debug!(
-            "instance buffer grew {} → {capacity} slots",
+            "instance buffer grew {} → {capacity} instances",
             self.instance_capacity
         );
-        self.instance_buffer = buffer;
-        self.instance_bind_group = bind_group;
+        self.instance_buffer = create_instance_buffer(&self.device, capacity);
         self.instance_capacity = capacity;
     }
 
@@ -1324,38 +1410,14 @@ fn create_sky_pipeline(
     })
 }
 
-/// Round `value` up to a multiple of `align`.
-fn align_up(value: u32, align: u32) -> u32 {
-    value.div_ceil(align) * align
-}
-
-fn create_instance_buffer(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    stride: u32,
-    capacity: u32,
-) -> (wgpu::Buffer, wgpu::BindGroup) {
-    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("instance uniforms"),
-        size: (stride as u64) * (capacity.max(1) as u64),
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+/// The per-instance vertex buffer: `capacity` × 96 bytes, no padding.
+fn create_instance_buffer(device: &wgpu::Device, capacity: u32) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("instances"),
+        size: (std::mem::size_of::<InstanceRaw>() as u64) * (capacity.max(1) as u64),
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
-    });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("instance bind group"),
-        layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            // A window of one struct, slid along the buffer by the dynamic
-            // offset — not the whole buffer.
-            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: &buffer,
-                offset: 0,
-                size: wgpu::BufferSize::new(std::mem::size_of::<InstanceUniform>() as u64),
-            }),
-        }],
-    });
-    (buffer, bind_group)
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -36,13 +36,15 @@ struct Frame {
 };
 @group(0) @binding(0) var<uniform> frame: Frame;
 
-// Per-entity slot, addressed with a dynamic uniform-buffer offset.
-struct Instance {
-    model: mat4x4<f32>,
-    base_color: vec4<f32>,
-    params: vec4<f32>,
-};
-@group(1) @binding(0) var<uniform> inst: Instance;
+// Per-entity data arrives as **vertex attributes** on buffer slot 1, stepped
+// per instance (DESIGN §5's first sanctioned optimization; `runt_core::
+// InstanceRaw`). It used to be a uniform at `@group(1)` addressed with a
+// dynamic offset — one bind-group set and 256 bytes of stride per entity — and
+// `@group(1)` is now deliberately empty so `@group(2)` below keeps its number.
+//
+// Locations 4–7 are the model matrix's four columns: a vertex attribute is at
+// most a `vec4`, so a `mat4x4` costs four of them, and the vertex shader
+// reassembles it. 8 is the base colour, 9 the material params.
 
 // The baked procedural texture (DESIGN §7). Present in the pipeline layout for
 // every variant — an untextured draw binds a 1×1 white albedo and a 1×1 flat
@@ -96,23 +98,53 @@ struct VSOut {
     // path at all: the original is a world-space shader and CSG-ish generated
     // geometry has no UV worth trusting, so the world *is* the parameterization.
     @location(2) world_pos: vec3<f32>,
+    // The two per-instance values the *fragment* stage needs, carried across as
+    // `flat` varyings now that they are attributes rather than a uniform.
+    //
+    // Flat, not interpolated, and that is not a micro-optimization: the value is
+    // constant over the primitive, and a barycentric blend of three identical
+    // floats is only *approximately* that float. `flat` passes the bits through
+    // unchanged, which is what makes moving off the uniform a visual no-op
+    // rather than a one-LSB drift across every surface in the frame. WebGL2
+    // (GLSL ES 3.00) has `flat` as core; the provoking-vertex difference between
+    // GLES and WebGPU cannot be observed on a value all three vertices share.
+    @location(3) @interpolate(flat) base_color: vec4<f32>,
+    @location(4) @interpolate(flat) params: vec4<f32>,
 };
 
 @vertex
 fn vs_main(
+    // Slot 0 — the mesh, one step per vertex.
     @location(0) pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) color: vec3<f32>,
+    // Slot 1 — the instance, one step per entity.
+    @location(4) m0: vec4<f32>,
+    @location(5) m1: vec4<f32>,
+    @location(6) m2: vec4<f32>,
+    @location(7) m3: vec4<f32>,
+    @location(8) base_color: vec4<f32>,
+    @location(9) params: vec4<f32>,
 ) -> VSOut {
     var out: VSOut;
-    let world = inst.model * vec4<f32>(pos, 1.0);
+    // Column-major, the order `glam` stores a `Mat4` and the order
+    // `InstanceRaw` writes one — so this is the same matrix the uniform held,
+    // and the multiply below is the same arithmetic on the same bits.
+    let model = mat4x4<f32>(m0, m1, m2, m3);
+    let world = model * vec4<f32>(pos, 1.0);
     out.clip = frame.view_proj * world;
     out.world_pos = world.xyz;
     // Rotating the normal by the model matrix is exact for the uniform-scale
     // transforms the engine places entities with; non-uniform scale would want
-    // an inverse-transpose in the instance block.
-    out.normal = (inst.model * vec4<f32>(normal, 0.0)).xyz;
+    // the cofactor matrix (`cross` of the column pairs — no inverse needed).
+    // Deliberately unchanged by instancing: the instance block never carried a
+    // normal matrix, so adding one here would be a *look* change riding along
+    // with a plumbing change, and it would move the golden frame for a reason
+    // that has nothing to do with instancing. It stays a separate decision.
+    out.normal = (model * vec4<f32>(normal, 0.0)).xyz;
+    out.base_color = base_color;
+    out.params = params;
     if (F_VERTEX_COLOR) {
         out.color = color;
     } else {
@@ -418,11 +450,11 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     if (F_PHASE_CIRCLE) {
         phase_dist = phase_distance(in.clip.xy);
         let inside = frame.phase.z > PHASE_MIN_RADIUS && phase_dist < frame.phase.z;
-        // `inst.params.x`: 0 world-only, 1 phase-only, 2 effect-only. Compared
+        // `in.params.x`: 0 world-only, 1 phase-only, 2 effect-only. Compared
         // with slack rather than `==` because it arrives as a float in a
         // uniform, and an authored 1.0 that survived a round trip through RON
         // must not become mode 0.
-        let mode = inst.params.x;
+        let mode = in.params.x;
         if (mode < 0.5) {
             // World-only: the circle removes it.
             if (inside) {
@@ -438,7 +470,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
     var n = normalize(in.normal);
 
-    var albedo = inst.base_color.rgb;
+    var albedo = in.base_color.rgb;
     if (F_VERTEX_COLOR) {
         albedo = albedo * in.color;
     }
@@ -544,5 +576,5 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         }
     }
 
-    return vec4<f32>(color, inst.base_color.a);
+    return vec4<f32>(color, in.base_color.a);
 }

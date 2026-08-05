@@ -35,13 +35,37 @@
 //! within the blended one. A frame with no blended item never runs the second
 //! step at all, which is what keeps the opaque path byte-identical.
 //!
+//! # Visibility and the frustum (D4, D5)
+//!
+//! Two filters sit either side of the camera. [`Visibility`] is a property of
+//! the *world* — a game says "not now" — so it is applied in extraction, where
+//! an invisible entity costs one `Option` check and then nothing at all. The
+//! frustum is a property of the *view*, so like the blended sort it is applied
+//! by the renderer, which is the first thing holding both the list and the
+//! camera; see [`Frustum`] and [`cull_draw_list`].
+//!
+//! Both are order-preserving filters over an already-sorted list, so neither
+//! can disturb the command stream's determinism: the retained set is a pure
+//! function of (world, camera), and its order is the order it already had.
+//!
+//! # Instancing (D3)
+//!
+//! The sort groups by state; [`coalesce_draws`] cashes that in. A maximal run
+//! of *adjacent* items agreeing on (variant, mesh, texture) becomes one
+//! instanced draw over a contiguous range of the frame's instance buffer. One
+//! rule for the whole list: in the opaque half the sort makes those runs long,
+//! and in the depth-ordered blended tail it usually finds runs of one — which
+//! is the correct answer there, because merging two adjacent blended items
+//! preserves their order (instances rasterize in index order) while merging
+//! non-adjacent ones would not.
+//!
 //! [`TRANSPARENT`]: MaterialVariant::TRANSPARENT
 //! [`ADDITIVE`]: MaterialVariant::ADDITIVE
 
 use bevy_ecs::prelude::*;
-use glam::{Mat4, Vec4};
+use glam::{Mat3, Mat4, Vec3, Vec4};
 
-use crate::ecs::{Interpolated, Lighting, MeshRef, Transform};
+use crate::ecs::{Interpolated, Lighting, MeshRef, Transform, Visibility};
 use crate::material::{Material, MaterialVariant};
 use crate::registry::MeshHandle;
 use crate::texture::{TextureHandle, TextureLibrary};
@@ -166,13 +190,18 @@ impl Default for FrameParams {
     }
 }
 
-/// Components a drawable entity must have.
+/// Components a drawable entity must have, plus the two it may have.
+///
+/// [`Visibility`] is optional and its absence means *visible* (DESIGN §3), so
+/// no existing entity has to acquire a component to keep being drawn — which is
+/// the whole reason it is a filter here rather than a required member.
 pub type DrawQuery = (
     Entity,
     &'static MeshRef,
     &'static Material,
     &'static Transform,
     Option<&'static Interpolated>,
+    Option<&'static Visibility>,
 );
 
 /// Collect every drawable entity at interpolation `alpha`, sorted.
@@ -238,7 +267,11 @@ pub fn extract_draw_list(
         .is_some_and(TextureLibrary::live_textures);
     let mut items: Vec<DrawItem> = query
         .iter(world)
-        .map(|(entity, mesh, material, transform, interpolated)| DrawItem {
+        // Invisible entities leave before anything is computed for them: no
+        // matrix blend, no variant resolution, no slot in the instance buffer.
+        // `None` is visible, so this costs one discriminant test per drawable.
+        .filter(|(.., visibility)| visibility.is_none_or(|v| v.visible))
+        .map(|(entity, mesh, material, transform, interpolated, _)| DrawItem {
             entity,
             variant: resolve_variant(material.variant, material.texture.is_some(), live),
             mesh: mesh.0,
@@ -285,4 +318,225 @@ pub fn sort_draw_list_for_view(items: &mut [DrawItem], view_proj: &Mat4) {
     // contiguous suffix and `partition_point` finds its start in log n.
     let start = items.partition_point(|item| !item.is_blended());
     items[start..].sort_unstable_by_key(|item| item.blended_key(view_proj));
+}
+
+// ---------------------------------------------------------------------------
+// D5 — frustum culling
+// ---------------------------------------------------------------------------
+
+/// An axis-aligned box. Object space when it comes out of a mesh, world space
+/// once [`transformed`](Aabb::transformed) by a model matrix.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Aabb {
+    pub min: Vec3,
+    pub max: Vec3,
+}
+
+impl Aabb {
+    /// The bounds of `mesh`'s vertices, or `None` for geometry with none.
+    ///
+    /// Computed once, at upload (see [`MeshRegistry`]) — it is O(vertices) and
+    /// the answer never changes, because the handle *is* the content hash.
+    ///
+    /// [`MeshRegistry`]: crate::registry::MeshRegistry
+    pub fn of_mesh(mesh: &runt_mesh::MeshData) -> Option<Aabb> {
+        mesh.bounds().map(|(min, max)| Aabb { min, max })
+    }
+
+    pub fn center(&self) -> Vec3 {
+        (self.min + self.max) * 0.5
+    }
+
+    pub fn half_extents(&self) -> Vec3 {
+        (self.max - self.min) * 0.5
+    }
+
+    /// The smallest axis-aligned box containing this one transformed by
+    /// `model` — centre through the matrix, extents through its absolute value.
+    ///
+    /// Conservative by construction and cheaper than eight corners: `|M₃| · e`
+    /// is exactly the half-extent of the transformed box's own AABB, for any
+    /// rotation, scale or shear. Translation rides along in the centre.
+    pub fn transformed(&self, model: &Mat4) -> Aabb {
+        let center = model.transform_point3(self.center());
+        let basis = Mat3::from_mat4(*model);
+        let abs = Mat3::from_cols(
+            basis.x_axis.abs(),
+            basis.y_axis.abs(),
+            basis.z_axis.abs(),
+        );
+        let extents = abs * self.half_extents();
+        Aabb {
+            min: center - extents,
+            max: center + extents,
+        }
+    }
+}
+
+/// The six clip-space half-spaces of a view-projection, as world-space planes.
+///
+/// Gribb–Hartmann: the clip inequalities `−w ≤ x,y ≤ w` and `0 ≤ z ≤ w` are
+/// each a linear form in the world position, so each is a row combination of
+/// `view_proj`. The depth range is `0..1` (wgpu's convention, and what
+/// [`Camera::projection`](crate::camera::Camera::projection) builds), which is
+/// why the near plane is row 2 alone rather than `row3 + row2`.
+///
+/// The planes are **not** normalized. Nothing here measures a distance — every
+/// test is a sign — so dividing by `|n|` would be six square roots spent to
+/// make a comparison come out the same way.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Frustum {
+    /// `(a, b, c, d)` each, with the inside at `a·x + b·y + c·z + d ≥ 0`.
+    pub planes: [Vec4; 6],
+}
+
+impl Frustum {
+    pub fn from_view_proj(view_proj: &Mat4) -> Frustum {
+        let (r0, r1, r2, r3) = (
+            view_proj.row(0),
+            view_proj.row(1),
+            view_proj.row(2),
+            view_proj.row(3),
+        );
+        Frustum {
+            planes: [
+                r3 + r0, // left:   x ≥ −w
+                r3 - r0, // right:  x ≤  w
+                r3 + r1, // bottom: y ≥ −w
+                r3 - r1, // top:    y ≤  w
+                r2,      // near:   z ≥  0
+                r3 - r2, // far:    z ≤  w
+            ],
+        }
+    }
+
+    /// Whether a **world-space** box might be visible.
+    ///
+    /// The centre/extent form of the plane test: a box is rejected only when it
+    /// lies entirely behind one plane, which is the standard conservative
+    /// answer — it can keep a box that is outside the frustum but outside no
+    /// single plane of it (the corner case, literally), and it can never reject
+    /// one that is visible. That asymmetry is the whole contract: culling may
+    /// cost a draw, never a pixel.
+    ///
+    /// A NaN anywhere in the transform makes every comparison false, so a
+    /// broken matrix keeps its object rather than silently deleting it.
+    pub fn intersects(&self, aabb: &Aabb) -> bool {
+        let center = aabb.center();
+        let half = aabb.half_extents();
+        for plane in &self.planes {
+            let normal = plane.truncate();
+            // Signed distance of the centre (unnormalized) plus the box's
+            // extent along the plane normal: the most-positive corner.
+            let distance = normal.dot(center) + plane.w;
+            let reach = normal.abs().dot(half);
+            if distance + reach < 0.0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether an object-space box placed by `model` might be visible.
+    pub fn intersects_transformed(&self, local: &Aabb, model: &Mat4) -> bool {
+        self.intersects(&local.transformed(model))
+    }
+}
+
+/// Drop every draw whose geometry cannot reach the frustum, in place.
+///
+/// `bounds` supplies each mesh's object-space box; a handle it has no answer
+/// for is **kept**, which is what makes a mesh that has not been measured yet a
+/// performance question rather than a correctness one.
+///
+/// Order-preserving, so a culled list is still sorted, and a pure function of
+/// (list, camera, bounds): shuffling the spawn order that produced the list
+/// cannot change which items survive. Returns how many were dropped.
+pub fn cull_draw_list(
+    items: &mut Vec<DrawItem>,
+    frustum: &Frustum,
+    bounds: impl Fn(MeshHandle) -> Option<Aabb>,
+) -> usize {
+    let before = items.len();
+    items.retain(|item| match bounds(item.mesh) {
+        Some(local) => frustum.intersects_transformed(&local, &item.model),
+        None => true,
+    });
+    before - items.len()
+}
+
+// ---------------------------------------------------------------------------
+// D3 — instanced draw coalescing
+// ---------------------------------------------------------------------------
+
+/// One `draw_indexed` call: a pipeline, a mesh, a texture binding, and a
+/// contiguous range of the frame's instance buffer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InstanceRun {
+    pub variant: MaterialVariant,
+    pub mesh: MeshHandle,
+    pub texture: Option<TextureHandle>,
+    /// First instance index — an offset into the frame's instance buffer, which
+    /// holds one [`InstanceRaw`](crate::InstanceRaw) per draw item in list
+    /// order.
+    pub first: u32,
+    pub count: u32,
+}
+
+impl InstanceRun {
+    /// Whether `item` can join this run: same pipeline, same bind group, same
+    /// vertex/index buffers. Everything that differs between two instances —
+    /// the model matrix, the colour, the params — is per-instance data now, so
+    /// it is not part of the question.
+    pub fn accepts(&self, item: &DrawItem) -> bool {
+        self.variant == item.variant && self.mesh == item.mesh && self.texture == item.texture
+    }
+}
+
+/// Collapse an **already-sorted** list into instanced draws, into `runs`.
+///
+/// Adjacency is the entire rule (see the module docs). It is why this is a pure
+/// function of the list and why it is safe on the blended tail: a run is a
+/// contiguous slice of the order the frame was already going to be drawn in, so
+/// coalescing can never move a draw past another one.
+pub fn coalesce_draws_into(items: &[DrawItem], runs: &mut Vec<InstanceRun>) {
+    runs.clear();
+    for (index, item) in items.iter().enumerate() {
+        match runs.last_mut() {
+            Some(run) if run.accepts(item) => run.count += 1,
+            _ => runs.push(InstanceRun {
+                variant: item.variant,
+                mesh: item.mesh,
+                texture: item.texture,
+                first: index as u32,
+                count: 1,
+            }),
+        }
+    }
+}
+
+/// As [`coalesce_draws_into`], allocating. The renderer reuses a buffer; tests
+/// and callers who want the answer once use this.
+pub fn coalesce_draws(items: &[DrawItem]) -> Vec<InstanceRun> {
+    let mut runs = Vec::new();
+    coalesce_draws_into(items, &mut runs);
+    runs
+}
+
+/// What the last frame actually cost, in the two units that matter.
+///
+/// `items` is what extraction produced, `draws` is how many `draw_indexed`
+/// calls the pass issued. Their ratio is the instancing win, and the gap
+/// between `items` and `instances` is the culling one — cheap to keep, and the
+/// first number to look at when a frame gets slow.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DrawStats {
+    /// Draw items handed to the renderer, before it culled anything.
+    pub items: u32,
+    /// Items dropped by the frustum test.
+    pub culled: u32,
+    /// Instances written to the instance buffer — `items − culled`.
+    pub instances: u32,
+    /// `draw_indexed` calls issued, sky excluded.
+    pub draws: u32,
 }

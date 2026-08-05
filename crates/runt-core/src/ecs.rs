@@ -515,6 +515,54 @@ impl Interpolated {
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MeshRef(pub MeshHandle);
 
+/// Whether an entity is drawn at all (DESIGN §3's core component set).
+///
+/// **Absent means visible.** That is the whole design: nothing that exists
+/// today has to acquire a component to keep being rendered, a game only pays
+/// for the entities it actually hides, and there is no "default visibility"
+/// question to get wrong. [`draw::extract_draw_list`] drops a hidden entity
+/// before it computes anything for it — no interpolated matrix, no variant
+/// resolution, no instance slot, no frustum test.
+///
+/// It is *sim* state, not render state, and deliberately so: a game toggles it
+/// from a `FixedSim` system like any other component, and two runs of the same
+/// replay hide the same things at the same ticks. That is the difference
+/// between this and [`RenderScale`] — hiding an object is a decision the world
+/// makes, and the world is allowed to remember making it.
+///
+/// It replaces the parking trick (translating something to `y = -1000` to get
+/// it off screen), which cost a draw, a matrix and a frustum test to achieve
+/// nothing, and which lied to every system that read a transform.
+///
+/// [`draw::extract_draw_list`]: crate::draw::extract_draw_list
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Visibility {
+    pub visible: bool,
+}
+
+impl Default for Visibility {
+    /// Visible — the same answer as having no `Visibility` at all, so adding
+    /// the component with its default can never change what a frame looks like.
+    fn default() -> Visibility {
+        Visibility::VISIBLE
+    }
+}
+
+impl Visibility {
+    pub const VISIBLE: Visibility = Visibility { visible: true };
+    pub const HIDDEN: Visibility = Visibility { visible: false };
+
+    pub fn new(visible: bool) -> Visibility {
+        Visibility { visible }
+    }
+
+    /// Flip it, returning the new state — what a toggle system wants.
+    pub fn toggle(&mut self) -> bool {
+        self.visible = !self.visible;
+        self.visible
+    }
+}
+
 /// Demo-only: constant-rate rotation about a local axis.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct Spin {

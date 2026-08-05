@@ -8,10 +8,10 @@
 
 use bevy_ecs::prelude::*;
 use glam::{Quat, Vec3, Vec4};
-use runt_core::draw::{build_draw_list, resolve_variant, DrawItem};
+use runt_core::draw::{build_draw_list, cull_draw_list, resolve_variant, Aabb, DrawItem, Frustum};
 use runt_core::registry::MeshHandle;
 use runt_core::texture::{TextureHandle, TextureLibrary};
-use runt_core::{Interpolated, Material, MaterialVariant, MeshRef, Transform};
+use runt_core::{Interpolated, Material, MaterialVariant, MeshRef, Transform, Visibility};
 
 /// Spawn a drawable with an explicit mesh handle and variant.
 fn spawn(world: &mut World, mesh: u64, variant: MaterialVariant, x: f32) -> Entity {
@@ -100,6 +100,64 @@ fn spawn_order_does_not_change_the_draw_order() {
     };
     assert_eq!(build(false), build(true));
     assert_eq!(build(false), vec![(0, 3), (0, 7), (1, 1), (1, 7)]);
+}
+
+#[test]
+fn spawn_order_does_not_change_the_draw_order_with_culling_on() {
+    // The same claim as above, now that a camera gets to remove things (D5) and
+    // a component gets to hide them (D4). Both are order-preserving filters
+    // over the sorted list, so the retained set must still be a pure function
+    // of the world — not of the order it was built in.
+    let pose = Transform::looking_at(Vec3::new(0.0, 0.0, 10.0), Vec3::ZERO, Vec3::Y);
+    let view_proj = runt_core::Camera::default().view_proj(pose.matrix(), 1.0);
+    let frustum = Frustum::from_view_proj(&view_proj);
+    let unit = Aabb {
+        min: Vec3::splat(-0.5),
+        max: Vec3::splat(0.5),
+    };
+
+    // (mesh, variant, x, visible). Two are parked far off to the side and one
+    // is hidden outright, so all three filters have something to do.
+    let mut specs = vec![
+        (7u64, MaterialVariant::VERTEX_COLOR, 0.0f32, true),
+        (3, MaterialVariant::NONE, 900.0, true),
+        (7, MaterialVariant::NONE, -1.0, false),
+        (1, MaterialVariant::VERTEX_COLOR, 1.5, true),
+        (3, MaterialVariant::VERTEX_COLOR, -900.0, true),
+        (1, MaterialVariant::NONE, -2.0, true),
+    ];
+    let build = |specs: &[(u64, MaterialVariant, f32, bool)]| {
+        let mut world = World::new();
+        for (mesh, variant, x, visible) in specs {
+            let entity = spawn(&mut world, *mesh, *variant, *x);
+            if !visible {
+                world.entity_mut(entity).insert(Visibility::HIDDEN);
+            }
+        }
+        let mut items = build_draw_list(&mut world, 0.0);
+        cull_draw_list(&mut items, &frustum, |_| Some(unit));
+        // Keys plus position: the entity ids differ between two worlds, the
+        // content does not.
+        items
+            .iter()
+            .map(|i| (i.variant.bits(), i.mesh.0, i.model.w_axis.x))
+            .collect::<Vec<_>>()
+    };
+
+    let forward = build(&specs);
+    assert_eq!(forward.len(), 3, "one hidden, two off screen, three drawn");
+    specs.reverse();
+    assert_eq!(build(&specs), forward);
+    // Rotated rather than reversed — a third order, same answer.
+    specs.rotate_left(2);
+    assert_eq!(build(&specs), forward);
+
+    // And the answer itself, so a change of *policy* has to be deliberate.
+    assert_eq!(
+        forward,
+        vec![(0, 1, -2.0), (1, 1, 1.5), (1, 7, 0.0)],
+        "variant, then mesh, then entity — with the culled and hidden gone"
+    );
 }
 
 #[test]
