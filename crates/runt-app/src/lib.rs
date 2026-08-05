@@ -51,6 +51,14 @@ pub mod storage;
 /// and silence when a game does not ask for either.
 pub mod audio;
 
+/// Where the content cache's bytes live per platform (DESIGN §6): a directory
+/// natively, IndexedDB on web. The engine defines the store; the host picks one.
+pub mod cache;
+
+/// The two IndexedDB calls [`cache`] needs, and nothing else.
+#[cfg(target_arch = "wasm32")]
+pub mod idb;
+
 pub use audio::AudioConfig;
 
 // ---------------------------------------------------------------------------
@@ -90,6 +98,15 @@ pub struct RunConfig {
     /// the last word. Anything that must survive on web has to be written as it
     /// happens.
     pub on_exit: Option<SetupFn>,
+    /// What to call this program's slice of persistent storage: a directory
+    /// under the user's cache directory natively, an IndexedDB database on web.
+    ///
+    /// `None` derives one from [`title`](RunConfig::title)
+    /// ([`cache::slug`]), which is right until two programs pick titles that
+    /// squeeze to the same name — then say so explicitly, because the cost of
+    /// getting it wrong is two games sharing a cache and each treating the
+    /// other's entries as misses forever.
+    pub cache_name: Option<String>,
     /// Sound, or `None` for a silent program (DESIGN §8).
     ///
     /// Opt-in per program rather than per build: `runt-native` and the engine
@@ -108,6 +125,7 @@ impl RunConfig {
             quality: None,
             setup: None,
             on_exit: None,
+            cache_name: None,
             audio: None,
         }
     }
@@ -145,12 +163,26 @@ impl RunConfig {
         self
     }
 
-    /// The [`SimConfig`](runt_core::SimConfig) this describes, with the host's
-    /// platform cache attached (DESIGN §6: persistence is a host opt-in).
-    fn sim_config(&self) -> runt_core::SimConfig {
+    /// See [`cache_name`](RunConfig::cache_name).
+    pub fn with_cache_name(mut self, name: impl Into<String>) -> RunConfig {
+        self.cache_name = Some(name.into());
+        self
+    }
+
+    /// The storage name this config resolves to.
+    pub fn cache_name(&self) -> String {
+        match &self.cache_name {
+            Some(name) => cache::slug(name),
+            None => cache::slug(&self.title),
+        }
+    }
+
+    /// The [`SimConfig`](runt_core::SimConfig) this describes, over the store
+    /// the host opened for it (DESIGN §6: persistence is a host opt-in).
+    fn sim_config(&self, store: Box<dyn runt_core::CacheStore>) -> runt_core::SimConfig {
         let config = runt_core::SimConfig::default()
             .with_scene(self.scene_ron.clone())
-            .with_cache(runt_core::cache::platform_default());
+            .with_cache(store);
         match self.quality {
             Some(q) => config.with_quality(q),
             None => config,
@@ -189,6 +221,10 @@ struct Host {
     /// for a program that asked for none — the engine cannot tell the
     /// difference, and neither can a determinism test.
     audio: Box<dyn runt_core::AudioBackend>,
+    /// The content cache's storage side (DESIGN §6). The engine holds the
+    /// store; the host holds this, which is the only thing that knows how to
+    /// get bytes *out* again on a platform where writing is asynchronous.
+    cache: cache::HostCache,
 }
 
 impl Host {
@@ -248,9 +284,14 @@ impl Host {
         surface.configure(&device, &config);
 
         // The host is where the persistent half of the content cache is opted
-        // into (DESIGN §6): a disk cache natively, nothing on web until the
-        // IndexedDB/worker story lands. `runt-core` itself never assumes storage.
-        let mut engine = Engine::from_config(device.clone(), queue, format, run.sim_config());
+        // into (DESIGN §6): a directory natively, IndexedDB on web. This is the
+        // last point at which storage may be *awaited* — after it, the engine's
+        // synchronous `CacheStore` is the only view anyone has (see
+        // `cache::HostCache`), so the read has to finish here, before the scene
+        // load inside `from_config` asks its first question.
+        let mut cache = cache::HostCache::open(&run.cache_name()).await;
+        let mut engine =
+            Engine::from_config(device.clone(), queue, format, run.sim_config(cache.take_store()));
 
         // The scene exists (`Startup` ran inside `from_config`) and no tick has
         // happened yet: the one moment a game can install `FixedSim` systems
@@ -281,6 +322,7 @@ impl Host {
             title: run.title,
             shown_status: String::new(),
             audio,
+            cache,
         };
         host.sync_status();
         Ok(host)
@@ -379,6 +421,18 @@ impl Host {
 
         self.engine.queue().present(frame);
         self.sync_status();
+
+        // Anything the frame generated goes to storage *after* it was
+        // presented, never before: the first frame is the slow one (it is the
+        // one that ran the bake), and making the player wait on a database to
+        // see it would trade the exact thing the cache exists to buy. On web
+        // this hands the write to the browser and returns; natively it is
+        // nothing at all, the bytes are already on disk.
+        //
+        // Per frame rather than once, because a cache write is not a start-up
+        // event — a level loaded ten minutes in bakes too. It costs one lock
+        // and a zero check when there is nothing to say.
+        self.cache.flush();
     }
 
     /// Read every connected pad and push whatever moved since the last frame.

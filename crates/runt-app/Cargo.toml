@@ -67,6 +67,21 @@ web-sys = { version = "0.3", features = [
     "Navigator",
     # `src/storage.rs`.
     "Storage",
+    # IndexedDB (`src/idb.rs`): the persistent half of the content cache on web
+    # (DESIGN §6). One database, one object store of string → bytes, read whole
+    # and written in batches — hence `IdbObjectStore`'s get_all/put and no
+    # cursor bindings.
+    "Event",
+    "EventTarget",
+    "DomException",
+    "IdbFactory",
+    "IdbDatabase",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbObjectStore",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "DomStringList",
 ] }
 # The audio backend calls two functions on `window.runtAudio` (see
 # `web/runt-audio.js`). That needs `Reflect` and `Uint8Array` and nothing else —

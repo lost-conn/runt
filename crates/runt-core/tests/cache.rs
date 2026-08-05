@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use glam::{Vec2, Vec3};
-use runt_core::cache::{CacheStore, GenCache, NativeDiskCache, NoopCache};
+use runt_core::cache::{CacheStore, GenCache, MemCache, NativeDiskCache, NoopCache};
 use runt_core::gen::{GeneratorSpec, Shading};
 use runt_core::{MeshHandle, MeshLibrary, Quality, TerrainParams};
 use runt_mesh::MeshData;
@@ -297,6 +297,223 @@ fn the_noop_store_never_hits_and_never_lies() {
     assert_eq!(a, b, "no persistence, same answer — that is the invariant");
     assert_eq!(cold.stats().store_hits, 0);
     assert_eq!(cache.store_label(), "noop");
+}
+
+// ---------------------------------------------------------------------------
+// Blobs: bakes the engine stores but cannot read (D13)
+// ---------------------------------------------------------------------------
+
+/// Stand-in for a game's baked level: the engine only ever sees the bytes.
+fn fake_bake(tag: u8, len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(tag)).collect()
+}
+
+#[test]
+fn blobs_round_trip_and_survive_a_reload_byte_identical() {
+    // The determinism doctrine at the blob level: what goes in comes back out,
+    // and a *second session* over the same directory sees the same bytes. The
+    // stronger claim — that those bytes equal what a fresh bake would produce —
+    // needs the baker, so it lives port-side (shift/src/level.rs) where the
+    // `Built` struct is; this is the half the engine can state on its own.
+    let dir = TempDir::new("blob-roundtrip");
+    let payloads = [fake_bake(7, 0), fake_bake(11, 1), fake_bake(23, 64 * 1024)];
+
+    {
+        let store = NativeDiskCache::new(dir.path());
+        for (i, bytes) in payloads.iter().enumerate() {
+            store.store_blob(i as u64, bytes);
+            assert_eq!(store.load_blob(i as u64).as_ref(), Some(bytes), "same session");
+        }
+    }
+
+    let reopened = NativeDiskCache::new(dir.path());
+    for (i, bytes) in payloads.iter().enumerate() {
+        assert_eq!(
+            reopened.load_blob(i as u64).as_ref(),
+            Some(bytes),
+            "a new session must read back the same bytes"
+        );
+    }
+    assert_eq!(reopened.load_blob(999), None, "a key nobody wrote is a miss");
+}
+
+#[test]
+fn a_corrupted_blob_is_refused_rather_than_trusted() {
+    // The blob half of the untrusted-storage stance. A mesh proves itself by
+    // re-hashing; a blob is opaque, so the frame's checksum stands in — and it
+    // has to catch all three ways an entry can be wrong.
+    let dir = TempDir::new("blob-corrupt");
+    let store = NativeDiskCache::new(dir.path());
+    let payload = fake_bake(3, 4096);
+    let path = |hash: u64| dir.path().join("blob").join(format!("{hash:016x}.blob"));
+
+    // 1. Truncated (a torn write, a full disk).
+    store.store_blob(1, &payload);
+    let bytes = std::fs::read(path(1)).expect("read");
+    std::fs::write(path(1), &bytes[..bytes.len() / 2]).expect("truncate");
+    assert_eq!(store.load_blob(1), None, "a truncated blob must be refused");
+
+    // 2. Flipped bit inside the payload.
+    store.store_blob(2, &payload);
+    let mut bytes = std::fs::read(path(2)).expect("read");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    std::fs::write(path(2), &bytes).expect("corrupt");
+    assert_eq!(store.load_blob(2), None, "a bit-rotted blob must be refused");
+
+    // 3. Misfiled: a whole, valid entry sitting under somebody else's key. This
+    //    is the one plain length/parse checks would wave through, and the one
+    //    that would silently serve the wrong level.
+    store.store_blob(3, &payload);
+    std::fs::copy(path(3), path(4)).expect("misfile");
+    assert_eq!(store.load_blob(3), Some(payload), "the honest key still reads");
+    assert_eq!(store.load_blob(4), None, "the impostor key must not");
+}
+
+#[test]
+fn the_user_cache_directory_is_per_app_and_refuses_a_path() {
+    // Where a *shipped* program's cache goes, as opposed to `in_target`'s
+    // build-directory answer. The app name becomes a directory component, so
+    // anything that could climb out of it has to be refused rather than escaped.
+    if let Some(store) = NativeDiskCache::in_cache_dir("runt-selftest") {
+        let root = store.root();
+        assert!(root.ends_with("runt-selftest/content"), "{}", root.display());
+        assert!(root.is_absolute());
+    } else {
+        // No HOME and no XDG_CACHE_HOME: nowhere to put it, which is a legal
+        // answer (the caller falls back to a store that keeps nothing).
+        assert!(std::env::var_os("HOME").is_none());
+    }
+    for hostile in ["", "..", "../../etc", "a/b"] {
+        assert!(
+            NativeDiskCache::in_cache_dir(hostile).is_none(),
+            "{hostile:?} must not become a directory"
+        );
+    }
+}
+
+#[test]
+fn a_store_with_no_blob_support_is_a_miss_and_not_a_lie() {
+    // Every existing store predates blobs and gets the default impls, so the
+    // engine's contract has to hold for them unchanged: a write is accepted and
+    // discarded, a read is a miss, and the caller re-bakes.
+    let store = NoopCache;
+    store.store_blob(1, &fake_bake(1, 32));
+    assert_eq!(store.load_blob(1), None);
+}
+
+// ---------------------------------------------------------------------------
+// MemCache: the web's synchronous face on an asynchronous database (D13)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_mem_cache_records_writes_but_not_preloads() {
+    // The flush contract. Entries that came *from* storage must not be written
+    // back to it — a page load would otherwise rewrite the whole database it
+    // just read, every time.
+    let mesh = specs()[0].generate(Quality::FULL);
+    let hash = MeshHandle::of(&mesh).0;
+
+    let cold = MemCache::new();
+    assert_eq!(cold.pending_writes(), 0);
+    cold.store_mesh(hash, &mesh);
+    cold.store_blob(77, &fake_bake(5, 512));
+    cold.store_key(9, hash);
+    assert_eq!(cold.load_mesh(hash).as_ref(), Some(&mesh));
+    assert_eq!(cold.load_blob(77), Some(fake_bake(5, 512)));
+    assert_eq!(cold.load_key(9), Some(hash));
+    assert_eq!(cold.pending_writes(), 3);
+
+    // What the host would hand to IndexedDB.
+    let written = cold.take_written();
+    assert_eq!(written.len(), 3, "one entry per distinct key written");
+    assert_eq!(cold.pending_writes(), 0, "draining is idempotent");
+    assert!(cold.take_written().is_empty());
+    assert_eq!(cold.len(), 3, "draining does not empty the cache");
+
+    // Next page load: the same entries come back as preloads and read fine,
+    // and nothing is queued to be written back.
+    let warm = MemCache::preloaded(written);
+    assert_eq!(warm.len(), 3);
+    assert_eq!(warm.pending_writes(), 0);
+    assert_eq!(warm.load_mesh(hash).as_ref(), Some(&mesh));
+    assert_eq!(warm.load_blob(77), Some(fake_bake(5, 512)));
+    assert_eq!(warm.load_key(9), Some(hash));
+    assert!(warm.take_written().is_empty(), "a pure read flushes nothing");
+}
+
+#[test]
+fn a_mem_cache_rewrite_is_queued_once() {
+    let cache = MemCache::new();
+    for i in 0..5 {
+        cache.store_blob(1, &fake_bake(i, 16));
+    }
+    let written = cache.take_written();
+    assert_eq!(written.len(), 1, "five writes to one key are one entry to flush");
+    assert_eq!(cache.load_blob(1), Some(fake_bake(4, 16)), "the last one wins");
+}
+
+#[test]
+fn clones_of_a_mem_cache_share_one_map() {
+    // The host keeps a handle while the engine holds the store as a
+    // `Box<dyn CacheStore>`; if those were separate maps the flush would always
+    // be empty and web would never warm up.
+    let host = MemCache::new();
+    let engine: Box<dyn CacheStore> = Box::new(host.clone());
+    engine.store_blob(1, &fake_bake(2, 8));
+    assert_eq!(host.pending_writes(), 1);
+    assert_eq!(host.take_written().len(), 1);
+    assert_eq!(engine.load_blob(1), Some(fake_bake(2, 8)));
+}
+
+#[test]
+fn a_second_web_session_generates_nothing() {
+    // The whole point of D13's web half, end to end: session one runs every
+    // generator and hands its writes to (a stand-in for) IndexedDB; session two
+    // starts from those bytes and runs none — with identical geometry, which is
+    // the invariant this file exists to defend.
+    let host = MemCache::new();
+    let (cold, cold_handles, cold_meshes) = run(Box::new(host.clone()));
+    assert_eq!(cold.stats().generated as usize, specs().len());
+
+    let stored = host.take_written();
+    assert!(!stored.is_empty(), "a cold session must leave something behind");
+
+    let (warm, warm_handles, warm_meshes) = run(Box::new(MemCache::preloaded(stored)));
+    assert_eq!(warm.stats().generated, 0, "a warm page load must not generate");
+    assert_eq!(warm.stats().store_hits as usize, specs().len());
+    assert_eq!(cold_handles, warm_handles);
+    assert_eq!(cold_meshes, warm_meshes);
+    assert_eq!(warm.store_label(), "memory");
+}
+
+#[test]
+fn a_mem_cache_refuses_a_corrupted_preload() {
+    // Bytes out of a browser database are no more trustworthy than bytes off a
+    // disk: same validate-on-load, same fall-through to regeneration.
+    let good = MemCache::new();
+    good.store_blob(42, &fake_bake(9, 256));
+    let entries = good.take_written();
+    assert_eq!(entries, vec![("blob/000000000000002a".to_string(), entries[0].1.clone())]);
+
+    // Truncated in storage.
+    let mut torn = entries.clone();
+    torn[0].1.truncate(4); // Shorter than the frame's checksum.
+    assert_eq!(MemCache::preloaded(torn).load_blob(42), None);
+
+    // Whole, valid, and filed under a key it was not written for.
+    let misfiled = vec![("blob/00000000000000ff".to_string(), entries[0].1.clone())];
+    let store = MemCache::preloaded(misfiled);
+    assert_eq!(store.load_blob(0xff), None, "the frame is bound to its key");
+    assert_eq!(store.load_blob(42), None, "and the real key is simply absent");
+}
+
+#[test]
+fn textures_never_persist_through_a_mem_cache() {
+    // Not a preference: baking a texture back out of the GPU needs a blocking
+    // device poll, and the platform this store exists for has none. The flag is
+    // the promise, so it stays false wherever the memory store might run.
+    assert!(!MemCache::new().caches_textures());
 }
 
 #[test]
