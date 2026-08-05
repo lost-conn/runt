@@ -114,6 +114,16 @@ pub struct RunConfig {
     /// gets the same [`AudioEvent`](runt_core::AudioEvent) stream pumped into
     /// whatever the platform has. The engine cannot tell which it got.
     pub audio: Option<AudioConfig>,
+    /// Default render scale when the adapter is an integrated (or software)
+    /// GPU — the first sliver of DESIGN §11's device probe. Applied **before**
+    /// the `setup` hook, so anything that pins a scale explicitly (a settings
+    /// file, a `?scale=` query) simply wins by running later. `None` leaves
+    /// the engine default (1.0) everywhere.
+    ///
+    /// A default, not a tier system: the real quality-preset story is game-side
+    /// (settings UI) and this field only answers "what should a machine that
+    /// never opened the settings get?".
+    pub integrated_gpu_scale: Option<f32>,
 }
 
 impl RunConfig {
@@ -127,6 +137,7 @@ impl RunConfig {
             on_exit: None,
             cache_name: None,
             audio: None,
+            integrated_gpu_scale: None,
         }
     }
 
@@ -139,6 +150,12 @@ impl RunConfig {
 
     pub fn with_quality(mut self, quality: f32) -> RunConfig {
         self.quality = Some(quality);
+        self
+    }
+
+    /// See [`integrated_gpu_scale`](RunConfig::integrated_gpu_scale).
+    pub fn with_integrated_gpu_scale(mut self, scale: f32) -> RunConfig {
+        self.integrated_gpu_scale = Some(scale);
         self
     }
 
@@ -292,6 +309,24 @@ impl Host {
         let mut cache = cache::HostCache::open(&run.cache_name()).await;
         let mut engine =
             Engine::from_config(device.clone(), queue, format, run.sim_config(cache.take_store()));
+
+        // Integrated-GPU default render scale, before `setup` so an explicit
+        // pin (settings, `?scale=`) wins by running later. `Cpu` is the
+        // software-rasterizer case and gets the same mercy.
+        if let Some(scale) = run.integrated_gpu_scale {
+            use wgpu::DeviceType::{Cpu, IntegratedGpu, Other};
+            let ty = adapter.get_info().device_type;
+            // `Other` is what the WebGL2 fallback reports — the browser hides
+            // the GPU. A WebGPU-capable browser on a discrete card answers
+            // honestly and keeps full scale; a hidden GPU errs chunky, which
+            // is the right failure mode for the §11 low-end pillar.
+            let treat_as_integrated =
+                matches!(ty, IntegratedGpu | Cpu) || (cfg!(target_arch = "wasm32") && ty == Other);
+            if treat_as_integrated {
+                log::info!("integrated/hidden adapter ({ty:?}): default render scale {scale}");
+                engine.sim_mut().set_render_scale(scale);
+            }
+        }
 
         // The scene exists (`Startup` ran inside `from_config`) and no tick has
         // happened yet: the one moment a game can install `FixedSim` systems
