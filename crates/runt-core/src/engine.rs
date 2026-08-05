@@ -246,6 +246,18 @@ impl Engine {
         self.renderer
             .set_render_clock(self.render_seconds as f32, self.sim.alpha());
 
+        // The HUD the world holds right now (plan D11, `crate::ui`). Mirrored
+        // into the renderer every frame — the batch is rebuilt each frame by
+        // whoever owns it, so "what the world says" is always the whole truth,
+        // and a world that says nothing draws no UI pass at all. A world with
+        // no `UiBatch` in it (a hand-built one, an older host) is the same
+        // case as an empty batch.
+        let (quads, atlas) = match self.sim.world().get_resource::<crate::ui::UiBatch>() {
+            Some(batch) => (batch.quads.as_slice(), batch.atlas),
+            None => (&[][..], None),
+        };
+        self.renderer.set_ui_batch(quads, atlas);
+
         let Some(frame) = self.sim.frame_params(aspect) else {
             if !self.warned_no_camera {
                 log::warn!("no camera entity in the world; nothing will be drawn");

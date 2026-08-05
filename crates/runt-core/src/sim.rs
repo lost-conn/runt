@@ -295,6 +295,11 @@ impl Sim {
         world.insert_resource(crate::ecs::RenderScale::default());
         world.insert_resource(SimSpeed::default());
         world.insert_resource(crate::audio::AudioOut::new());
+        // The frame's HUD (plan D11). A standard output seam like `StatusLine`
+        // and `AudioOut`: present from tick zero so a game's HUD system can take
+        // `ResMut<UiBatch>` without inserting it first, empty until something
+        // fills it, and free while it stays that way.
+        world.insert_resource(crate::ui::UiBatch::default());
         world.insert_resource(quality);
         world.insert_resource(GenCache::new(cache));
         world.insert_resource(PendingScene(scene));

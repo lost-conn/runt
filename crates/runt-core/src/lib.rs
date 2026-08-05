@@ -45,6 +45,8 @@ pub mod sky;
 /// Procedural texture specs and their CPU evaluator (DESIGN §7).
 pub mod texture;
 pub mod trace;
+/// Screen-space UI: one instanced quad batch drawn after the frame is finished.
+pub mod ui;
 
 /// The background pass's WGSL. Standalone (no feature consts), unlike
 /// [`material::BASE_SHADER`].
@@ -54,6 +56,11 @@ pub const SKY_SHADER: &str = include_str!("sky.wgsl");
 /// (DESIGN §11). Standalone like [`SKY_SHADER`]; see
 /// [`Renderer::render_scaled`].
 pub const BLIT_SHADER: &str = include_str!("blit.wgsl");
+
+/// The screen-space UI pass's WGSL (see [`ui`]). Standalone like
+/// [`BLIT_SHADER`]; re-exported from [`ui::UI_SHADER`] so the three standalone
+/// shaders sit together.
+pub const UI_SHADER: &str = ui::UI_SHADER;
 
 pub use action::{
     resolve_actions, ActionId, Actions, Bindings, Source, StickDir, DEFAULT_DEADZONE, MAX_ACTIONS,
@@ -94,6 +101,7 @@ pub use sim::{Sim, SimConfig, SimSpeed, MAX_ACCUMULATED, TICK_DT};
 pub use texture::{
     NoiseSpec, NormalMode, NormalSpec, TextureHandle, TextureLibrary, TextureSpec,
 };
+pub use ui::{UiBatch, UiPass, UiQuad, PREMULTIPLIED_BLEND};
 pub use noise::{CellReturn, Fractal, Lattice};
 pub use trace::{InputTrace, TickEvent};
 
@@ -371,6 +379,18 @@ pub struct Renderer {
     offscreen: Option<Offscreen>,
     /// The blit pipeline and its nearest sampler, compiled on first use.
     blit: Option<Blit>,
+
+    /// The screen-space UI pipeline, compiled the first time a frame actually
+    /// has a HUD in it (see [`ensure_ui`](Renderer::ensure_ui)).
+    ui: Option<ui::UiPass>,
+    /// This frame's HUD, copied out of the world by
+    /// [`set_ui_batch`](Renderer::set_ui_batch).
+    ///
+    /// Render-side state, held here for the same reason [`phase`](Renderer::phase)
+    /// is: nothing in a tick may read it. The `Vec` is reused, so a steady HUD
+    /// allocates nothing after its first frame.
+    ui_quads: Vec<ui::UiQuad>,
+    ui_atlas: Option<texture::TextureHandle>,
 }
 
 /// The internal color target for a scaled frame, plus the bind group that
@@ -473,6 +493,9 @@ impl Renderer {
             depth: None,
             offscreen: None,
             blit: None,
+            ui: None,
+            ui_quads: Vec::new(),
+            ui_atlas: None,
         }
     }
 
@@ -587,6 +610,38 @@ impl Renderer {
     pub fn set_render_clock(&mut self, seconds: f32, alpha: f32) {
         self.time[0] = seconds;
         self.time[1] = alpha;
+    }
+
+    /// Hand the next frame its screen-space HUD (DESIGN §13, plan D11; see
+    /// [`ui`]).
+    ///
+    /// Copies rather than borrows, because the batch lives in the world and the
+    /// frame is drawn after that borrow ends. The copy is a `memcpy` of
+    /// 48 bytes per quad into a `Vec` that keeps its capacity, which is cheaper
+    /// than the lifetime it saves.
+    ///
+    /// Call it every frame: the batch is *replaced*, not accumulated, so a
+    /// frame with nothing to draw is passed an empty slice and costs nothing at
+    /// all — no pass is encoded and no pipeline is compiled. A host driving the
+    /// `Renderer` directly and never calling this never sees the UI path.
+    /// Through an [`Engine`], the [`UiBatch`] resource is mirrored here once per
+    /// frame and this is that door.
+    pub fn set_ui_batch(&mut self, quads: &[ui::UiQuad], atlas: Option<texture::TextureHandle>) {
+        self.ui_quads.clear();
+        self.ui_quads.extend_from_slice(quads);
+        self.ui_atlas = atlas;
+    }
+
+    /// Quads the next frame will paint.
+    pub fn ui_quad_count(&self) -> usize {
+        self.ui_quads.len()
+    }
+
+    /// Whether the UI pipeline has been compiled — false until the first frame
+    /// with a non-empty batch, which is what "an empty HUD costs nothing" means
+    /// concretely.
+    pub fn ui_ready(&self) -> bool {
+        self.ui.is_some()
     }
 
     /// Compile `variant`'s pipeline if it is not cached yet.
@@ -904,6 +959,45 @@ impl Renderer {
             pass.draw(0..3, 0..1);
         }
 
+        // The HUD, last, over `view` at the host's own resolution — after the
+        // blit rather than before it, which is the whole point: the world may be
+        // drawn at half scale and chonked back up, and the UI on top of it is
+        // still crisp at surface pixels. It rides this encoder, so a frame with
+        // a HUD is still exactly one submission.
+        //
+        // An empty batch skips all of it — no `ensure_ui`, no pass, no draw —
+        // so a game with no HUD produces the byte-identical frame it did before
+        // this pass existed.
+        if !self.ui_quads.is_empty() {
+            self.ensure_ui();
+            // Split the borrow: the pass owns its own buffers and needs the
+            // device, the queue and the texture registry, all of which are
+            // sibling fields.
+            let Renderer {
+                ui: Some(ui),
+                device,
+                queue,
+                textures,
+                ui_quads,
+                ui_atlas,
+                ..
+            } = self
+            else {
+                unreachable!("ensured above")
+            };
+            ui.encode(
+                device,
+                queue,
+                &mut encoder,
+                view,
+                width,
+                height,
+                ui_quads,
+                *ui_atlas,
+                textures,
+            );
+        }
+
         self.queue.submit(Some(encoder.finish()));
     }
 
@@ -1210,6 +1304,19 @@ impl Renderer {
             layout,
             sampler,
         });
+    }
+
+    /// Compile the screen-space UI pipeline, once, the first time a frame has a
+    /// non-empty [`UiBatch`] in it.
+    ///
+    /// Lazy for the blit's reason, one notch stronger: a game with no HUD pays
+    /// for no shader module, no sampler, no pipeline, no 1×1 texture and no
+    /// instance buffer — and, because the pass is skipped entirely, not one
+    /// command in the stream either.
+    fn ensure_ui(&mut self) {
+        if self.ui.is_none() {
+            self.ui = Some(ui::UiPass::new(&self.device, &self.queue, self.target_format));
+        }
     }
 
     /// Keep the internal color target at `width` × `height`, recreating it (and
