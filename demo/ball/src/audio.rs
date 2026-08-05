@@ -87,6 +87,10 @@ pub fn bank() -> PatchBank {
                 resonance: 1.1,
                 gain: 0.5,
                 jitter_semitones: 0.03,
+                // …and no noise: E7's three noise fields stay at their zero
+                // defaults, so these three presets render the samples they
+                // rendered before the field existed. See the bank docs.
+                ..PluckParams::default()
             }),
         )
         .with(
@@ -103,6 +107,10 @@ pub fn bank() -> PatchBank {
                 resonance: 0.8,
                 gain: 0.9,
                 jitter_semitones: 0.5,
+                // …and no noise: E7's three noise fields stay at their zero
+                // defaults, so these three presets render the samples they
+                // rendered before the field existed. See the bank docs.
+                ..PluckParams::default()
             }),
         )
         .with(
@@ -119,6 +127,10 @@ pub fn bank() -> PatchBank {
                 resonance: 0.9,
                 gain: 0.55,
                 jitter_semitones: 0.0,
+                // …and no noise: E7's three noise fields stay at their zero
+                // defaults, so these three presets render the samples they
+                // rendered before the field existed. See the bank docs.
+                ..PluckParams::default()
             }),
         )
         .with(

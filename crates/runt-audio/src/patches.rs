@@ -80,6 +80,38 @@ fn decay_coefficient(seconds: f32, sample_rate: f32, ln_target: f32) -> f32 {
 /// One instance is built per voice slot at pool construction and re-triggered
 /// forever after — including with a *different* preset, which is why every knob
 /// that could vary between presets is a `Shared` rather than a `dc()` constant.
+///
+/// ## Two graphs, and why the noise is not in the first one
+///
+/// ```text
+/// tone   0-in 1-out   two saws -> lowpass -> dcblock        (unchanged since E1)
+/// noise  0-in 1-out   noise -> highpass -> the same lowpass -> dcblock
+/// Rust                the envelopes, the note choice, and the crossfade
+/// ```
+///
+/// Godot mixes its noise into the oscillator **before** the filter
+/// (`synth_engine.gd:744`, then `:747`), and this does too — but through a
+/// *second copy* of the filter rather than by feeding one filter a summed
+/// signal. That looks like a strange way to write `lowpass(a + b)`, and the
+/// reason is exact:
+///
+/// - An SVF with a swept cutoff is still a **linear** system, so
+///   `LP(a) + LP(b) == LP(a + b)` — the two arrangements are the same filter.
+///   (`dcblock()` is linear too, and the noise carries its own envelope *into*
+///   the filter, which is where Godot applies it, so nothing moves.)
+/// - Putting a `noise()` node inside the tone graph would not have been free.
+///   fundsp seeds a graph by walking it (`AudioUnit::ping`), threading one hash
+///   through every node in traversal order, and `WaveSynth::reset` starts its
+///   phase at `rnd1(hash)` — so inserting *any* node ahead of the two saws
+///   changes the phase they start at, and every pluck the crate has ever
+///   rendered would have come out different. A separate graph is what makes
+///   `noise_mix: 0.0` **bit-identical** to the pre-noise build rather than
+///   merely indistinguishable, which is the promise DESIGN §8 makes about a
+///   patch's params.
+///
+/// The second graph is built once per slot at pool construction and, when a
+/// preset leaves `noise_mix` at zero, is never ticked: the per-sample cost of
+/// the whole feature on a silent preset is one `bool` tested outside the loop.
 pub struct Pluck {
     net: Box<dyn AudioUnit>,
     /// Fundamental of oscillator 1, Hz.
@@ -90,6 +122,14 @@ pub struct Pluck {
     detune_gain: Shared,
     cutoff: Shared,
     resonance: Shared,
+
+    /// The noise half. Reads the same `cutoff`/`resonance` `Shared`s as `net`,
+    /// so the two paths are one filter in two boxes — see the struct docs.
+    noise: Box<dyn AudioUnit>,
+    /// `noise_mix * noise_env`, written per sample. Applied *inside* the graph,
+    /// ahead of the filters, because that is where Godot applies it.
+    noise_gain: Shared,
+    noise_highpass: Shared,
 
     sample_rate: f32,
     /// Note frequency chosen at trigger time, before [`ParamId::PITCH`].
@@ -107,6 +147,15 @@ pub struct Pluck {
     decay_coef: f32,
     attacking: bool,
     active: bool,
+
+    /// `params.noise_mix`, clamped. Fixed for the life of a note — there is no
+    /// [`ParamId`] for it, deliberately: "how much of this sound is noise" is a
+    /// property of the sound, not a thing a game re-aims mid-strike.
+    noise_mix: f32,
+    /// `1 - noise_mix`, Godot's `sample * (1 - p.noise_mix)`.
+    tone_gain: f32,
+    noise_env: f32,
+    noise_coef: f32,
 }
 
 impl Pluck {
@@ -132,6 +181,23 @@ impl Pluck {
         net.allocate();
         net.reset();
 
+        // The noise half. Its `>> highpass() >> … >> lowpass()` is `Hihat`'s
+        // shape and its `dc(0.7)` is `Kick`'s flat click Q, for the same reason:
+        // a resonant peak on a noise burst is a whistle. The `cutoff` and
+        // `resonance` `Shared`s are *the tone graph's* — one filter, two boxes.
+        let noise_gain = shared(0.0);
+        let noise_highpass = shared(MIN_CUTOFF);
+        let noise_path = ((noise() * var(&noise_gain)) | var(&noise_highpass) | dc(0.7))
+            >> highpass()
+            >> (pass() | var(&cutoff) | var(&resonance))
+            >> lowpass()
+            >> dcblock();
+
+        let mut noise_net = Box::new(noise_path) as Box<dyn AudioUnit>;
+        noise_net.set_sample_rate(sample_rate as f64);
+        noise_net.allocate();
+        noise_net.reset();
+
         Pluck {
             net,
             freq_a,
@@ -139,6 +205,9 @@ impl Pluck {
             detune_gain,
             cutoff,
             resonance,
+            noise: noise_net,
+            noise_gain,
+            noise_highpass,
             sample_rate,
             note_hz: 440.0,
             detune: 1.005,
@@ -152,6 +221,10 @@ impl Pluck {
             decay_coef: 0.999,
             attacking: false,
             active: false,
+            noise_mix: 0.0,
+            tone_gain: 1.0,
+            noise_env: 0.0,
+            noise_coef: 1.0,
         }
     }
 
@@ -194,12 +267,42 @@ impl Pluck {
         self.attacking = true;
         self.active = true;
 
+        // -- the noise half ------------------------------------------------
+        self.noise_mix = if params.noise_mix.is_finite() {
+            params.noise_mix.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.tone_gain = 1.0 - self.noise_mix;
+        self.noise_env = 1.0;
+        // `noise_decay_s <= 0` is Godot's "the noise follows the amp envelope"
+        // (`synth_engine.gd:737`): a coefficient of exactly 1.0 holds the burst
+        // open and lets the shared envelope below do all the shaping.
+        self.noise_coef = if params.noise_decay_s > 0.0 {
+            decay_coefficient(params.noise_decay_s, self.sample_rate, LN_60DB)
+        } else {
+            1.0
+        };
+        self.noise_highpass.set_value(if params.noise_highpass_hz > MIN_CUTOFF {
+            clamp_cutoff(params.noise_highpass_hz, self.sample_rate)
+        } else {
+            MIN_CUTOFF // a bypass, exactly as `HihatParams::highpass_hz` documents
+        });
+        self.noise_gain.set_value(self.noise_mix);
+
         // FINDINGS landmine 4: seed, then reset, in that order. `reset()` also
         // zeroes the oscillator phases and the filter state, which is what makes
         // every strike of the same note identical rather than dependent on how
         // long the slot happened to sit idle.
+        //
+        // Both graphs get the *same* seed and neither can see the other, which
+        // is the point: the tone graph is pinged with the identical hash it was
+        // pinged with before the noise path existed, so its saws start at the
+        // identical phase. See the struct docs.
         self.net.ping(false, AttoHash::new(seed));
         self.net.reset();
+        self.noise.ping(false, AttoHash::new(seed));
+        self.noise.reset();
     }
 
     fn write_freqs(&mut self) {
@@ -248,6 +351,13 @@ impl Pluck {
             return;
         }
         let peak_span = self.cutoff_peak_mul - 1.0;
+        // Godot decides both of these once per buffer (`synth_engine.gd:594-595`)
+        // so that a patch without noise pays nothing per sample. Same here, and
+        // it is what keeps `noise_mix: 0.0` on the exact instruction sequence the
+        // pre-noise build ran: `tone_gain` is then `1.0`, and `x * 1.0` is `x`
+        // for every finite float.
+        let has_tone = self.tone_gain > 0.0;
+        let mut has_noise = self.noise_mix > 0.0;
         let mut i = 0;
         while i < out.len() {
             // Envelope first: the cutoff for *this* sample rides it.
@@ -272,7 +382,30 @@ impl Pluck {
                 self.sample_rate,
             );
             self.cutoff.set_value(cutoff);
-            out[i] = self.net.get_mono() * self.env * self.patch_gain;
+            let mut sample = if has_tone {
+                self.net.get_mono() * self.tone_gain
+            } else {
+                // `noise_mix >= 1` disconnects the oscillators rather than
+                // multiplying them by zero — `synth_engine.gd:741-742`.
+                0.0
+            };
+            if has_noise {
+                // Godot's crossfade: the burst envelope is applied to the noise
+                // *before* the filters, which is why it lives in the graph as a
+                // `Shared` rather than as a multiply out here.
+                self.noise_gain.set_value(self.noise_mix * self.noise_env);
+                sample += self.noise.get_mono();
+                self.noise_env *= self.noise_coef;
+                if self.noise_env < SILENCE {
+                    // Cut, do not fade to nothing — `SILENCE`'s whole argument,
+                    // applied to the second envelope in this patch. Below this
+                    // the burst is 80 dB under the note it is riding on and the
+                    // multiply is on its way to a subnormal.
+                    self.noise_env = 0.0;
+                    has_noise = false;
+                }
+            }
+            out[i] = sample * self.env * self.patch_gain;
             i += 1;
         }
         out[i..].fill(0.0);

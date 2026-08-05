@@ -113,6 +113,61 @@ fn a_long_idle_tail_stays_exactly_zero() {
 }
 
 #[test]
+fn a_noise_preset_is_deterministic_across_two_independent_pools() {
+    // A noise source is the one thing in the crate that could plausibly reach
+    // for entropy, so it gets the same treatment `canonical_render` gets: two
+    // fresh pools, one hash. The noise is fundsp's, seeded by the event's seed
+    // through `ping` — DESIGN §3's "the RNG is visible and seeded", arriving at
+    // the audio thread by the only route this crate has.
+    let bank = PatchBank::new().with(
+        "splash",
+        PatchDef::Pluck(PluckParams {
+            noise_mix: 0.85,
+            noise_decay_s: 0.14,
+            noise_highpass_hz: 600.0,
+            decay_s: 1.0,
+            ..PluckParams::default()
+        }),
+    );
+    let render = |seed: u64| {
+        render_offline(
+            &bank,
+            &[(
+                0,
+                Event::Play {
+                    voice: VoiceId(0),
+                    patch: PatchId::new("splash"),
+                    seed,
+                    gain: 1.0,
+                    pan: 0.0,
+                },
+            )],
+            48_000 * 2,
+            128,
+            sr(),
+        )
+    };
+    let a = render(3);
+    let b = render(3);
+    assert_eq!(hash_samples(&a), hash_samples(&b));
+    assert_eq!(a, b, "the same seed must produce the same noise");
+    assert_ne!(
+        hash_samples(&a),
+        hash_samples(&render(4)),
+        "and a different seed must produce different noise"
+    );
+    assert!(analyze::peak(&a) > 0.05, "a noise preset must not be silent");
+    // The second envelope is cut at `SILENCE` for the same reason the first one
+    // is; this is the check that it actually is.
+    assert_eq!(analyze::anomalies(&a), (0, 0));
+    let tail = &a[48_000 * 2 * 3 / 2..];
+    assert!(
+        tail.iter().all(|s| *s == 0.0),
+        "a finished noisy voice must contribute exact zeros too"
+    );
+}
+
+#[test]
 fn the_bank_hash_is_a_content_address() {
     // DESIGN §6, one level down: same presets → same hash, regardless of the
     // order they were inserted in; a changed parameter → a different hash.
@@ -133,6 +188,30 @@ fn the_bank_hash_is_a_content_address() {
         }),
     );
     assert_ne!(a.param_hash(), c.param_hash());
+
+    // …including the noise fields, which are the newest and therefore the ones a
+    // hash taken over a stale field list would silently miss.
+    for noisy in [
+        PluckParams {
+            noise_mix: 0.5,
+            ..PluckParams::default()
+        },
+        PluckParams {
+            noise_decay_s: 0.12,
+            ..PluckParams::default()
+        },
+        PluckParams {
+            noise_highpass_hz: 600.0,
+            ..PluckParams::default()
+        },
+    ] {
+        let mut d = a.clone();
+        d.insert("one", PatchDef::Pluck(noisy.clone()));
+        assert_ne!(a.param_hash(), d.param_hash(), "{noisy:?} did not move the hash");
+        // …and the whole preset survives the byte form the worklet loads.
+        let bytes = d.to_bytes().expect("encode");
+        assert_eq!(PatchBank::from_bytes(&bytes).expect("decode"), d);
+    }
 }
 
 #[test]

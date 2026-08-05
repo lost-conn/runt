@@ -230,6 +230,244 @@ fn the_attack_starts_from_silence() {
 }
 
 // ---------------------------------------------------------------------------
+// Pluck — the noise half (E7)
+// ---------------------------------------------------------------------------
+
+/// The gate the whole feature was designed around: a preset that does not ask
+/// for noise must render the *same bytes* it rendered before the noise existed.
+///
+/// This is not "sounds the same". `Pluck` grew a second fundsp graph, and had it
+/// gone into the first one, `AudioUnit::ping` would have threaded a different
+/// hash into the two saws and `WaveSynth::reset` would have started them at a
+/// different phase — every pluck in the crate quietly different, for a field
+/// nobody set. The check that it did not is a byte comparison against a render
+/// taken with the noise fields absent, which is what the two halves below are.
+#[test]
+fn a_preset_without_noise_renders_exactly_what_it_rendered_before_noise_existed() {
+    // The 0.0 defaults, spelled out rather than inherited, so that a future
+    // change to `Default` cannot quietly turn this test into a tautology.
+    let silent = PluckParams {
+        noise_mix: 0.0,
+        noise_decay_s: 0.0,
+        noise_highpass_hz: 0.0,
+        ..PluckParams::default()
+    };
+    assert_eq!(silent, PluckParams::default(), "the default is noiseless");
+
+    // Every knob a preset in the port actually moves, so this covers the paths
+    // (detune off, filter wide open, filter shut, long tail) and not just one.
+    let shapes = [
+        PluckParams::default(),
+        fixed_pluck(220.0),
+        PluckParams {
+            base_hz: 46.25,
+            steps: vec![0],
+            detune: 1.012,
+            detune_gain: 0.8,
+            cutoff_hz: 150.0,
+            cutoff_env: 2.4,
+            resonance: 0.8,
+            ..PluckParams::default()
+        },
+        PluckParams {
+            base_hz: 880.0,
+            detune_gain: 0.0,
+            cutoff_hz: 9000.0,
+            cutoff_env: 1.0,
+            resonance: 6.0,
+            decay_s: 0.05,
+            ..PluckParams::default()
+        },
+    ];
+    for (i, shape) in shapes.iter().enumerate() {
+        for seed in [0u64, 1, 7, 0xdead_beef] {
+            let a = strike(PatchDef::Pluck(shape.clone()), seed, 24_000);
+            // The same params reached through the noise fields' defaults rather
+            // than through `Default` — the bytes must be identical, not close.
+            let b = strike(
+                PatchDef::Pluck(PluckParams {
+                    noise_mix: 0.0,
+                    noise_decay_s: 0.0,
+                    noise_highpass_hz: 0.0,
+                    ..shape.clone()
+                }),
+                seed,
+                24_000,
+            );
+            assert_eq!(a, b, "shape {i}, seed {seed}: the noise path is not inert");
+            assert!(analyze::peak(&a) > 0.01, "shape {i} must sound at all");
+        }
+    }
+}
+
+#[test]
+fn noise_mix_puts_noise_in_the_signal_and_takes_tone_out() {
+    // Three claims at once, because they are one claim: the crossfade is a
+    // crossfade. More noise → less pitch, more broadband energy, and at 1.0 the
+    // oscillators are gone rather than quiet.
+    let base = PluckParams {
+        base_hz: 220.0,
+        steps: vec![0],
+        jitter_semitones: 0.0,
+        decay_s: 0.6,
+        cutoff_hz: 6000.0,
+        cutoff_env: 1.0,
+        resonance: 0.7,
+        ..PluckParams::default()
+    };
+    println!("== noise_mix crossfade ==");
+    let mut tonality = Vec::new();
+    for mix in [0.0f32, 0.35, 0.7, 1.0] {
+        let buf = strike(
+            PatchDef::Pluck(PluckParams {
+                noise_mix: mix,
+                ..base.clone()
+            }),
+            0,
+            24_000,
+        );
+        let mono = analyze::to_mono(&buf);
+        // Goertzel at the fundamental against the total: a pure saw parks a lot
+        // of magnitude in one bin, white noise parks almost none in any.
+        let fundamental = analyze::goertzel(&mono[2_000..14_000], SR, 220.0);
+        let total = analyze::rms(&mono[2_000..14_000]).max(1e-9);
+        let ratio = fundamental / total;
+        println!("  mix={mix:.2}  220 Hz/rms={ratio:.4}  peak={:.4}", analyze::peak(&buf));
+        assert!(analyze::peak(&buf) > 0.01, "mix={mix} must make a sound");
+        tonality.push(ratio);
+    }
+    for pair in tonality.windows(2) {
+        assert!(
+            pair[1] < pair[0],
+            "more noise must mean less of the note: {pair:?}"
+        );
+    }
+    assert!(
+        tonality[3] < tonality[0] * 0.25,
+        "at mix 1.0 the oscillators are disconnected, not attenuated: {tonality:?}"
+    );
+}
+
+#[test]
+fn the_noise_decay_is_independent_of_the_note_decay() {
+    // The field's whole reason to exist: Godot's noisy patches are a *burst*
+    // over a body, and the burst is shorter. A long note with a short
+    // `noise_decay_s` must be noisy at the front and tonal at the back.
+    let params = PluckParams {
+        base_hz: 220.0,
+        steps: vec![0],
+        jitter_semitones: 0.0,
+        attack_s: 0.002,
+        decay_s: 1.5,
+        cutoff_hz: 6000.0,
+        cutoff_env: 1.0,
+        noise_mix: 0.75,
+        ..PluckParams::default()
+    };
+    // Three renders that differ *only* in `noise_decay_s`, so the amplitude
+    // envelope — which is decaying under all of this — and the `1 - mix` share
+    // of the tone cancel out of every comparison. The reference is not "no
+    // noise": it is the same preset with a burst one millisecond long, i.e. the
+    // same quarter-level note with the noise already over.
+    let render = |noise_decay_s: f32| {
+        let buf = strike(
+            PatchDef::Pluck(PluckParams {
+                noise_decay_s,
+                ..params.clone()
+            }),
+            0,
+            48_000,
+        );
+        let mono = analyze::to_mono(&buf);
+        (
+            analyze::rms(&mono[200..2_000]),
+            analyze::rms(&mono[20_000..30_000]),
+        )
+    };
+    let (gone_early, gone_late) = render(0.001); // the note alone, at 1 - mix
+    let (burst_early, burst_late) = render(0.3); // a 300 ms burst under a 1.5 s note
+    let (held_early, held_late) = render(0.0); // Godot's "follow the amp envelope"
+
+    println!("== noise burst under a long note ==  rms at 4–40 ms / 420–630 ms");
+    println!("  noise_decay_s = 0.001   {gone_early:.5}  {gone_late:.5}");
+    println!("  noise_decay_s = 0.3     {burst_early:.5}  {burst_late:.5}");
+    println!("  noise_decay_s = 0       {held_early:.5}  {held_late:.5}");
+
+    assert!(
+        burst_early > gone_early * 1.5,
+        "the strike must carry the burst ({burst_early} vs {gone_early})"
+    );
+    assert!(
+        (burst_late - gone_late).abs() < gone_late * 0.05,
+        "…and by 420 ms the burst is over and only the note is left \
+         ({burst_late} vs {gone_late})"
+    );
+    // …and it is `noise_decay_s` that ended it: at Godot's `0.0` the burst
+    // follows the amplitude envelope instead and is still going.
+    assert!(
+        held_late > gone_late * 1.5,
+        "noise_decay_s = 0 must hold the burst open ({held_late} vs {gone_late})"
+    );
+}
+
+#[test]
+fn the_noise_highpass_takes_the_bottom_out_of_the_noise_only() {
+    let base = PluckParams {
+        base_hz: 110.0,
+        steps: vec![0],
+        jitter_semitones: 0.0,
+        decay_s: 0.5,
+        cutoff_hz: 8000.0,
+        cutoff_env: 1.0,
+        noise_mix: 1.0, // noise only, so the measurement is about the noise
+        ..PluckParams::default()
+    };
+    println!("== noise highpass ==");
+    let mut previous = f32::INFINITY;
+    for hp in [0.0f32, 600.0, 3000.0] {
+        let buf = strike(
+            PatchDef::Pluck(PluckParams {
+                noise_highpass_hz: hp,
+                ..base.clone()
+            }),
+            0,
+            24_000,
+        );
+        let mono = analyze::to_mono(&buf);
+        let low = analyze::band_energy(&mono[1_000..16_000], SR, 30.0, 400.0);
+        println!("  highpass={hp:6.0} Hz  energy below 400 Hz = {low:.5}");
+        assert!(low < previous, "a higher highpass must leave less bottom");
+        previous = low;
+    }
+}
+
+#[test]
+fn a_noisy_pluck_is_deterministic_and_clean() {
+    // Same seed → the same noise, twice; different seed → different noise; and
+    // nothing subnormal or infinite anywhere, which is the property `SILENCE`
+    // exists to protect and which a second, independently-cut envelope could
+    // have broken.
+    let params = PluckParams {
+        noise_mix: 0.85,
+        noise_decay_s: 0.14,
+        noise_highpass_hz: 600.0,
+        decay_s: 2.0, // far longer than the burst: the cut has room to happen
+        ..PluckParams::default()
+    };
+    let a = strike(PatchDef::Pluck(params.clone()), 42, 48_000);
+    let b = strike(PatchDef::Pluck(params.clone()), 42, 48_000);
+    let c = strike(PatchDef::Pluck(params), 43, 48_000);
+    assert_eq!(a, b, "same params + seed must give the same noise");
+    assert_ne!(a, c, "a different seed must give different noise");
+    assert!(analyze::peak(&a) > 0.05, "and it must actually sound");
+    assert_eq!(
+        analyze::anomalies(&a),
+        (0, 0),
+        "no subnormals, no non-finite samples"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Drone
 // ---------------------------------------------------------------------------
 

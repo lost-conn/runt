@@ -57,49 +57,85 @@ fn bench() {
     const QUANTUM: usize = 128;
     const QUANTA: usize = 20_000; // ~53 s of audio
 
-    let mut pool = VoicePool::new(PatchBank::builtin(), SR);
     let pluck = PatchId::new("pluck");
-    let mut buf = vec![0.0f32; QUANTUM * 2];
+    let budget_us = QUANTUM as f64 / SR as f64 * 1e6;
 
-    // Fill every slot with a long-decaying voice and keep them alive, so this
-    // measures a *saturated* pool rather than an idle one.
-    let retrigger = |pool: &mut VoicePool, block: usize| {
-        for i in 0..runt_audio::MAX_VOICES as u32 {
-            pool.apply(Event::Play {
-                voice: VoiceId(block as u32 * 32 + i),
-                patch: pluck,
-                seed: i as u64,
-                gain: 0.4,
-                pan: (i as f32 / 15.0) * 2.0 - 1.0,
-            });
+    // The same saturated group twice: once with the built-in (noiseless) pluck,
+    // once with a preset shaped like the port's water splash. The difference is
+    // what a `noise_mix` costs — a second fundsp graph per sounding voice, which
+    // is the *whole* per-voice cost of E7 because a preset that leaves
+    // `noise_mix` at zero never ticks that graph at all.
+    let run = |label: &str, def: runt_audio::PatchDef| -> f64 {
+        let mut pool = VoicePool::new(PatchBank::new().with("pluck", def), SR);
+        let mut buf = vec![0.0f32; QUANTUM * 2];
+
+        // Fill every slot with a long-decaying voice and keep them alive, so this
+        // measures a *saturated* pool rather than an idle one.
+        let retrigger = |pool: &mut VoicePool, block: usize| {
+            for i in 0..runt_audio::MAX_VOICES as u32 {
+                pool.apply(Event::Play {
+                    voice: VoiceId(block as u32 * 32 + i),
+                    patch: pluck,
+                    seed: i as u64,
+                    gain: 0.4,
+                    pan: (i as f32 / 15.0) * 2.0 - 1.0,
+                });
+            }
+        };
+
+        retrigger(&mut pool, 0);
+        for _ in 0..1000 {
+            pool.render_interleaved(&mut buf); // warm caches
         }
+
+        let start = std::time::Instant::now();
+        for block in 0..QUANTA {
+            if block % 100 == 0 {
+                retrigger(&mut pool, block);
+            }
+            pool.render_interleaved(&mut buf);
+        }
+        let per_quantum_us = start.elapsed().as_secs_f64() * 1e6 / QUANTA as f64;
+        println!(
+            "{label:<28} {per_quantum_us:>7.2} us   {:>5.2} % of one core   peak pre-clip {:.2}",
+            per_quantum_us / budget_us * 100.0,
+            pool.stats().peak_pre_clip
+        );
+        per_quantum_us
     };
 
-    retrigger(&mut pool, 0);
-    for _ in 0..1000 {
-        pool.render_interleaved(&mut buf); // warm caches
-    }
-
-    let start = std::time::Instant::now();
-    for block in 0..QUANTA {
-        if block % 100 == 0 {
-            retrigger(&mut pool, block);
-        }
-        pool.render_interleaved(&mut buf);
-    }
-    let elapsed = start.elapsed();
-
-    let per_quantum_us = elapsed.as_secs_f64() * 1e6 / QUANTA as f64;
-    let budget_us = QUANTUM as f64 / SR as f64 * 1e6;
     println!("voices           : {} plucks in a {}-slot pool", runt_audio::PLUCK_VOICES, runt_audio::MAX_VOICES);
     println!("quanta           : {QUANTA} x {QUANTUM} frames stereo");
-    println!("per quantum      : {per_quantum_us:.2} us");
-    println!("realtime budget  : {budget_us:.2} us");
-    println!(
-        "CPU load         : {:.2} % of one core",
-        per_quantum_us / budget_us * 100.0
+    println!("realtime budget  : {budget_us:.2} us per quantum");
+    println!();
+    let dry = run(
+        "noise_mix = 0 (the default)",
+        runt_audio::PatchDef::Pluck(runt_audio::PluckParams {
+            decay_s: 1.2,
+            ..runt_audio::PluckParams::default()
+        }),
     );
-    println!("stats            : {:?}", pool.stats());
+    let wet = run(
+        "noise_mix = 0.85, a splash",
+        runt_audio::PatchDef::Pluck(runt_audio::PluckParams {
+            decay_s: 1.2,
+            noise_mix: 0.85,
+            // Deliberately *longer* than the note: this bench wants the noise
+            // graph ticking for every sample of every voice, not a burst that
+            // switches itself off after 140 ms like a real splash does.
+            noise_decay_s: 0.0,
+            noise_highpass_hz: 600.0,
+            ..runt_audio::PluckParams::default()
+        }),
+    );
+    println!();
+    println!(
+        "noise adds       : {:.2} us over {} saturated voices = {:.3} us/voice/quantum ({:+.1} %)",
+        wet - dry,
+        runt_audio::PLUCK_VOICES,
+        (wet - dry) / runt_audio::PLUCK_VOICES as f64,
+        (wet / dry - 1.0) * 100.0
+    );
 }
 
 /// CPU cost of a **full background-music load**, against the realtime budget.
@@ -146,8 +182,24 @@ fn bench_bgm() {
     // previous phase's voices into the next — and a `Bass` sustains until it is
     // stopped, so the first phase's bass would still be sounding through the
     // third and every number after the first would be the same number.
-    let run = |label: &str, basses: u32, drums: u32, sfx: u32| -> f64 {
-        let mut pool = VoicePool::new(PatchBank::builtin(), SR);
+    // The port's SFX are noisy now (E7), so the worst case is measured twice:
+    // once with the built-in noiseless pluck and once with every SFX voice in
+    // the burst carrying a splash's `noise_mix`. The BGM presets are untouched
+    // — none of the four is a `Pluck`.
+    let noisy_bank = || {
+        PatchBank::builtin().with(
+            "pluck",
+            runt_audio::PatchDef::Pluck(runt_audio::PluckParams {
+                noise_mix: 0.85,
+                noise_decay_s: 0.14,
+                noise_highpass_hz: 600.0,
+                ..runt_audio::PluckParams::default()
+            }),
+        )
+    };
+
+    let run = |label: &str, bank: PatchBank, basses: u32, drums: u32, sfx: u32| -> f64 {
+        let mut pool = VoicePool::new(bank, SR);
         let mut buf = vec![0.0f32; QUANTUM * 2];
         let mut voice = 0u32;
         let mut live: Vec<(usize, VoiceId)> = Vec::new(); // (release quantum, voice)
@@ -231,21 +283,29 @@ fn bench_bgm() {
     println!("realtime budget  : {budget_us:.2} us per quantum");
     println!("slots            : {}", runt_audio::MAX_VOICES);
     println!();
-    let idle = run("silence (an empty pool)", 0, 0, 0);
+    let idle = run("silence (an empty pool)", PatchBank::builtin(), 0, 0, 0);
     // The song as written: the bassline is monophonic and the three drum
     // patterns never collide, so one voice per group is what it asks for.
-    let song = run("the song as written", 1, 1, 0);
+    let song = run("the song as written", PatchBank::builtin(), 1, 1, 0);
     // Every music group full at once. The song cannot produce this; a denser
     // one could.
-    let music = run("every BGM group full", 3, 3, 0);
+    let music = run("every BGM group full", PatchBank::builtin(), 3, 3, 0);
     let label = format!("...+ a {}-voice SFX burst", runt_audio::PLUCK_VOICES);
-    let everything = run(&label, 3, 3, runt_audio::PLUCK_VOICES as u32);
+    let everything = run(&label, PatchBank::builtin(), 3, 3, runt_audio::PLUCK_VOICES as u32);
+    let noisy = run(
+        "...with every SFX noisy",
+        noisy_bank(),
+        3,
+        3,
+        runt_audio::PLUCK_VOICES as u32,
+    );
     println!();
     println!("the song costs      {:.2} us over silence", song - idle);
     println!("the SFX burst adds  {:.2} us over the full BGM", everything - music);
+    println!("its noise adds      {:.2} us on top of that", noisy - everything);
     println!(
         "worst case is       {:.2} % of the {:.0} us budget",
-        everything / budget_us * 100.0,
+        noisy / budget_us * 100.0,
         budget_us
     );
 }

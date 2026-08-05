@@ -160,10 +160,98 @@ fn the_patch_def_discriminants_are_the_bank_format_and_do_not_move() {
         assert_eq!(bytes[3] as u32, *index, "{model}'s discriminant on the wire");
     }
     assert_eq!(
-        PatchBank::SCHEMA as usize,
+        PatchBank::MODELS as usize,
         expected.len(),
-        "SCHEMA counts the models"
+        "MODELS counts the models"
     );
+}
+
+#[test]
+fn the_schema_version_moves_when_the_bank_bytes_move() {
+    // `SCHEMA` used to *be* `MODELS`, and stopped being it the moment a params
+    // struct grew a field (E7's noise on `PluckParams`) — a change that moves
+    // every byte after the first pluck in a bank while leaving the model count
+    // alone. Pinning the version here is what makes the next such change a
+    // conscious one; see `PatchBank::SCHEMA` for the table.
+    assert_eq!(PatchBank::SCHEMA, 7);
+    // It started as the model count and left it behind; both numbers are pinned,
+    // so a future append cannot move one without a test noticing.
+    assert_eq!(PatchBank::MODELS, 6);
+}
+
+#[test]
+fn appending_a_params_field_breaks_old_bytes_loudly_rather_than_quietly() {
+    // The counterpart to the variant rule below: postcard writes a struct as its
+    // fields back to back with no names and no count, so `#[serde(default)]`
+    // cannot rescue a blob that predates a field. This reconstructs the pre-E7
+    // `PluckParams` as a shadow struct — eleven fields, exactly what it was —
+    // and checks that the current decoder *rejects* it rather than reading the
+    // following bytes as the noise it is missing.
+    //
+    // This is not a compatibility promise being kept. It is a compatibility
+    // promise being documented as absent, with the reason it is survivable:
+    // a bank blob lives for milliseconds between two halves of one build.
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct OldPluckParams {
+        base_hz: f32,
+        steps: Vec<i8>,
+        detune: f32,
+        detune_gain: f32,
+        attack_s: f32,
+        decay_s: f32,
+        cutoff_hz: f32,
+        cutoff_env: f32,
+        resonance: f32,
+        gain: f32,
+        jitter_semitones: f32,
+    }
+    #[derive(Serialize)]
+    enum OldPatchDef {
+        #[allow(dead_code)]
+        Pluck(OldPluckParams),
+    }
+    #[derive(Serialize)]
+    struct OldEntry {
+        name: String,
+        def: OldPatchDef,
+    }
+    #[derive(Serialize)]
+    struct OldBank {
+        entries: Vec<OldEntry>,
+    }
+
+    let old = OldBank {
+        entries: vec![OldEntry {
+            name: "pluck".to_string(),
+            def: OldPatchDef::Pluck(OldPluckParams {
+                base_hz: 440.0,
+                steps: vec![0, 3, 5, 7, 10, 12, 15, 17],
+                detune: 1.005,
+                detune_gain: 0.5,
+                attack_s: 0.004,
+                decay_s: 0.35,
+                cutoff_hz: 900.0,
+                cutoff_env: 5.0,
+                resonance: 0.9,
+                gain: 0.5,
+                jitter_semitones: 0.04,
+            }),
+        }],
+    };
+    let bytes = postcard::to_stdvec(&old).expect("encode with the pre-E7 schema");
+
+    assert!(
+        PatchBank::from_bytes(&bytes).is_err(),
+        "a pre-noise bank must fail to decode, not decode into something else"
+    );
+    // …and the current one is exactly twelve bytes longer: three appended f32s.
+    let now = PatchBank::new()
+        .with("pluck", PatchDef::Pluck(runt_audio::PluckParams::default()))
+        .to_bytes()
+        .expect("encode");
+    assert_eq!(now.len(), bytes.len() + 12, "noise_mix, noise_decay_s, noise_highpass_hz");
 }
 
 #[test]

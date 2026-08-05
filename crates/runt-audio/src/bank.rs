@@ -74,6 +74,30 @@ impl PatchId {
 /// instead of panicking on an audio thread. There is no version field because
 /// there is nothing a version field could do that this does not already do; see
 /// [`SCHEMA`](PatchBank::SCHEMA) for the number a test pins.
+///
+/// ## Appending a *field* is a different, sharper change
+///
+/// The variant rule above protects the enum. It says nothing about the structs
+/// inside it, and **postcard is not self-describing**: a struct is written as
+/// its fields back to back, with no names, no count and no length prefix, so a
+/// `#[serde(default)]` cannot fill in a field that is not in the bytes — it only
+/// ever helps a self-describing format (which is what scene RON is, and why the
+/// attribute is still right on those structs).
+///
+/// So appending `noise_mix` to [`PluckParams`] moved every byte after the first
+/// pluck in a bank. A bank blob written by an older build no longer decodes;
+/// worse, in principle, it could decode *wrongly*, by reading the next entry's
+/// name length as a float. That is exactly the silent reinterpretation the
+/// variant rule exists to forbid, arriving through a door the variant rule does
+/// not cover — so [`SCHEMA`](PatchBank::SCHEMA) covers it instead.
+///
+/// It is survivable here for one reason, stated so that it stays true: **no bank
+/// blob is ever persisted.** The game's wasm module calls `PatchBank::to_bytes`
+/// and JS hands the result straight to a worklet compiled from the same build,
+/// in the same page load; the native host does the same in-process. The bytes
+/// live for milliseconds and never cross a version boundary. The *durable* form
+/// of a bank is scene RON (DESIGN §8), which is self-describing and where
+/// `#[serde(default)]` does its job.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub enum PatchDef {
@@ -132,14 +156,33 @@ pub struct PatchBank {
 }
 
 impl PatchBank {
-    /// How many synthesis models [`PatchDef`] knows about.
+    /// The bank's **byte-format version**: it increments on any change that
+    /// moves a byte in [`to_bytes`](PatchBank::to_bytes).
     ///
-    /// This is the closest thing to a bank *version* the format has, and it is
-    /// deliberately a count rather than a number somebody has to remember to
-    /// bump: adding a variant changes it, and `tests/wire.rs` pins both it and
-    /// the individual discriminants. Read [`PatchDef`] for why appending is
-    /// enough and a version field would not add anything.
-    pub const SCHEMA: u32 = 6;
+    /// It started life as a count of the models in [`PatchDef`], which was
+    /// honest while the only way to change the format was to append a variant.
+    /// E7 appended `noise_mix` / `noise_decay_s` / `noise_highpass_hz` to
+    /// [`PluckParams`] and broke that: the model count did not move and the
+    /// bytes did (see [`PatchDef`]'s docs on why postcard makes a field append a
+    /// format change). A number that silently stops tracking the thing it is
+    /// named after is worse than no number, so this is now a version, and the
+    /// count it used to be is asserted separately in `tests/wire.rs`.
+    ///
+    /// It is a **tripwire, not a runtime check** — nothing transmits it and
+    /// nothing branches on it. Its whole job is that `tests/wire.rs` pins it, so
+    /// a change to the bank's bytes cannot land without somebody having read
+    /// this paragraph.
+    ///
+    /// | version | change |
+    /// |---|---|
+    /// | 2 | `Pluck`, `Drone` |
+    /// | 6 | + `Kick`, `Snare`, `Hihat`, `Bass` (2026-08-04) |
+    /// | 7 | + `PluckParams`'s three noise fields (E7, 2026-08-05) |
+    pub const SCHEMA: u32 = 7;
+
+    /// How many synthesis models [`PatchDef`] knows about. Pinned, with the
+    /// individual discriminants, by `tests/wire.rs`.
+    pub const MODELS: u32 = 6;
 
     pub fn new() -> PatchBank {
         PatchBank::default()

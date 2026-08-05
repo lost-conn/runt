@@ -90,6 +90,21 @@ impl ParamId {
 ///
 /// This is the whole answer to "how does a game vary a sound without the engine
 /// learning what a note is".
+///
+/// ## The noise half
+///
+/// A splash, a leaf rustle, a rock cracking: eight of the 3dimenshift port's
+/// forty-one SFX are *defined* by `noise_mix` in their `.tres`, and before this
+/// the only models in the crate that made noise ([`SnareParams`],
+/// [`HihatParams`]) lived in two- and three-slot BGM groups where a splash would
+/// have stolen a backbeat. So the noise came here, to the twenty-four-slot
+/// workhorse, as three fields that are **all zero by default**:
+/// [`noise_mix`](PluckParams::noise_mix),
+/// [`noise_decay_s`](PluckParams::noise_decay_s) and
+/// [`noise_highpass_hz`](PluckParams::noise_highpass_hz). A preset that does not
+/// ask for noise renders exactly the samples it rendered before they existed —
+/// see [`crate::patches::Pluck`] for how that is arranged, because it is not
+/// free and it is not obvious.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 #[serde(default)]
@@ -121,6 +136,45 @@ pub struct PluckParams {
     /// Fraction of a semitone the seed may detune the whole note by. Keeps a
     /// scale from sounding like a MIDI file.
     pub jitter_semitones: f32,
+    /// Blend between the oscillators (`0`) and white noise (`1`), mixed
+    /// **before** the filter — `synth_engine.gd:744`'s
+    /// `sample * (1 - mix) + noise * mix * noise_env`, verbatim, and the same
+    /// crossfade [`SnareParams::noise_mix`] uses.
+    ///
+    /// `0.0` is the default and means *no noise at all*: not a silent noise
+    /// source but an untouched signal path, matching Godot's own
+    /// `has_noise: bool = p.noise_mix > 0.0` per-buffer gate. `1.0` disconnects
+    /// the oscillators entirely, as `synth_engine.gd:741` does.
+    pub noise_mix: f32,
+    /// Seconds for the noise burst to reach −60 dB, measured the same way
+    /// [`decay_s`](PluckParams::decay_s) is and **independent of it**.
+    ///
+    /// This is the field that makes the noise read as an *impact* rather than as
+    /// hiss over a note: Godot's water splash decays its noise in 140 ms under a
+    /// 200 ms body, its swim-eject in 100 ms under 140. `0.0` means the noise
+    /// follows the amplitude envelope instead, which is exactly what
+    /// `synth_engine.gd:737`'s `if p.noise_decay > 0.0` says.
+    ///
+    /// Godot's noise envelope is a **linear** ramp to zero; this one is
+    /// exponential, the same deliberate deviation
+    /// [`crate::patches::Adsr`](crate::patches) makes for every other envelope in
+    /// the crate so that there is one envelope shape here rather than two.
+    pub noise_decay_s: f32,
+    /// Highpass on the noise only, Hz. `0` — the default — is a bypass, as is
+    /// anything below 20 Hz.
+    ///
+    /// Godot filters its noise with *two* one-poles, `noise_lowpass` and
+    /// `noise_highpass`, before the crossfade. The lowpass needs no field here:
+    /// the noise enters ahead of the patch's own
+    /// [`cutoff_hz`](PluckParams::cutoff_hz), which is a steeper filter doing the
+    /// same job on the same signal — that is the whole reason the mix is
+    /// pre-filter. The highpass has no such stand-in, and without it every noisy
+    /// preset is the same low wash: leaves in a canopy and a rock cracking are
+    /// told apart almost entirely by how much bottom their noise has. So it is a
+    /// field, spelled in Hz like every other cutoff here rather than as Godot's
+    /// one-pole coefficient, and it is the one addition [`HihatParams`] made for
+    /// the identical reason.
+    pub noise_highpass_hz: f32,
 }
 
 impl Default for PluckParams {
@@ -140,6 +194,13 @@ impl Default for PluckParams {
             resonance: 0.9,
             gain: 0.5,
             jitter_semitones: 0.04,
+            // Zero, zero, zero: the built-in pluck is a *pitched ping*, and the
+            // noise path costs nothing at all until a preset asks for it. This
+            // default is load-bearing — `tests/patches.rs` renders it and
+            // compares against the pre-noise build.
+            noise_mix: 0.0,
+            noise_decay_s: 0.0,
+            noise_highpass_hz: 0.0,
         }
     }
 }
