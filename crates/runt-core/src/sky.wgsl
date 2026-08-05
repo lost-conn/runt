@@ -39,19 +39,36 @@ struct Frame {
 // handle, a bind group and a second pipeline layout — for two octaves of value
 // noise that cost less than the fetch would.
 //
-// The look's constants are `simple_sky.gdshader`'s own defaults. They are here
-// rather than in the frame block for the reason `Lighting::clouds` gives: they
-// are one authored weather, and a scene that wants another wants another shader.
+// The look's constants are the ones `playground.tscn` authors on its own
+// `simple_sky` material, not the shader's defaults — the defaults are a
+// scattered-puff sky and the game's is a soft overcast, and it is the game that
+// exists. They are here rather than in the frame block for the reason
+// `Lighting::clouds` gives: they are one authored weather, and a scene that
+// wants another wants another shader, not seven more RON fields.
 
 const CLOUD_SCALE: f32 = 0.6;
-const CLOUD_DENSITY: f32 = 0.5;
-const CLOUD_SOFTNESS: f32 = 0.3;
+// How many lattice cells the *field* has per unit of `cloud_scale`.
+//
+// Not one of the original's uniforms, and it has to exist: `cloud_scale` maps
+// the view direction onto a 0..0.6 patch of a **texture**, whose own frequency
+// is a property of the image Godot samples (`terrain_noise.tres`). Evaluating
+// a lattice field directly instead means that frequency has to be stated, and
+// at 1 the whole sky would land inside a single cell — a flat wash, which is
+// what the first attempt at this drew.
+const CLOUD_LATTICE: f32 = 9.0;
+// Low, so most of the noise range is cloud, and soft, so the edges are haze
+// rather than shapes: `cloud_density = 0.197`, `cloud_softness = 0.902`.
+const CLOUD_DENSITY: f32 = 0.197;
+const CLOUD_SOFTNESS: f32 = 0.902;
 const CLOUD_BRIGHTNESS: f32 = 1.0;
-const CLOUD_SPEED: f32 = 0.05;
+// `cloud_speed = 0.01` along `cloud_direction = (1, 0, -0.855)`, normalized.
+const CLOUD_SPEED: f32 = 0.01;
+const CLOUD_DRIFT: vec2<f32> = vec2<f32>(0.7601, -0.6499);
 // How hard the view direction is flattened before it is projected to the cloud
-// plane. 1 would be a plane at infinity; the original's 0.5 keeps the layer
-// reading as a dome.
-const CLOUD_FLATTEN: f32 = 0.5;
+// plane. 1 would be a plane at infinity; `cloud_flatten = 0.104` barely
+// flattens at all, which is what keeps the layer reading as a dome overhead
+// rather than as a ceiling.
+const CLOUD_FLATTEN: f32 = 0.104;
 // The band above the horizon the layer fades in over, so the clouds do not
 // stack into a hard line where the dome meets the ground.
 const CLOUD_HORIZON_FADE: f32 = 0.1;
@@ -80,8 +97,8 @@ fn sky_value_noise(p: vec2<f32>) -> f32 {
 // Two octaves. Three would be prettier and this is a background.
 fn sky_clouds(dir: vec3<f32>) -> f32 {
     let flat_dir = normalize(vec3<f32>(dir.x, dir.y * (1.0 - CLOUD_FLATTEN), dir.z));
-    let drift = vec2<f32>(frame.time.x * CLOUD_SPEED, 0.0);
-    let uv = flat_dir.xz * CLOUD_SCALE + drift;
+    let drift = CLOUD_DRIFT * frame.time.x * CLOUD_SPEED;
+    let uv = (flat_dir.xz * CLOUD_SCALE + drift) * CLOUD_LATTICE;
     let n = sky_value_noise(uv) * 0.65 + sky_value_noise(uv * 2.17 + vec2<f32>(11.3, 5.7)) * 0.35;
     var alpha = smoothstep(CLOUD_DENSITY, CLOUD_DENSITY + CLOUD_SOFTNESS, n);
     alpha = alpha * smoothstep(0.0, CLOUD_HORIZON_FADE, dir.y);
