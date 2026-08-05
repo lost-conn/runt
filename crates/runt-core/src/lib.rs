@@ -80,9 +80,9 @@ pub use collide::{
 };
 pub use draw::{Aabb, DrawItem, DrawStats, FrameParams, Frustum, InstanceRun};
 pub use ecs::{
-    default_horizon, DemoScene, FixedSim, GeneratorRef, GlobalTransform, Interpolated, Lighting,
-    MeshRef, PostSim, QualityTier, RenderScale, Spin, Startup, StatusLine, TerrainSurface,
-    TickCount, Transform, Visibility,
+    default_horizon, project_phase_fx, DemoScene, FixedSim, GeneratorRef, GlobalTransform,
+    Interpolated, Lighting, MeshRef, PhaseFx, PostSim, QualityTier, RenderScale, Spin, Startup,
+    StatusLine, TerrainSurface, TickCount, Transform, Visibility,
 };
 pub use engine::Engine;
 pub use gen::{GeneratorSpec, Shading};
@@ -226,6 +226,21 @@ pub struct FrameUniform {
     /// perspective-correct clip-position varying on every variant, paid for by
     /// every draw that has nothing to do with any of this.
     pub viewport: [f32; 4],
+    /// The sky pass's two knobs and two reserved slots: `x` — cloud cover
+    /// ([`Lighting::clouds`](crate::Lighting::clouds)), `y` — sun-disk size
+    /// ([`Lighting::sun`](crate::Lighting::sun)), `zw` — reserved.
+    ///
+    /// Both are `0` by default, and both are `0`-guarded in the shader, so a
+    /// scene that says nothing about weather draws the same three-stop gradient
+    /// it always did — which is what `tests/headless_screenshot.rs` holds
+    /// against [`sky::gradient`](crate::sky::gradient).
+    ///
+    /// A block of its own rather than the spare `w` of `light_dir` and
+    /// `sky_color`: those are padding because a `vec3` is padded, and a value
+    /// hidden in padding is a value nobody finds. `shader.wgsl` restates it too
+    /// even though nothing there reads it — one buffer, one layout, three
+    /// files (see the block's own note).
+    pub sky_params: [f32; 4],
 }
 
 /// Per-instance vertex data: one of these per drawn entity, in a vertex buffer
@@ -1085,6 +1100,7 @@ impl Renderer {
             phase: self.phase,
             time: self.time,
             viewport: [w, h, 1.0 / w, 1.0 / h],
+            sky_params: [light.clouds, light.sun, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&uniform));

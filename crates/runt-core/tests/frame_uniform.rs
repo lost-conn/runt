@@ -14,7 +14,7 @@
 use runt_core::{FrameUniform, MaterialVariant, Renderer};
 
 /// The fields, in order, as `FrameUniform` declares them.
-const FIELDS: [&str; 10] = [
+const FIELDS: [&str; 11] = [
     "view_proj",
     "inv_view_proj",
     "light_dir",
@@ -25,15 +25,16 @@ const FIELDS: [&str; 10] = [
     "phase",
     "time",
     "viewport",
+    "sky_params",
 ];
 
 #[test]
 fn the_block_is_std140_shaped() {
-    // Two mat4x4 (64 B each) and eight vec4 (16 B each). Nothing needs padding
+    // Two mat4x4 (64 B each) and nine vec4 (16 B each). Nothing needs padding
     // because nothing in it is smaller than a vec4 — which is the whole reason
     // the light direction is a `vec4` with a wasted `w` rather than a `vec3`.
-    assert_eq!(std::mem::size_of::<FrameUniform>(), 2 * 64 + 8 * 16);
-    assert_eq!(std::mem::size_of::<FrameUniform>(), 256);
+    assert_eq!(std::mem::size_of::<FrameUniform>(), 2 * 64 + 9 * 16);
+    assert_eq!(std::mem::size_of::<FrameUniform>(), 272);
     assert_eq!(
         std::mem::size_of::<FrameUniform>() % 16,
         0,
@@ -53,8 +54,9 @@ fn the_block_is_std140_shaped() {
         std::mem::offset_of!(FrameUniform, phase),
         std::mem::offset_of!(FrameUniform, time),
         std::mem::offset_of!(FrameUniform, viewport),
+        std::mem::offset_of!(FrameUniform, sky_params),
     ];
-    assert_eq!(offsets, [0, 64, 128, 144, 160, 176, 192, 208, 224, 240]);
+    assert_eq!(offsets, [0, 64, 128, 144, 160, 176, 192, 208, 224, 240, 256]);
     for (field, offset) in FIELDS.iter().zip(offsets) {
         assert_eq!(offset % 16, 0, "{field} is not 16-byte aligned");
     }
@@ -143,8 +145,50 @@ fn the_phase_variant_translates_to_glsl_es_for_webgl2() {
         | MaterialVariant::VERTEX_COLOR
         | MaterialVariant::TEXTURE
         | MaterialVariant::NORMAL_MAP;
+    translates_to_glsl_es(variant);
+}
+
+/// The same claim for P6's two looks, which are the other two shapes a GLSL
+/// backend could refuse: `F_FRESNEL` does two matrix multiplies against the
+/// inverse view-projection *inside* the fragment stage, and `F_EMISSIVE_SWEEP`
+/// is the first thing in this shader to read the interpolated `uv` — a varying
+/// that was added for it and that every other variant now carries.
+///
+/// The outline the port actually draws is all three at once (the circle decides
+/// where the rim exists), so that is the key under test rather than each bit on
+/// its own.
+#[test]
+fn the_outline_and_sweep_variants_translate_to_glsl_es_for_webgl2() {
+    translates_to_glsl_es(
+        MaterialVariant::FRESNEL | MaterialVariant::PHASE_CIRCLE | MaterialVariant::ADDITIVE,
+    );
+    translates_to_glsl_es(
+        MaterialVariant::EMISSIVE_SWEEP | MaterialVariant::VERTEX_COLOR,
+    );
+}
+
+/// The sky pass has to make the crossing too, and it is standalone WGSL with no
+/// variant key — so it is one call rather than a loop over keys. P6 gave it a
+/// value-noise cloud layer and a sun disk, both of which are ordinary maths, and
+/// this is what says so on the target that cannot run the test suite.
+#[test]
+fn the_sky_translates_to_glsl_es_for_webgl2() {
+    glsl_es(runt_core::SKY_SHADER, &[("vs_sky", naga::ShaderStage::Vertex), ("fs_sky", naga::ShaderStage::Fragment)]);
+}
+
+fn translates_to_glsl_es(variant: MaterialVariant) {
     let source = runt_core::material::variant_source(runt_core::material::BASE_SHADER, variant);
-    let module = naga::front::wgsl::parse_str(&source).expect("variant WGSL parses");
+    glsl_es(
+        &source,
+        &[
+            ("vs_main", naga::ShaderStage::Vertex),
+            ("fs_main", naga::ShaderStage::Fragment),
+        ],
+    );
+}
+
+fn glsl_es(source: &str, entries: &[(&str, naga::ShaderStage)]) {
+    let module = naga::front::wgsl::parse_str(source).expect("variant WGSL parses");
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::empty(),
@@ -159,10 +203,7 @@ fn the_phase_variant_translates_to_glsl_es_for_webgl2() {
         },
         ..Default::default()
     };
-    for (stage, entry) in [
-        (naga::ShaderStage::Vertex, "vs_main"),
-        (naga::ShaderStage::Fragment, "fs_main"),
-    ] {
+    for &(entry, stage) in entries {
         let pipeline_options = naga::back::glsl::PipelineOptions {
             shader_stage: stage,
             entry_point: entry.to_string(),

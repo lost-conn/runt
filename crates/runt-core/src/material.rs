@@ -144,6 +144,46 @@ impl MaterialVariant {
     /// billboard *basis* is built on the CPU into the model matrix, so this is
     /// a fragment-side bit only and the vertex shader is untouched.
     pub const BILLBOARD_UNLIT: MaterialVariant = MaterialVariant(1 << 9);
+    /// A silhouette rim: unlit, `pow(1 − |N·V|, power)` of `base_color`, in both
+    /// the colour and the alpha. `power` is [`Material::params`]`.y`.
+    ///
+    /// The original's `phase_outline.gdshader` in its `SHELL` style — a
+    /// holographic ghost of a phase object drawn exactly where the phase circle
+    /// removed it, so a step you cannot stand on yet still tells you it is
+    /// there. It composes: the ghost is `PHASE_CIRCLE | FRESNEL | ADDITIVE` on
+    /// the same mesh, with the circle's mode *flipped* relative to the solid
+    /// draw, which is how "render what the main pass discarded" is spelled with
+    /// no second discard rule.
+    ///
+    /// The view vector is rebuilt per fragment from
+    /// [`FrameUniform::inv_view_proj`] — the construction `sky.wgsl` already
+    /// uses — because the frame block carries no camera position and a rim term
+    /// is the only thing that has ever wanted one. Two matrix multiplies on a
+    /// population of fragments that is, by construction, a thin rim.
+    ///
+    /// [`FrameUniform::inv_view_proj`]: crate::FrameUniform::inv_view_proj
+    pub const FRESNEL: MaterialVariant = MaterialVariant(1 << 10);
+    /// An unlit two-tone wipe along `uv.x`, driven entirely by
+    /// [`Material::params`]: `(inactive_gain, progress, fade_width,
+    /// active_gain)`.
+    ///
+    /// The original's `logic_wire.gdshader`: light runs down a wire from the
+    /// switch that fired it. The *tones* come from the two colour channels a
+    /// draw already has — the mesh's own vertex colour is the un-swept side and
+    /// `base_color` is the swept one — so the effect needs no third colour slot
+    /// and no new uniform. It therefore wants [`VERTEX_COLOR`] alongside it;
+    /// without it the un-swept side is white.
+    ///
+    /// Emissive in the only sense this renderer has one (DESIGN §5: no emission
+    /// channel): the gain multiplies the tone and the target clamps, so an
+    /// "energy" above 1 reads as a colour blowing out to white — which is what
+    /// the original's `EMISSION` did on the way through its tonemap.
+    ///
+    /// Generic on purpose: it is a parameterised wipe, not a wire. A charge bar,
+    /// a fuse, a filling gauge is the same three numbers.
+    ///
+    /// [`VERTEX_COLOR`]: MaterialVariant::VERTEX_COLOR
+    pub const EMISSIVE_SWEEP: MaterialVariant = MaterialVariant(1 << 11);
 
     /// Every declared flag, with the WGSL `const` it maps to. The order here is
     /// the order the preprocessor emits, so generated sources are stable.
@@ -152,7 +192,7 @@ impl MaterialVariant {
     /// the WGSL reads `F_TRANSPARENT`, `F_ADDITIVE` or `F_DEPTH_GREATER`: this
     /// list is the *declaration* of the key space, and a bit missing from it
     /// would be a key the preprocessor silently could not describe.
-    pub const FLAGS: [(&'static str, MaterialVariant); 10] = [
+    pub const FLAGS: [(&'static str, MaterialVariant); 12] = [
         ("F_VERTEX_COLOR", MaterialVariant::VERTEX_COLOR),
         ("F_TEXTURE", MaterialVariant::TEXTURE),
         ("F_RAMP", MaterialVariant::RAMP),
@@ -163,6 +203,8 @@ impl MaterialVariant {
         ("F_DEPTH_GREATER", MaterialVariant::DEPTH_GREATER),
         ("F_PHASE_CIRCLE", MaterialVariant::PHASE_CIRCLE),
         ("F_BILLBOARD_UNLIT", MaterialVariant::BILLBOARD_UNLIT),
+        ("F_FRESNEL", MaterialVariant::FRESNEL),
+        ("F_EMISSIVE_SWEEP", MaterialVariant::EMISSIVE_SWEEP),
     ];
 
     /// The two blend bits, as one mask: the draws that leave the opaque
@@ -181,6 +223,21 @@ impl MaterialVariant {
             | MaterialVariant::ADDITIVE.0
             | MaterialVariant::DEPTH_GREATER.0
             | MaterialVariant::PHASE_CIRCLE.0
+            | MaterialVariant::BILLBOARD_UNLIT.0
+            | MaterialVariant::FRESNEL.0
+            | MaterialVariant::EMISSIVE_SWEEP.0,
+    );
+
+    /// The four bits that each *replace* the lighting term rather than feeding
+    /// it. Exactly one of them wins per fragment (the shader's `else if` chain,
+    /// in this order), so a key carrying two is defined rather than undefined —
+    /// the same resolution rule [`LIVE_TEX`] beats [`TEXTURE`] by.
+    ///
+    /// [`LIVE_TEX`]: MaterialVariant::LIVE_TEX
+    /// [`TEXTURE`]: MaterialVariant::TEXTURE
+    pub const UNLIT: MaterialVariant = MaterialVariant(
+        MaterialVariant::FRESNEL.0
+            | MaterialVariant::EMISSIVE_SWEEP.0
             | MaterialVariant::BILLBOARD_UNLIT.0,
     );
 
@@ -276,11 +333,22 @@ pub struct Material {
     /// [`TRANSPARENT`]: MaterialVariant::TRANSPARENT
     /// [`ADDITIVE`]: MaterialVariant::ADDITIVE
     pub base_color: Vec4,
-    /// The per-material scalar slot. `x` is [`PHASE_CIRCLE`]'s mode
-    /// ([`PHASE_WORLD_ONLY`] / [`PHASE_ONLY`] / [`PHASE_EFFECT_ONLY`]); the
-    /// rest is still reserved for ramp threshold/softness/… as those variants
-    /// land. Uploaded whole from the start so a new variant never changes the
-    /// uniform layout.
+    /// The per-material scalar slot, read by whichever variants a key names:
+    ///
+    /// | bits | `x` | `y` | `z` | `w` |
+    /// |---|---|---|---|---|
+    /// | [`PHASE_CIRCLE`] | mode | — | — | — |
+    /// | [`FRESNEL`] | — | rim power | — | — |
+    /// | [`EMISSIVE_SWEEP`] | un-swept gain | progress | fade width | swept gain |
+    ///
+    /// `x` is shared, which is why the two consumers of it are: the phase
+    /// circle's mode is a property of *phase* geometry and the sweep is a
+    /// property of a wire, and no draw is both. The rest is reserved for ramp
+    /// threshold/softness/… as those variants land. Uploaded whole from the
+    /// start so a new variant never changes the uniform layout.
+    ///
+    /// [`FRESNEL`]: MaterialVariant::FRESNEL
+    /// [`EMISSIVE_SWEEP`]: MaterialVariant::EMISSIVE_SWEEP
     ///
     /// [`PHASE_CIRCLE`]: MaterialVariant::PHASE_CIRCLE
     /// [`PHASE_WORLD_ONLY`]: Material::PHASE_WORLD_ONLY

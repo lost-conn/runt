@@ -239,6 +239,137 @@ impl RenderScale {
     }
 }
 
+/// Where the screen-space phase circle is, as the *world* sees it (D1, DESIGN
+/// §5's [`PHASE_CIRCLE`] variant).
+///
+/// [`Renderer::set_phase_fx`] takes NDC and a radius, which is the right thing
+/// for a host holding a viewport and the wrong thing for a game holding a
+/// player: the projection needs the frame's own view-projection and aspect, and
+/// neither exists until the frame is being drawn. So a game says *what* the
+/// circle is centred on and *how big*, in units that survive a resize, and
+/// [`Engine::render`] resolves it against the frame it is about to draw. That
+/// is the same seam [`UiBatch`](crate::ui::UiBatch) uses, and it exists for the
+/// same reason: the sim owns the intent, the renderer owns the pixels.
+///
+/// **A render value living in the world.** Nothing in the engine reads it
+/// inside a tick, exactly like [`RenderScale`], so a `FixedSim` system may write
+/// it every tick without any fingerprint being able to see it. Absent means
+/// "no circle", which is the resting state and costs nothing.
+///
+/// [`PHASE_CIRCLE`]: crate::MaterialVariant::PHASE_CIRCLE
+/// [`Renderer::set_phase_fx`]: crate::Renderer::set_phase_fx
+/// [`Engine::render`]: crate::Engine::render
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct PhaseFx {
+    /// The world point the disc is centred on.
+    pub center: Vec3,
+    /// How big, in the units [`cover`](PhaseFx::cover) selects. Zero is off.
+    pub radius: f32,
+    /// The edge fringe's strength, `0..1`.
+    pub strength: f32,
+    /// What [`radius`](PhaseFx::radius) is measured in.
+    ///
+    /// `false` — NDC-Y units, the same thing [`Renderer::set_phase_fx`] takes:
+    /// an absolute size on screen, which is what a small fixed flourish wants.
+    ///
+    /// `true` — a fraction of the distance from the centre to the *farthest
+    /// corner of this frame*, plus a hair of padding. So `1.0` covers the whole
+    /// viewport from wherever the centre happens to be, at whatever aspect the
+    /// window happens to have, and a game can animate `0 → 1` without ever
+    /// computing a corner. The original does the corner search itself, once,
+    /// when the phase begins; doing it per frame instead is both simpler and
+    /// correct across a resize mid-transition.
+    ///
+    /// [`Renderer::set_phase_fx`]: crate::Renderer::set_phase_fx
+    pub cover: bool,
+}
+
+impl Default for PhaseFx {
+    fn default() -> PhaseFx {
+        PhaseFx {
+            center: Vec3::ZERO,
+            radius: 0.0,
+            strength: 0.0,
+            cover: false,
+        }
+    }
+}
+
+/// Padding added to the farthest-corner distance under [`PhaseFx::cover`], in
+/// NDC-Y units.
+///
+/// The original's `_max_radius += 0.1`, in its own units — fractions of the
+/// viewport *height*, where NDC-Y spans two of those. Without it a circle that
+/// exactly reaches the corner leaves the corner pixel itself on the boundary,
+/// and the fringe (which is drawn *at* the boundary) frames the screen.
+pub const PHASE_COVER_PADDING: f32 = 0.2;
+
+/// Below this much clip `w`, the centre is pinned to the middle of the screen.
+///
+/// The original's `cam_dist < 1.0` first-person guard: a projection is unusable
+/// when the point is all but inside the lens, and the answer that reads is
+/// "centred", not "somewhere off the edge". `w` is the view-space depth for the
+/// engine's perspective projection, so this is that distance, in metres, with no
+/// camera pose needed on this side.
+pub const PHASE_PIN_DISTANCE: f32 = 1.0;
+
+/// Resolve a [`PhaseFx`] against the frame it will be drawn in: `(centre in
+/// NDC, radius in NDC-Y units)`.
+///
+/// Three cases, and they are the original's
+/// (`scripts/phase/phase_visual_effect.gd`) restated in clip space:
+///
+/// - **all but on the lens** (`|w| < `[`PHASE_PIN_DISTANCE`]) — pin to the
+///   centre of the screen;
+/// - **behind the camera** (`w < 0`) — mirror through the centre and clamp,
+///   so a circle whose anchor is behind you slides off the correct edge instead
+///   of jumping to the opposite one;
+/// - otherwise the plain perspective divide.
+///
+/// Pure, and public, so the whole of it is an ordinary unit test.
+pub fn project_phase_fx(view_proj: &Mat4, aspect: f32, fx: &PhaseFx) -> (Vec2, f32) {
+    let clip = *view_proj * fx.center.extend(1.0);
+    let w = clip.w;
+    let center = if w.abs() < PHASE_PIN_DISTANCE {
+        Vec2::ZERO
+    } else if w < 0.0 {
+        // The divide by a negative `w` already mirrors the point through the
+        // origin, so this is the original's `1 - uv` written once. The clamp is
+        // its `[-0.5, 1.5]` in UV, which is `[-2, 2]` in NDC.
+        Vec2::new(clip.x / w, clip.y / w).clamp(Vec2::splat(-2.0), Vec2::splat(2.0))
+    } else {
+        Vec2::new(clip.x / w, clip.y / w)
+    };
+    let aspect = if aspect.is_finite() && aspect > 0.0 {
+        aspect
+    } else {
+        1.0
+    };
+    let radius = if fx.cover {
+        fx.radius * (farthest_corner(center, aspect) + PHASE_COVER_PADDING)
+    } else {
+        fx.radius
+    };
+    (center, radius.max(0.0))
+}
+
+/// Aspect-corrected distance from `center` to the farthest corner of the NDC
+/// square — the radius at which a disc centred there covers the frame.
+fn farthest_corner(center: Vec2, aspect: f32) -> f32 {
+    let mut worst = 0.0f32;
+    for corner in [
+        Vec2::new(-1.0, -1.0),
+        Vec2::new(1.0, -1.0),
+        Vec2::new(-1.0, 1.0),
+        Vec2::new(1.0, 1.0),
+    ] {
+        let mut d = corner - center;
+        d.x *= aspect;
+        worst = worst.max(d.length());
+    }
+    worst
+}
+
 /// Which scene generator an entity's geometry came from.
 ///
 /// [`MeshRef`] is a content hash and stays one — it is the renderer's key and it
@@ -353,6 +484,24 @@ pub struct Lighting {
     /// to — is the midpoint of sky and ground, so an old rig gains a background
     /// without gaining a decision. See [`Lighting::horizon`].
     pub horizon: Option<Vec3>,
+    /// How much of the sky the drifting cloud layer covers, `0..1`. **`0` — the
+    /// default — is no cloud pass at all**, which is what keeps the three-stop
+    /// gradient exactly the picture it was before clouds existed.
+    ///
+    /// A single number rather than the original's eight (`cloud_scale`,
+    /// `_density`, `_softness`, `_brightness`, `_height`, `_flatten`, `_speed`,
+    /// `_direction`): those are one authored *look*, and a scene that wants a
+    /// different one wants a different shader, not seven more RON fields. The
+    /// look is `sky.wgsl`'s constants, which are `simple_sky.gdshader`'s
+    /// defaults.
+    pub clouds: f32,
+    /// The angular radius of the sun disk, as `1 − cos θ` — the original's
+    /// `sun_disk_size`, in its units. **`0` is no disk.**
+    ///
+    /// Drawn in [`key_color`](Lighting::key_color) at
+    /// [`key_dir`](Lighting::key_dir), so a scene cannot end up with a sun in
+    /// one place and its shadows coming from another.
+    pub sun: f32,
 }
 
 impl Default for Lighting {
@@ -366,6 +515,10 @@ impl Default for Lighting {
             sky_color: Vec3::new(0.30, 0.33, 0.40),
             ground_color: Vec3::new(0.14, 0.13, 0.12),
             horizon: None,
+            // Off: the sky stays the three-stop gradient it has always been
+            // unless a scene asks for weather.
+            clouds: 0.0,
+            sun: 0.0,
         }
     }
 }
@@ -704,4 +857,114 @@ pub fn fixed_sim_schedule() -> Schedule {
             .chain(),
     );
     s
+}
+
+#[cfg(test)]
+mod phase_fx_tests {
+    use super::*;
+
+    /// A perspective camera at `eye` looking at the origin, as the engine's own
+    /// `Camera` builds one — so this tests the projection the frame is really
+    /// drawn with rather than a hand-rolled matrix that resembles it.
+    fn view_proj(eye: Vec3, aspect: f32) -> Mat4 {
+        let camera = crate::camera::Camera::default();
+        camera.view_proj(Transform::looking_at(eye, Vec3::ZERO, Vec3::Y).matrix(), aspect)
+    }
+
+    fn fx(center: Vec3, radius: f32, cover: bool) -> PhaseFx {
+        PhaseFx {
+            center,
+            radius,
+            strength: 1.0,
+            cover,
+        }
+    }
+
+    #[test]
+    fn a_point_in_front_projects_where_the_camera_sees_it() {
+        let vp = view_proj(Vec3::new(0.0, 0.0, 8.0), 16.0 / 9.0);
+        // Dead centre of the frame.
+        let (c, r) = project_phase_fx(&vp, 16.0 / 9.0, &fx(Vec3::ZERO, 0.3, false));
+        assert!(c.abs_diff_eq(Vec2::ZERO, 1e-5), "{c:?}");
+        assert_eq!(r, 0.3, "an absolute radius passes through untouched");
+
+        // Up and to the right of it.
+        let (c, _) = project_phase_fx(&vp, 16.0 / 9.0, &fx(Vec3::new(1.0, 1.0, 0.0), 0.0, false));
+        assert!(c.x > 0.0 && c.y > 0.0, "{c:?}");
+    }
+
+    #[test]
+    fn a_point_behind_the_camera_is_mirrored_and_clamped() {
+        let vp = view_proj(Vec3::new(0.0, 0.0, 8.0), 16.0 / 9.0);
+        // Well behind the eye, and off to the +X side of the world. The point
+        // has no honest place on screen; what it must not do is land in the
+        // middle of the frame as if it were in front.
+        let behind = Vec3::new(4.0, 0.0, 40.0);
+        let (c, _) = project_phase_fx(&vp, 16.0 / 9.0, &fx(behind, 0.0, false));
+        assert!(c.x <= 2.0 && c.x >= -2.0 && c.y <= 2.0 && c.y >= -2.0, "{c:?}");
+        assert!(c.x < 0.0, "a point to the right and behind mirrors left: {c:?}");
+    }
+
+    #[test]
+    fn a_point_all_but_on_the_lens_pins_to_the_centre() {
+        let vp = view_proj(Vec3::new(0.0, 0.0, 8.0), 16.0 / 9.0);
+        // Half a metre in front of the eye and a long way off-axis: the divide
+        // would fling it far outside the frame, and "centred" is the answer
+        // that reads.
+        let (c, _) = project_phase_fx(&vp, 16.0 / 9.0, &fx(Vec3::new(3.0, 0.0, 7.5), 0.0, false));
+        assert_eq!(c, Vec2::ZERO);
+    }
+
+    #[test]
+    fn a_cover_radius_of_one_reaches_every_corner_at_any_aspect() {
+        for aspect in [1.0, 16.0 / 9.0, 0.5] {
+            let vp = view_proj(Vec3::new(0.0, 0.0, 8.0), aspect);
+            for center in [Vec3::ZERO, Vec3::new(2.0, 1.5, 0.0)] {
+                let full = fx(center, 1.0, true);
+                let (c, r) = project_phase_fx(&vp, aspect, &full);
+                // Every corner of the NDC square, aspect-corrected exactly as
+                // `shader.wgsl`'s `phase_distance` does it, is inside.
+                for corner in [
+                    Vec2::new(-1.0, -1.0),
+                    Vec2::new(1.0, -1.0),
+                    Vec2::new(-1.0, 1.0),
+                    Vec2::new(1.0, 1.0),
+                ] {
+                    let mut d = corner - c;
+                    d.x *= aspect;
+                    assert!(
+                        d.length() < r,
+                        "corner {corner:?} outside a full-cover circle \
+                         (aspect {aspect}, centre {c:?}, radius {r})"
+                    );
+                }
+                // …and it is not wildly bigger than it needs to be: the padding
+                // is the whole of the slack.
+                assert!(r < 4.0, "{r}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_cover_radius_of_zero_is_off_and_a_negative_one_cannot_happen() {
+        let vp = view_proj(Vec3::new(0.0, 0.0, 8.0), 1.0);
+        assert_eq!(project_phase_fx(&vp, 1.0, &fx(Vec3::ZERO, 0.0, true)).1, 0.0);
+        assert_eq!(project_phase_fx(&vp, 1.0, &fx(Vec3::ZERO, -1.0, false)).1, 0.0);
+        // A host that has not sized its window yet must not produce a NaN
+        // radius that would make every comparison in the shader false.
+        assert!(project_phase_fx(&vp, 0.0, &fx(Vec3::ZERO, 1.0, true)).1.is_finite());
+        assert!(project_phase_fx(&vp, f32::NAN, &fx(Vec3::ZERO, 1.0, true))
+            .1
+            .is_finite());
+    }
+
+    #[test]
+    fn the_default_is_the_resting_state() {
+        let fx = PhaseFx::default();
+        assert_eq!(fx.radius, 0.0);
+        assert_eq!(
+            project_phase_fx(&Mat4::IDENTITY, 1.0, &fx),
+            (Vec2::ZERO, 0.0)
+        );
+    }
 }

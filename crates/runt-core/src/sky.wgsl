@@ -24,8 +24,69 @@ struct Frame {
     time: vec4<f32>,
     // xy: render target size in pixels. zw: its reciprocal.
     viewport: vec4<f32>,
+    // x: cloud cover, 0 = no cloud pass. y: sun-disk size as 1 − cos θ, 0 = no
+    // disk. zw: reserved.
+    sky_params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> frame: Frame;
+
+// ---------------------------------------------------------------------------
+// The cloud layer (`simple_sky.gdshader`, minus its texture)
+// ---------------------------------------------------------------------------
+//
+// The original samples a `NoiseTexture2D`; this evaluates the same *kind* of
+// field directly, because a sky that needed a texture would need a bake, a
+// handle, a bind group and a second pipeline layout — for two octaves of value
+// noise that cost less than the fetch would.
+//
+// The look's constants are `simple_sky.gdshader`'s own defaults. They are here
+// rather than in the frame block for the reason `Lighting::clouds` gives: they
+// are one authored weather, and a scene that wants another wants another shader.
+
+const CLOUD_SCALE: f32 = 0.6;
+const CLOUD_DENSITY: f32 = 0.5;
+const CLOUD_SOFTNESS: f32 = 0.3;
+const CLOUD_BRIGHTNESS: f32 = 1.0;
+const CLOUD_SPEED: f32 = 0.05;
+// How hard the view direction is flattened before it is projected to the cloud
+// plane. 1 would be a plane at infinity; the original's 0.5 keeps the layer
+// reading as a dome.
+const CLOUD_FLATTEN: f32 = 0.5;
+// The band above the horizon the layer fades in over, so the clouds do not
+// stack into a hard line where the dome meets the ground.
+const CLOUD_HORIZON_FADE: f32 = 0.1;
+
+// Hoskins-family 2D hash. Not a `fract(sin(...))` one: DESIGN §7 forbids those,
+// because "highp" is fp24 on cheap mobile parts and the sine destroys them.
+fn sky_hash(p_in: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p_in.x, p_in.y, p_in.x) * 0.1031);
+    p3 = p3 + vec3<f32>(dot(p3, p3.yzx + vec3<f32>(33.33)));
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// Value noise: bilinear over the lattice with a smoothstep fade, which is the
+// cheapest field that has no visible grid in it.
+fn sky_value_noise(p: vec2<f32>) -> f32 {
+    let cell = floor(p);
+    let f = p - cell;
+    let w = f * f * (3.0 - 2.0 * f);
+    let a = sky_hash(cell);
+    let b = sky_hash(cell + vec2<f32>(1.0, 0.0));
+    let c = sky_hash(cell + vec2<f32>(0.0, 1.0));
+    let d = sky_hash(cell + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
+}
+
+// Two octaves. Three would be prettier and this is a background.
+fn sky_clouds(dir: vec3<f32>) -> f32 {
+    let flat_dir = normalize(vec3<f32>(dir.x, dir.y * (1.0 - CLOUD_FLATTEN), dir.z));
+    let drift = vec2<f32>(frame.time.x * CLOUD_SPEED, 0.0);
+    let uv = flat_dir.xz * CLOUD_SCALE + drift;
+    let n = sky_value_noise(uv) * 0.65 + sky_value_noise(uv * 2.17 + vec2<f32>(11.3, 5.7)) * 0.35;
+    var alpha = smoothstep(CLOUD_DENSITY, CLOUD_DENSITY + CLOUD_SOFTNESS, n);
+    alpha = alpha * smoothstep(0.0, CLOUD_HORIZON_FADE, dir.y);
+    return alpha;
+}
 
 struct SkyOut {
     @builtin(position) clip: vec4<f32>,
@@ -75,5 +136,27 @@ fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
     } else {
         color = mix(frame.horizon_color.rgb, frame.ground_color.rgb, pow(-t, 0.75));
     }
+
+    // Both passes below are skipped outright at zero rather than multiplied by
+    // it. That is not a micro-optimization: it is what makes "a scene that says
+    // nothing about weather draws exactly the gradient it always did" a fact
+    // about the emitted bytes rather than a hope about floating-point identity.
+    let cover = frame.sky_params.x;
+    if (cover > 0.0) {
+        color = mix(color, vec3<f32>(CLOUD_BRIGHTNESS), sky_clouds(dir) * cover);
+    }
+
+    let sun_size = frame.sky_params.y;
+    if (sun_size > 0.0) {
+        // The original's disk: a smoothstep on `dot(view, light)`, blurred over
+        // a fixed fraction of the size so a big sun keeps a proportionate edge.
+        let blur = sun_size * 0.5;
+        let d = dot(dir, normalize(frame.light_dir.xyz));
+        let disk = smoothstep(1.0 - sun_size - blur, 1.0 - sun_size, d);
+        // Above the horizon only, exactly as `step(0.0, EYEDIR.y)` does: a sun
+        // shining up out of the ground half of the gradient reads as a bug.
+        color = mix(color, frame.light_color.rgb, disk * step(0.0, dir.y));
+    }
+
     return vec4<f32>(color, 1.0);
 }

@@ -54,15 +54,44 @@ pub fn view_ray(inv_view_proj: Mat4, ndc: Vec2) -> Vec3 {
 /// The background color along `dir`.
 ///
 /// Three stops on the ray's vertical component: `ground_color` straight down,
-/// [`Lighting::horizon`] at the horizon, `sky_color` straight up.
+/// [`Lighting::horizon`] at the horizon, `sky_color` straight up — then
+/// [`Lighting::sun`]'s disk over the top of it.
+///
+/// # What this twin does *not* cover
+///
+/// [`Lighting::clouds`]. The cloud layer scrolls on the render clock, so a
+/// value-for-value twin would have to be handed a time as well — and the thing
+/// this function exists for is a screenshot assertion, where "what time was it"
+/// is exactly the question a test should not have to answer. A rig with
+/// `clouds > 0` is therefore outside what this can be held to, which is why the
+/// default is `0.0` and why the engine's own screenshot fixture leaves it there.
 pub fn gradient(lighting: &Lighting, dir: Vec3) -> Vec3 {
     let horizon = lighting.horizon();
     let t = dir.y.clamp(-1.0, 1.0);
-    if t >= 0.0 {
+    let base = if t >= 0.0 {
         horizon.lerp(lighting.sky_color, t.powf(ZENITH_EXPONENT))
     } else {
         horizon.lerp(lighting.ground_color, (-t).powf(NADIR_EXPONENT))
+    };
+    base.lerp(lighting.key_color, sun_disk(lighting, dir))
+}
+
+/// How much of [`Lighting::key_color`] the sun disk contributes along `dir`.
+///
+/// Zero everywhere when [`Lighting::sun`] is zero, and zero below the horizon
+/// always — `sky.wgsl`'s `smoothstep` and its `step(0.0, EYEDIR.y)`, restated.
+pub fn sun_disk(lighting: &Lighting, dir: Vec3) -> f32 {
+    if lighting.sun <= 0.0 || dir.y < 0.0 {
+        return 0.0;
     }
+    let blur = lighting.sun * 0.5;
+    let (lo, hi) = (1.0 - lighting.sun - blur, 1.0 - lighting.sun);
+    let d = dir.dot(lighting.key_dir.normalize_or(Vec3::Y));
+    if hi <= lo {
+        return f32::from(d >= hi);
+    }
+    let t = ((d - lo) / (hi - lo)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// The background color at a normalized-device point — [`view_ray`] then

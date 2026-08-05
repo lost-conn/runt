@@ -33,6 +33,10 @@ struct Frame {
     // target's, so `position.xy * viewport.zw` is a fragment's place in the
     // frame at any render scale.
     viewport: vec4<f32>,
+    // x: cloud cover. y: sun-disk size. zw: reserved. The sky pass's, and read
+    // by nothing here — restated because the block is one buffer with one
+    // layout and all three files move together or it is silently misaligned.
+    sky_params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> frame: Frame;
 
@@ -110,6 +114,12 @@ struct VSOut {
     // GLES and WebGPU cannot be observed on a value all three vertices share.
     @location(3) @interpolate(flat) base_color: vec4<f32>,
     @location(4) @interpolate(flat) params: vec4<f32>,
+    // The mesh's own parameterization. Only `F_EMISSIVE_SWEEP` reads it today —
+    // everything else in here is world-space by doctrine (see `world_pos`) —
+    // and it is carried unconditionally rather than behind the flag because a
+    // varying cannot be conditional in WGSL and one more `vec2` interpolant is
+    // below the noise floor of a pass that already passes two flat `vec4`s.
+    @location(5) uv: vec2<f32>,
 };
 
 @vertex
@@ -145,6 +155,7 @@ fn vs_main(
     out.normal = (model * vec4<f32>(normal, 0.0)).xyz;
     out.base_color = base_color;
     out.params = params;
+    out.uv = uv;
     if (F_VERTEX_COLOR) {
         out.color = color;
     } else {
@@ -431,15 +442,48 @@ const PHASE_MIN_RADIUS: f32 = 0.001;
 /// Width of the fringe at the circle's edge, in NDC-Y units.
 const PHASE_EDGE: f32 = 0.03;
 
+// The fragment's normalized device coordinates, +Y up, from the framebuffer
+// pixel `@builtin(position)` carries in the fragment stage.
+fn frag_ndc(frag_pos: vec2<f32>) -> vec2<f32> {
+    let uv = frag_pos * frame.viewport.zw;
+    return vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+}
+
 // Aspect-corrected distance from the circle's centre, in NDC-Y units.
 fn phase_distance(frag_pos: vec2<f32>) -> f32 {
-    let uv = frag_pos * frame.viewport.zw;
-    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    var d = ndc - frame.phase.xy;
+    var d = frag_ndc(frag_pos) - frame.phase.xy;
     // viewport.x / viewport.y, written as a multiply by the reciprocal we are
     // already carrying.
     d.x = d.x * frame.viewport.x * frame.viewport.w;
     return length(d);
+}
+
+// ---------------------------------------------------------------------------
+// The rim term (`F_FRESNEL`)
+// ---------------------------------------------------------------------------
+//
+// The world-space direction the camera looks along through this fragment,
+// unprojected from the fragment's own NDC column — `sky.wgsl`'s construction,
+// which is the only one available here: the frame block carries `view_proj` and
+// its inverse and no camera position, and a rim term is the first thing that has
+// ever asked for one.
+//
+// Sign is not load-bearing. The rim is `1 − |N·V|`, so a view vector pointing
+// away from the eye instead of towards it gives the same band — which is also
+// what makes it agree with the original's `VIEW` (view space, towards the eye)
+// without reproducing that basis.
+fn view_direction(frag_pos: vec2<f32>) -> vec3<f32> {
+    let ndc = frag_ndc(frag_pos);
+    let near = frame.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
+    let far = frame.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    let delta = far.xyz / far.w - near.xyz / near.w;
+    let len = length(delta);
+    // A degenerate view-projection (the no-camera path hands us the identity)
+    // must produce a direction, not a NaN — same guard `fs_sky` carries.
+    if (len > 0.0) {
+        return delta / len;
+    }
+    return vec3<f32>(0.0, 0.0, 1.0);
 }
 
 @fragment
@@ -550,7 +594,38 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     }
 
     var color: vec3<f32>;
-    if (F_BILLBOARD_UNLIT) {
+    // The alpha the fragment leaves with. `base_color.a` unless one of the
+    // unlit looks below owns it (only `F_FRESNEL` does), because a rim that
+    // faded its colour and not its coverage would be a solid shell with a
+    // gradient painted on it.
+    var alpha = in.base_color.a;
+    if (F_FRESNEL) {
+        // `phase_outline.gdshader`, style 0: a silhouette rim, in the colour
+        // *and* in the coverage, unshaded. `params.y` is the exponent — higher
+        // is thinner and sharper — floored at the original's own hint range so
+        // an unset param cannot turn the rim into a solid shell (`pow(x, 0)`
+        // is 1 everywhere).
+        let rim = pow(
+            1.0 - abs(dot(n, view_direction(in.clip.xy))),
+            max(in.params.y, 0.5),
+        );
+        color = albedo * rim;
+        alpha = alpha * rim;
+    } else if (F_EMISSIVE_SWEEP) {
+        // `logic_wire.gdshader`: a wipe running along the mesh's own `u`, from
+        // the end the signal entered. `t` is 1 on the swept side.
+        //
+        // Two tones and two gains, and no third colour slot: the mesh's vertex
+        // colour is the un-swept side, `base_color` the swept one. `albedo` is
+        // deliberately not used — it is the *product* of the two, which is not
+        // either tone.
+        let t = 1.0 - smoothstep(
+            in.params.y - in.params.z,
+            in.params.y + in.params.z,
+            in.uv.x,
+        );
+        color = mix(in.color, in.base_color.rgb, t) * mix(in.params.x, in.params.w, t);
+    } else if (F_BILLBOARD_UNLIT) {
         // No lighting at all. A camera-facing quad's normal is whatever its
         // CPU-built basis happens to point at, so shading it would make the
         // surface swim as the camera turns — and these are emissive things
@@ -576,5 +651,5 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         }
     }
 
-    return vec4<f32>(color, in.base_color.a);
+    return vec4<f32>(color, alpha);
 }

@@ -208,9 +208,15 @@ impl Engine {
     ///
     /// The host-side door, exactly like
     /// [`set_render_scale`](Engine::set_render_scale): it is a *render* value,
-    /// no system reads it, and no fingerprint can move when it changes. A game
-    /// projects its player through the same camera the frame is drawn with and
-    /// calls this once a frame.
+    /// no system reads it, and no fingerprint can move when it changes.
+    ///
+    /// **Not the normal path for a game.** Projecting a world point needs the
+    /// frame's own view-projection and aspect, which do not exist until
+    /// [`render`](Engine::render) is running — so a game writes the
+    /// [`PhaseFx`](crate::ecs::PhaseFx) resource, in world units, and the frame
+    /// resolves it. This is the door for a host or an editor that already has
+    /// screen coordinates in hand; a world carrying `PhaseFx` overwrites it on
+    /// the next frame.
     pub fn set_phase_fx(&mut self, center: glam::Vec2, radius: f32, strength: f32) {
         self.renderer.set_phase_fx(center, radius, strength);
     }
@@ -258,6 +264,13 @@ impl Engine {
         };
         self.renderer.set_ui_batch(quads, atlas);
 
+        // The phase circle the world is asking for (D1, `ecs::PhaseFx`),
+        // resolved against *this* frame's camera and aspect. Read before
+        // `frame_params` only so the borrow of the world ends first; a world
+        // that says nothing leaves whatever the host last set alone, which is
+        // what keeps `Engine::set_phase_fx` a usable door of its own.
+        let phase_fx = self.sim.world().get_resource::<crate::ecs::PhaseFx>().copied();
+
         let Some(frame) = self.sim.frame_params(aspect) else {
             if !self.warned_no_camera {
                 log::warn!("no camera entity in the world; nothing will be drawn");
@@ -278,6 +291,11 @@ impl Engine {
             );
             return;
         };
+
+        if let Some(fx) = phase_fx {
+            let (center, radius) = crate::ecs::project_phase_fx(&frame.view_proj, aspect, &fx);
+            self.renderer.set_phase_fx(center, radius, fx.strength);
+        }
 
         let draws = self.sim.draw_list();
         self.renderer.render_scaled(

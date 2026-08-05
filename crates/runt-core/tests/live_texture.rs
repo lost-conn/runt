@@ -76,6 +76,7 @@ fn flat_lighting() -> Lighting {
         sky_color: Vec3::ONE,
         ground_color: Vec3::ONE,
         horizon: None,
+        ..Lighting::default()
     }
 }
 
@@ -592,6 +593,7 @@ fn the_live_normal_actually_bends_the_light() {
         sky_color: Vec3::ZERO,
         ground_color: Vec3::ZERO,
         horizon: None,
+        ..Lighting::default()
     };
 
     let shoot = |renderer: &mut Renderer, variant: MaterialVariant| {

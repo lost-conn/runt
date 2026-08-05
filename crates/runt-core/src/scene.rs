@@ -642,6 +642,13 @@ pub struct LightingDesc {
     #[serde(default)]
     #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::OptVec3Def))]
     pub horizon: Option<Vec3>,
+    /// Cloud cover, `0..1` (DESIGN §5; [`Lighting::clouds`]). `0` — the default,
+    /// and what every file written before this existed says — is no cloud pass.
+    #[serde(default)]
+    pub clouds: f32,
+    /// Sun-disk size, `1 − cos θ` ([`Lighting::sun`]). `0` is no disk.
+    #[serde(default)]
+    pub sun: f32,
 }
 
 impl Default for LightingDesc {
@@ -658,6 +665,8 @@ impl From<Lighting> for LightingDesc {
             sky_color: l.sky_color,
             ground_color: l.ground_color,
             horizon: l.horizon,
+            clouds: l.clouds,
+            sun: l.sun,
         }
     }
 }
@@ -670,6 +679,8 @@ impl LightingDesc {
             sky_color: self.sky_color,
             ground_color: self.ground_color,
             horizon: self.horizon,
+            clouds: self.clouds,
+            sun: self.sun,
         }
     }
 }

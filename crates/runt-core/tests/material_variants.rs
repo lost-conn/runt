@@ -131,6 +131,8 @@ fn variant_keys_behave_as_bitflags() {
     assert_eq!(MaterialVariant::DEPTH_GREATER.bits(), 1 << 7);
     assert_eq!(MaterialVariant::PHASE_CIRCLE.bits(), 1 << 8);
     assert_eq!(MaterialVariant::BILLBOARD_UNLIT.bits(), 1 << 9);
+    assert_eq!(MaterialVariant::FRESNEL.bits(), 1 << 10);
+    assert_eq!(MaterialVariant::EMISSIVE_SWEEP.bits(), 1 << 11);
 
     // The flag list and the bits agree, so no key can be generated that the
     // preprocessor would not emit a const for.
@@ -139,7 +141,16 @@ fn variant_keys_behave_as_bitflags() {
         assert!(!union.contains(flag), "duplicate flag bit {:#06b}", flag.bits());
         union |= flag;
     }
-    assert_eq!(union.bits(), 0b11_1111_1111);
+    assert_eq!(union.bits(), 0b1111_1111_1111);
+
+    // The four looks that replace the lighting term rather than feeding it.
+    // Exactly one wins per fragment; the mask is what says which four they are.
+    assert_eq!(
+        MaterialVariant::UNLIT.bits(),
+        MaterialVariant::FRESNEL.bits()
+            | MaterialVariant::EMISSIVE_SWEEP.bits()
+            | MaterialVariant::BILLBOARD_UNLIT.bits(),
+    );
 
     // `contains` is all-of, `intersects` is any-of. `BLENDED` is a mask where
     // either bit alone is the whole answer, so the two are not interchangeable.
