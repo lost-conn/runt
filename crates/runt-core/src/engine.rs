@@ -15,6 +15,14 @@ pub struct Engine {
     /// A world with no camera draws nothing; say so once rather than every
     /// frame for as long as it stays broken.
     warned_no_camera: bool,
+    /// The last wall time [`update`](Engine::update) was given — the render
+    /// clock (`FrameUniform::time.x`), forwarded to the renderer at draw time.
+    ///
+    /// Not the sim's clock: this is the host's raw elapsed seconds, un-quantized
+    /// by ticks, so a shader driven from it moves smoothly between them. Nothing
+    /// in a `FixedSim` can reach it, which is the property that lets render-side
+    /// animation exist at all without putting a replay at risk (DESIGN §4).
+    render_seconds: f64,
 }
 
 impl Engine {
@@ -85,6 +93,7 @@ impl Engine {
             sim,
             renderer,
             warned_no_camera: false,
+            render_seconds: 0.0,
         };
         engine.bake_scene_textures();
         engine
@@ -186,7 +195,30 @@ impl Engine {
     /// number of ticks that ran. The engine never reads a clock itself, so this
     /// value is the only time source in the system (DESIGN §4).
     pub fn update(&mut self, elapsed_seconds: f64) -> u32 {
+        if elapsed_seconds.is_finite() {
+            self.render_seconds = elapsed_seconds;
+        }
         self.sim.update(elapsed_seconds)
+    }
+
+    /// Aim the screen-space phase circle every
+    /// [`PHASE_CIRCLE`](crate::MaterialVariant::PHASE_CIRCLE) material reads
+    /// (DESIGN §5). `center` is NDC, `radius` is in NDC-Y units, `strength` is
+    /// `0..1`.
+    ///
+    /// The host-side door, exactly like
+    /// [`set_render_scale`](Engine::set_render_scale): it is a *render* value,
+    /// no system reads it, and no fingerprint can move when it changes. A game
+    /// projects its player through the same camera the frame is drawn with and
+    /// calls this once a frame.
+    pub fn set_phase_fx(&mut self, center: glam::Vec2, radius: f32, strength: f32) {
+        self.renderer.set_phase_fx(center, radius, strength);
+    }
+
+    /// The phase circle as the next frame will draw it: `(center, radius,
+    /// strength)`.
+    pub fn phase_fx(&self) -> (glam::Vec2, f32, f32) {
+        self.renderer.phase_fx()
     }
 
     /// Draw one frame into `view`, which must be [`target_format`] and
@@ -206,6 +238,13 @@ impl Engine {
         // belongs in it either way (see `Renderer::render_scaled`).
         let aspect = width as f32 / height as f32;
         let scale = self.sim.render_scale();
+        // The render clock, forwarded rather than measured — the engine owns no
+        // clock (DESIGN §4). `as f32` is lossy after a few hours of uptime; a
+        // shader animating on a value that has stopped advancing smoothly is a
+        // real (and known) limit, and the fix when something needs it is to
+        // wrap the seconds, not to hand the GPU an f64 it cannot take.
+        self.renderer
+            .set_render_clock(self.render_seconds as f32, self.sim.alpha());
 
         let Some(frame) = self.sim.frame_params(aspect) else {
             if !self.warned_no_camera {

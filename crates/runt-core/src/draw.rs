@@ -10,12 +10,33 @@
 //! putting it on `Material` would mean every entity carrying a copy of a
 //! host-wide switch, and flipping it would mean a world mutation.
 //!
-//! Sorting is by `(variant, texture, mesh, entity)`: variant first because a
-//! pipeline swap is the expensive state change, texture second because a
-//! bind-group swap is the next one, mesh third because vertex/index buffer
-//! binds are after that, entity last purely as a deterministic tie-break — two
-//! frames from the same world state must produce byte-identical command
-//! streams.
+//! Sorting is by `(pass, variant, texture, mesh, entity)`: variant first
+//! because a pipeline swap is the expensive state change, texture second
+//! because a bind-group swap is the next one, mesh third because vertex/index
+//! buffer binds are after that, entity last purely as a deterministic
+//! tie-break — two frames from the same world state must produce byte-identical
+//! command streams.
+//!
+//! # The blended pass
+//!
+//! `pass` is ahead of all of it, and it is the one place where correctness
+//! outranks state changes. A draw carrying [`TRANSPARENT`] or [`ADDITIVE`]
+//! blends with whatever is already in the attachment and writes no depth, so
+//! the order it needs is **the camera's**, not the pipeline's: farthest first,
+//! after every opaque draw. Those items are partitioned to the end of the list
+//! here and re-ordered by [`sort_draw_list_for_view`] once the view matrix is
+//! known.
+//!
+//! Why the second step is separate: extraction is a pure function of the world
+//! and an alpha (that is what makes `Sim::draw_list` cheap and testable), and
+//! the camera lives in [`FrameParams`], one layer up. So this layer decides
+//! *which pass* an item belongs to — a property of the material alone — and the
+//! renderer, which is holding the view-projection anyway, decides the order
+//! within the blended one. A frame with no blended item never runs the second
+//! step at all, which is what keeps the opaque path byte-identical.
+//!
+//! [`TRANSPARENT`]: MaterialVariant::TRANSPARENT
+//! [`ADDITIVE`]: MaterialVariant::ADDITIVE
 
 use bevy_ecs::prelude::*;
 use glam::{Mat4, Vec4};
@@ -45,6 +66,11 @@ pub struct DrawItem {
 impl DrawItem {
     /// The sort key. Public so the ordering can be asserted directly.
     ///
+    /// `pass` leads: `0` for opaque, `1` for blended (see the module docs).
+    /// It cannot be folded into the variant bits — [`PHASE_CIRCLE`] and
+    /// [`BILLBOARD_UNLIT`] are numerically above the blend bits and are
+    /// perfectly ordinary opaque looks — so it is its own field.
+    ///
     /// The tie-break is the entity's *index*, not `Entity`'s own `Ord` — that
     /// one compares opaque bits, which today happens to run backwards from
     /// spawn order and could change between bevy_ecs releases. Index-then-bits
@@ -53,14 +79,74 @@ impl DrawItem {
     /// Untextured draws key as `0`, which sorts them ahead of every textured
     /// one within a variant — so the two populations never interleave and the
     /// default bind group is set at most once per variant.
-    pub fn sort_key(&self) -> (u32, u64, u64, u32, u64) {
+    ///
+    /// [`PHASE_CIRCLE`]: MaterialVariant::PHASE_CIRCLE
+    /// [`BILLBOARD_UNLIT`]: MaterialVariant::BILLBOARD_UNLIT
+    pub fn sort_key(&self) -> (u32, u32, u64, u64, u32, u64) {
         (
+            self.pass(),
             self.variant.bits(),
             self.texture.map(|t| t.0).unwrap_or(0),
             self.mesh.0,
             self.entity.index_u32(),
             self.entity.to_bits(),
         )
+    }
+
+    /// Whether this draw blends rather than replaces — [`BLENDED`] in the key.
+    ///
+    /// [`BLENDED`]: MaterialVariant::BLENDED
+    pub fn is_blended(&self) -> bool {
+        self.variant.intersects(MaterialVariant::BLENDED)
+    }
+
+    /// `0` opaque, `1` blended: which half of the frame this item is drawn in.
+    pub fn pass(&self) -> u32 {
+        self.is_blended() as u32
+    }
+
+    /// The blended pass's key: farthest fragment first, then entity.
+    ///
+    /// **Every component is an integer**, which is the point. Depth is a `f32`
+    /// that came out of a matrix multiply, and DESIGN's determinism rule is not
+    /// "the same inputs give the same floats" (they do) but "the *order* must
+    /// never depend on how a comparison treats a float". So the depth is mapped
+    /// to a `u32` that carries IEEE-754 total order — sign-magnitude flipped to
+    /// two's-complement-ish, the standard radix trick — and then complemented,
+    /// because back-to-front is descending depth and `sort_by_key` ascends.
+    /// NaN and ±0 land in fixed places instead of making a comparator
+    /// non-transitive; nothing is ever *equal-but-unordered*.
+    ///
+    /// Depth is `clip.w` of the model's origin: for the engine's perspective
+    /// projection that is exactly the view-space distance along the camera's
+    /// forward axis, with no view matrix needed on this side (we are only ever
+    /// handed the product). A projection whose `w` is constant — an
+    /// orthographic one, or [`FrameParams::default`]'s identity — makes every
+    /// depth equal, and the entity tie-break carries the whole order. That is a
+    /// degradation to "arbitrary but stable", never to "unstable".
+    ///
+    /// Per *object*, not per triangle: a blended object that intersects another
+    /// is still drawn in one piece and can still sort wrong. Splitting geometry
+    /// to fix that is a cost the content does not need us to pay.
+    pub fn blended_key(&self, view_proj: &Mat4) -> (u32, u32, u64) {
+        let clip = *view_proj * self.model.w_axis;
+        (
+            !ordered_f32(clip.w),
+            self.entity.index_u32(),
+            self.entity.to_bits(),
+        )
+    }
+}
+
+/// `f32` → `u32` preserving IEEE-754 total order: positives keep their order
+/// above the sign flip, negatives reverse below it. Bijective, so no two
+/// distinct bit patterns collide and no comparison is ever ambiguous.
+fn ordered_f32(value: f32) -> u32 {
+    let bits = value.to_bits();
+    if bits & 0x8000_0000 != 0 {
+        !bits
+    } else {
+        bits ^ 0x8000_0000
     }
 }
 
@@ -169,8 +255,34 @@ pub fn extract_draw_list(
     items
 }
 
-/// Sort in place by `(variant, texture, mesh, entity)` — see the module docs
-/// for why that order and why the tie-break is not optional.
+/// Sort in place by `(pass, variant, texture, mesh, entity)` — see the module
+/// docs for why that order and why the tie-break is not optional.
+///
+/// This leaves the blended items at the end, grouped by state rather than
+/// ordered by depth; [`sort_draw_list_for_view`] is what finishes them.
 pub fn sort_draw_list(items: &mut [DrawItem]) {
     items.sort_unstable_by_key(|item| item.sort_key());
+}
+
+/// Whether any item needs the camera-ordered second pass.
+///
+/// The renderer's guard: a frame of nothing but opaque geometry must take the
+/// exact path it took before blending existed — same slice, same slots, same
+/// commands — and that is a claim this predicate is the whole of.
+pub fn has_blended(items: &[DrawItem]) -> bool {
+    items.iter().any(DrawItem::is_blended)
+}
+
+/// The full frame order: opaque by state, then blended back-to-front from
+/// `view_proj`.
+///
+/// Called by the renderer, which is the first thing to hold both the list and
+/// the camera. Idempotent and total: sorting an already-sorted list is a no-op,
+/// and two lists with the same contents in any spawn order come out identical.
+pub fn sort_draw_list_for_view(items: &mut [DrawItem], view_proj: &Mat4) {
+    sort_draw_list(items);
+    // `sort_draw_list` put every blended item last, so the blended half is one
+    // contiguous suffix and `partition_point` finds its start in log n.
+    let start = items.partition_point(|item| !item.is_blended());
+    items[start..].sort_unstable_by_key(|item| item.blended_key(view_proj));
 }

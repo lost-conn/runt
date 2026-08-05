@@ -179,6 +179,45 @@ pub struct FrameUniform {
     pub ground_color: [f32; 4],
     /// The resolved [`Lighting::horizon`] — the sky's middle stop.
     pub horizon_color: [f32; 4],
+    /// The screen-space phase circle (DESIGN §5's variant doctrine, the port's
+    /// signature effect), read by
+    /// [`PHASE_CIRCLE`](MaterialVariant::PHASE_CIRCLE) draws:
+    ///
+    /// - `xy` — centre in **NDC** (`-1..1`, +Y up),
+    /// - `z` — radius in NDC-Y units, i.e. fractions of the half-height, with
+    ///   the X offset aspect-corrected so the disc is round on screen,
+    /// - `w` — effect strength `0..1`, which drives the edge fringe only.
+    ///
+    /// Zero (the default) is a circle of no radius: nothing is inside it, so
+    /// world geometry is solid and phase geometry is gone. That is both the
+    /// resting state and the original's, whose `phase_radius` means the same
+    /// thing.
+    ///
+    /// NDC rather than pixels so the value survives [`RenderScale`]: the frame
+    /// is drawn into a smaller target and stretched back over the same
+    /// rectangle, and a normalized circle lands in the same place either way.
+    pub phase: [f32; 4],
+    /// `x` — the **render** clock in seconds; `y` — the interpolation alpha of
+    /// the frame being drawn; `zw` — reserved.
+    ///
+    /// A render-side clock, deliberately: it is the host's wall time, it moves
+    /// between ticks, and no system in a `FixedSim` may read it (DESIGN §4).
+    /// Animation driven from here is animation that cannot move a replay
+    /// fingerprint.
+    pub time: [f32; 4],
+    /// `xy` — the target's size in pixels; `zw` — its reciprocal.
+    ///
+    /// The *render* target's, so at [`RenderScale`] below 1.0 this is the
+    /// internal target rather than the host's view. That is what makes screen
+    /// space mean one thing: a fragment's `position.xy · viewport.zw` is its
+    /// place in the frame, `0..1`, whatever resolution the frame was drawn at.
+    ///
+    /// Not in D1's two vec4s, and here anyway: converting a fragment to NDC
+    /// takes the viewport, the phase circle is defined in NDC, and the
+    /// alternative was overloading `time.zw` (reserved for a reason) or a
+    /// perspective-correct clip-position varying on every variant, paid for by
+    /// every draw that has nothing to do with any of this.
+    pub viewport: [f32; 4],
 }
 
 /// `@group(1)`: one slot per drawn entity, addressed with a dynamic offset.
@@ -236,6 +275,16 @@ pub struct Renderer {
 
     frame_buffer: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
+
+    /// [`FrameUniform::phase`] and [`FrameUniform::time`], held between frames.
+    ///
+    /// Render-side state, kept here rather than in [`FrameParams`] for the same
+    /// reason [`RenderScale`] is not a component: nothing in a tick may read
+    /// it, so it must not be reachable from the world. `FrameParams` is what
+    /// `Extract` produces out of the world; these two are what the *host*
+    /// says about the frame it is asking for.
+    phase: [f32; 4],
+    time: [f32; 4],
 
     /// The background gradient's pipeline: one fullscreen triangle, `@group(0)`
     /// only, no depth. Not in `pipelines` because it is not a material variant —
@@ -382,6 +431,8 @@ impl Renderer {
             instance_layout,
             frame_buffer,
             frame_bind_group,
+            phase: [0.0; 4],
+            time: [0.0; 4],
             sky_pipeline,
             instance_buffer,
             instance_bind_group,
@@ -469,11 +520,51 @@ impl Renderer {
         self.instance_capacity
     }
 
+    /// Aim the screen-space phase circle (see [`FrameUniform::phase`]).
+    ///
+    /// `center` is NDC (`-1..1`, +Y up), `radius` is in NDC-Y units with the X
+    /// axis aspect-corrected, and `strength` (`0..1`) drives the edge fringe.
+    /// A radius of zero is the resting state: world geometry solid, phase
+    /// geometry gone.
+    ///
+    /// Cheap enough to call every frame — it writes two `vec4`s into the frame
+    /// uniform that were already being written — and invisible to the sim.
+    pub fn set_phase_fx(&mut self, center: glam::Vec2, radius: f32, strength: f32) {
+        self.phase = [center.x, center.y, radius.max(0.0), strength.clamp(0.0, 1.0)];
+    }
+
+    /// The phase circle as the next frame will see it: `(center, radius,
+    /// strength)`.
+    pub fn phase_fx(&self) -> (glam::Vec2, f32, f32) {
+        (
+            glam::Vec2::new(self.phase[0], self.phase[1]),
+            self.phase[2],
+            self.phase[3],
+        )
+    }
+
+    /// Set the render clock (see [`FrameUniform::time`]): host wall seconds and
+    /// the interpolation alpha of the frame about to be drawn.
+    ///
+    /// The renderer has no clock of its own — nothing in runt does (DESIGN §4)
+    /// — so this is the same value the host already hands
+    /// [`Engine::update`](crate::Engine::update), forwarded rather than
+    /// re-measured. A host driving the `Renderer` directly and never calling
+    /// this gets a frozen clock at zero, which is exactly what a screenshot
+    /// test wants.
+    pub fn set_render_clock(&mut self, seconds: f32, alpha: f32) {
+        self.time[0] = seconds;
+        self.time[1] = alpha;
+    }
+
     /// Compile `variant`'s pipeline if it is not cached yet.
     ///
     /// Variant sources come from one WGSL file plus prepended feature `const`s
     /// (see [`material::variant_source`]), so a new look never means a new
-    /// pipeline *shape* — only a new key in this map.
+    /// pipeline *shape* — only a new key in this map. Blend mode and depth
+    /// state come from the key too, via [`render_state`]: they are the half of
+    /// a "look" that no shader branch can express, and hardcoding them here was
+    /// the one thing keeping the variant system from covering the whole of §5.
     pub fn ensure_pipeline(&mut self, variant: MaterialVariant) {
         if self.pipelines.contains_key(&variant) {
             return;
@@ -493,10 +584,11 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(source.into()),
         });
 
+        let state = render_state(variant);
         let pipeline = self
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("forward opaque"),
+                label: Some(state.label),
                 layout: Some(&self.pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
@@ -509,7 +601,7 @@ impl Renderer {
                     entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: self.target_format,
-                        blend: Some(wgpu::BlendState::REPLACE),
+                        blend: Some(state.blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                     compilation_options: Default::default(),
@@ -521,8 +613,8 @@ impl Renderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    depth_write_enabled: Some(state.depth_write),
+                    depth_compare: Some(state.depth_compare),
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
@@ -536,11 +628,18 @@ impl Renderer {
     /// Draw one frame into `view`, which must be `target_format` and
     /// `width` × `height`.
     ///
-    /// Frame anatomy: upload any newly-referenced geometry → bake any
+    /// Frame anatomy: order the blended draws against this camera (only if
+    /// there are any) → upload any newly-referenced geometry → bake any
     /// newly-referenced texture → write the frame uniform → write one instance
     /// slot per draw → compile any missing variant → clear → paint the sky →
     /// walk the sorted list, changing pipeline, texture and vertex buffers only
     /// when the sort key says they changed.
+    ///
+    /// One loop covers both passes, because the sort put the blended items
+    /// last: the opaque half is state-ordered and the tail is back-to-front,
+    /// and the pipeline each item names already carries its blend and depth
+    /// state (see [`render_state`]). Same encoder, same render pass, same
+    /// single submit.
     ///
     /// Eight parameters is past clippy's taste, and a `RenderArgs` struct would
     /// only move the same eight values one level out: the target and its size
@@ -610,9 +709,27 @@ impl Renderer {
 
         self.ensure_depth(render_width, render_height);
 
+        // The blended half of the list has to be ordered by the camera, and the
+        // camera is here rather than in `Extract` (see `draw`'s module docs).
+        //
+        // A frame with nothing blended in it never copies, never re-sorts, and
+        // hands the loop below the caller's own slice — which is the whole of
+        // "the opaque path is byte-identical to what it was".
+        let depth_sorted: Vec<DrawItem>;
+        let draws: &[DrawItem] = if draw::has_blended(draws) {
+            depth_sorted = {
+                let mut items = draws.to_vec();
+                draw::sort_draw_list_for_view(&mut items, &frame.view_proj);
+                items
+            };
+            &depth_sorted
+        } else {
+            draws
+        };
+
         self.upload_missing_meshes(draws, library);
         self.bake_missing_textures(draws, textures);
-        self.write_frame_uniform(frame);
+        self.write_frame_uniform(frame, render_width, render_height);
         self.write_instances(draws);
         for item in draws {
             self.ensure_pipeline(item.variant);
@@ -813,8 +930,11 @@ impl Renderer {
         }
     }
 
-    fn write_frame_uniform(&mut self, frame: &FrameParams) {
+    /// `width`/`height` are the **render** target's, not the host view's — see
+    /// [`FrameUniform::viewport`].
+    fn write_frame_uniform(&mut self, frame: &FrameParams, width: u32, height: u32) {
         let light = frame.lighting;
+        let (w, h) = (width.max(1) as f32, height.max(1) as f32);
         let uniform = FrameUniform {
             view_proj: frame.view_proj.to_cols_array_2d(),
             inv_view_proj: frame.view_proj.inverse().to_cols_array_2d(),
@@ -823,6 +943,9 @@ impl Renderer {
             sky_color: light.sky_color.extend(0.0).to_array(),
             ground_color: light.ground_color.extend(0.0).to_array(),
             horizon_color: light.horizon().extend(0.0).to_array(),
+            phase: self.phase,
+            time: self.time,
+            viewport: [w, h, 1.0 / w, 1.0 / h],
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -1055,6 +1178,88 @@ impl Renderer {
             view,
             bind_group,
         });
+    }
+}
+
+/// The fixed-function half of a variant: what [`Renderer::ensure_pipeline`]
+/// builds that is not the shader module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PipelineState {
+    pub blend: wgpu::BlendState,
+    pub depth_write: bool,
+    pub depth_compare: wgpu::CompareFunction,
+    /// The pipeline's debug label; also the name a capture tool shows.
+    pub label: &'static str,
+}
+
+/// Derive a variant's blend and depth state from its key (DESIGN §5).
+///
+/// A pure function of the bits, and public, so the mapping can be asserted
+/// without a GPU — the pipeline cache is keyed on the variant, so this table
+/// being right is the difference between "two looks share a pipeline" and "two
+/// looks share a pipeline *by accident*".
+///
+/// | key | blend | depth write | depth test |
+/// |---|---|---|---|
+/// | *(none of the below)* | replace | yes | `Less` |
+/// | [`TRANSPARENT`] | `src·α + dst·(1−α)` | **no** | `Less` |
+/// | [`ADDITIVE`] | `src·α + dst` | **no** | `Less` |
+/// | `TRANSPARENT \| ADDITIVE` | additive — it wins | **no** | `Less` |
+/// | + [`DEPTH_GREATER`] | *(unchanged)* | *(unchanged)* | **`Greater`** |
+///
+/// Two decisions worth stating out loud:
+///
+/// - **Additive beats alpha** when a key carries both, the way `LIVE_TEX` beats
+///   `TEXTURE` in [`draw::resolve_variant`]: the combination is meaningless
+///   rather than illegal, so it resolves the same way everywhere instead of
+///   being undefined in one place and rejected in another.
+/// - **`DEPTH_GREATER` does not imply a blend.** An opaque `Greater` draw is a
+///   perfectly good "fill in what is hidden" pass, and folding the two together
+///   would have made the see-through-walls silhouette a special case instead of
+///   two composable bits.
+///
+/// Backface culling stays on for every variant. A camera-facing quad whose CPU
+/// basis is built right is wound right, and turning culling off for blended
+/// draws would silently double the fill cost of the one population that can
+/// least afford it.
+///
+/// [`TRANSPARENT`]: MaterialVariant::TRANSPARENT
+/// [`ADDITIVE`]: MaterialVariant::ADDITIVE
+/// [`DEPTH_GREATER`]: MaterialVariant::DEPTH_GREATER
+pub fn render_state(variant: MaterialVariant) -> PipelineState {
+    let (blend, label) = if variant.contains(MaterialVariant::ADDITIVE) {
+        (
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                // The destination's alpha is left alone: the attachment may be
+                // a surface whose alpha the compositor reads, and a glow has no
+                // opinion about how opaque the frame is.
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+            "forward additive",
+        )
+    } else if variant.contains(MaterialVariant::TRANSPARENT) {
+        (wgpu::BlendState::ALPHA_BLENDING, "forward transparent")
+    } else {
+        (wgpu::BlendState::REPLACE, "forward opaque")
+    };
+    PipelineState {
+        blend,
+        depth_write: !variant.intersects(MaterialVariant::BLENDED),
+        depth_compare: if variant.contains(MaterialVariant::DEPTH_GREATER) {
+            wgpu::CompareFunction::Greater
+        } else {
+            wgpu::CompareFunction::Less
+        },
+        label,
     }
 }
 

@@ -5,6 +5,11 @@
 // no feature consts to prepend. It binds @group(0) only — the frame block — so
 // it uses its own pipeline layout and never needs a per-instance slot.
 
+// Field order must match `runt_core::FrameUniform`, and `shader.wgsl` restates
+// the same block. The sky reads none of the last three — it has no material and
+// therefore no phase circle, no clock and no screen-space anything — but the
+// block is one buffer with one layout, so all three files move together or the
+// uniform is silently misaligned.
 struct Frame {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
@@ -13,6 +18,12 @@ struct Frame {
     sky_color: vec4<f32>,
     ground_color: vec4<f32>,
     horizon_color: vec4<f32>,
+    // xy: phase-circle centre in NDC. z: radius in NDC-Y units. w: strength.
+    phase: vec4<f32>,
+    // x: render-clock seconds. y: interpolation alpha. zw: reserved.
+    time: vec4<f32>,
+    // xy: render target size in pixels. zw: its reciprocal.
+    viewport: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> frame: Frame;
 

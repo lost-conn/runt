@@ -21,6 +21,18 @@ struct Frame {
     sky_color: vec4<f32>,
     ground_color: vec4<f32>,
     horizon_color: vec4<f32>,
+    // The screen-space phase circle. xy: centre in NDC (+Y up). z: radius in
+    // NDC-Y units, the X offset aspect-corrected so the disc is round on
+    // screen. w: effect strength, 0..1, which drives the edge fringe only.
+    // A zero radius is a circle nothing is inside — the resting state.
+    phase: vec4<f32>,
+    // x: the render clock in seconds (never a simulation input). y: this
+    // frame's interpolation alpha. zw: reserved.
+    time: vec4<f32>,
+    // xy: the render target's size in pixels. zw: its reciprocal. The *render*
+    // target's, so `position.xy * viewport.zw` is a fragment's place in the
+    // frame at any render scale.
+    viewport: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> frame: Frame;
 
@@ -355,8 +367,75 @@ fn perturb_normal(n: vec3<f32>, dpx: vec3<f32>, dpy: vec3<f32>, dhdx: f32, dhdy:
     return normalize(n + t.x * normalize(s * r1) + t.y * normalize(s * r2));
 }
 
+// ---------------------------------------------------------------------------
+// The phase circle (`F_PHASE_CIRCLE`)
+// ---------------------------------------------------------------------------
+//
+// A disc in **screen** space, centred on wherever the game put it. Screen space
+// is the original's choice and it is the right one: a world-space sphere hugs
+// the geometry it cuts and its edge becomes an unreadable silhouette, where a
+// screen circle stays a circle you can track while the camera moves. See
+// `3dimenshift/shaders/phase_common.gdshaderinc`, which this restates.
+//
+// Three things are worth knowing about the coordinates:
+//
+//   * The fragment's place in the frame comes from `@builtin(position)` — in
+//     the fragment stage that is the framebuffer pixel, not the clip vector the
+//     vertex shader wrote — divided by the render target's size. So it needs no
+//     varying and costs nothing in the variants that do not use it.
+//   * **Render scale is free.** `viewport` is the size of the target actually
+//     being drawn into, so the division lands in the same 0..1 whether the
+//     frame is native or a quarter of it, and the circle is in the same place
+//     on screen after the blit. The one thing that changes is how many pixels
+//     the edge fringe is smeared over, which is the point of drawing small.
+//   * The X offset is multiplied by the aspect ratio, so the disc is round on
+//     screen rather than round in NDC.
+
+/// Below this the circle is "off": nothing is inside it, so world geometry is
+/// solid and phase-only geometry is gone. Godot's `phase_common` uses the same
+/// 0.001, and the resting state has to be exact or every phase object flickers
+/// at radius zero.
+const PHASE_MIN_RADIUS: f32 = 0.001;
+/// Width of the fringe at the circle's edge, in NDC-Y units.
+const PHASE_EDGE: f32 = 0.03;
+
+// Aspect-corrected distance from the circle's centre, in NDC-Y units.
+fn phase_distance(frag_pos: vec2<f32>) -> f32 {
+    let uv = frag_pos * frame.viewport.zw;
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    var d = ndc - frame.phase.xy;
+    // viewport.x / viewport.y, written as a multiply by the reciprocal we are
+    // already carrying.
+    d.x = d.x * frame.viewport.x * frame.viewport.w;
+    return length(d);
+}
+
 @fragment
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+    // Before anything expensive: a discarded fragment should not pay for a
+    // triplanar sample it is about to throw away.
+    var phase_dist = 0.0;
+    if (F_PHASE_CIRCLE) {
+        phase_dist = phase_distance(in.clip.xy);
+        let inside = frame.phase.z > PHASE_MIN_RADIUS && phase_dist < frame.phase.z;
+        // `inst.params.x`: 0 world-only, 1 phase-only, 2 effect-only. Compared
+        // with slack rather than `==` because it arrives as a float in a
+        // uniform, and an authored 1.0 that survived a round trip through RON
+        // must not become mode 0.
+        let mode = inst.params.x;
+        if (mode < 0.5) {
+            // World-only: the circle removes it.
+            if (inside) {
+                discard;
+            }
+        } else if (mode < 1.5) {
+            // Phase-only: it exists nowhere else.
+            if (!inside) {
+                discard;
+            }
+        }
+    }
+
     var n = normalize(in.normal);
 
     var albedo = inst.base_color.rgb;
@@ -438,10 +517,32 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         }
     }
 
-    // Hemisphere ambient: sky above, ground below, blended on the normal's Y.
-    // Cheap, and it separates silhouettes far better than a constant term.
-    let hemi = mix(frame.ground_color.rgb, frame.sky_color.rgb, 0.5 + 0.5 * n.y);
-    let key = frame.light_color.rgb * max(dot(n, normalize(frame.light_dir.xyz)), 0.0);
+    var color: vec3<f32>;
+    if (F_BILLBOARD_UNLIT) {
+        // No lighting at all. A camera-facing quad's normal is whatever its
+        // CPU-built basis happens to point at, so shading it would make the
+        // surface swim as the camera turns — and these are emissive things
+        // (glyphs, motes, prompts) that were never lit in the original either.
+        color = albedo;
+    } else {
+        // Hemisphere ambient: sky above, ground below, blended on the normal's
+        // Y. Cheap, and it separates silhouettes far better than a constant
+        // term.
+        let hemi = mix(frame.ground_color.rgb, frame.sky_color.rgb, 0.5 + 0.5 * n.y);
+        let key = frame.light_color.rgb * max(dot(n, normalize(frame.light_dir.xyz)), 0.0);
+        color = (hemi + key) * albedo;
+    }
 
-    return vec4<f32>((hemi + key) * albedo, inst.base_color.a);
+    if (F_PHASE_CIRCLE) {
+        // The fringe: a band at the circle's edge, whitened by `phase.w`. It is
+        // what makes the boundary read as an *event* rather than a clipping
+        // plane, and it is the only thing mode 2 (effect-only) is for. Two
+        // instructions on a fragment that already survived the discard above.
+        if (frame.phase.z > PHASE_MIN_RADIUS) {
+            let edge = 1.0 - smoothstep(0.0, PHASE_EDGE, abs(phase_dist - frame.phase.z));
+            color = mix(color, vec3<f32>(1.0), edge * frame.phase.w);
+        }
+    }
+
+    return vec4<f32>(color, inst.base_color.a);
 }
