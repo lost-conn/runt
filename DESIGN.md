@@ -105,6 +105,27 @@ ordering down now. Cost accepted: wasm size (+~200–400 KB) and compile time.
 - Input is captured by the host, translated to engine input events, and
   consumed at tick boundaries — replays are just recorded input traces + seeds.
 
+**Actions (2026-08-04, for the 3dimenshift port).** The engine owns the
+action-map *mechanism* and nothing else: `runt-core`'s `action.rs` is a
+`Bindings` table — plain serializable data mapping keys, mouse buttons, pad
+buttons, analog triggers and stick directions onto action slots, plus the
+move/look stick assignments — and a per-tick `resolve_actions::<A>` pass at
+the head of `FixedSim`. Each game owns its *vocabulary*: an enum implementing
+`ActionId`, whose dense index is the bit position in `Actions<A>` and the row
+in the table. The engine has no opinion about whether a game has a "jump";
+gameplay systems read `Actions<A>` and never a `Key`, so remapping is editing
+data (a RON blob in the KV store — `localStorage` on web, XDG config natively)
+rather than editing systems, and a rebind UI is a later view onto the same
+bytes. Replays stay independent of the bindings because a trace records **raw
+`InputEvent`s**, not resolved actions: playback re-derives the actions from
+the events, so a run recorded under one binding set and played back under
+another is a different *reproducible* run rather than a corrupt trace. The one
+subtlety worth naming: action edges are computed by diffing this tick's held
+bits against last tick's rather than forwarding `Input::just_pressed`, which
+is the only way an analog trigger crossing its threshold — a level, with no
+edge in `Input` at all — can be a press, and the only way two sources bound to
+one action produce one press instead of two.
+
 ## 5. Renderer — stylized forward
 
 **Decision:** single forward opaque pass, stylized (non-PBR) lighting.

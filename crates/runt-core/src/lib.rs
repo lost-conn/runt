@@ -55,7 +55,9 @@ pub const SKY_SHADER: &str = include_str!("sky.wgsl");
 /// [`Renderer::render_scaled`].
 pub const BLIT_SHADER: &str = include_str!("blit.wgsl");
 
-pub use action::{resolve_actions, ActionId, Actions, Bindings, Source, StickDir};
+pub use action::{
+    resolve_actions, ActionId, Actions, Bindings, Source, StickDir, DEFAULT_DEADZONE, MAX_ACTIONS,
+};
 pub use audio::{
     AudioBackend, AudioEvent, AudioOut, Listener, ParamId, PatchId, RecordingBackend, Rolloff,
     SilentBackend, VoiceId,
