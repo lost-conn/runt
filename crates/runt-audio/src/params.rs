@@ -46,6 +46,22 @@ impl ParamId {
     pub const PITCH: ParamId = ParamId(2);
     /// Filter cutoff multiplier on the patch's authored cutoff.
     pub const CUTOFF: ParamId = ParamId(3);
+    /// **Not a sound parameter**: `≥ 0.5` exempts this voice from being stolen,
+    /// anything else releases the exemption. Handled by
+    /// [`VoicePool`](crate::VoicePool) at the slot, so no patch ever sees it.
+    ///
+    /// For a *looped* sound — a swim stroke that runs for as long as the player
+    /// is swimming and is re-aimed with `SetParam` — where losing the slot to a
+    /// steal would leave the game talking to a voice that no longer exists. Sent
+    /// immediately after the `Play` that starts the loop, and cleared (or
+    /// `Stop`ped) when it ends. See the pool's module docs for what happens when
+    /// every slot in a group is held.
+    ///
+    /// Id 4 is an **append**: the wire record is unchanged (a `SetParam` already
+    /// carries a `u16` id and an `f32`), and a build that predates this id
+    /// forwards it to the patch, which ignores an id it has no meaning for
+    /// exactly as it always has.
+    pub const HOLD: ParamId = ParamId(4);
 }
 
 // ---------------------------------------------------------------------------

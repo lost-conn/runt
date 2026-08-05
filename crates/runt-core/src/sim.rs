@@ -44,6 +44,102 @@ pub const MAX_ACCUMULATED: f64 = 0.25;
 /// callers are entitled to rely on it.
 const ALPHA_MAX: f32 = 1.0 - f32::EPSILON;
 
+/// How fast sim time runs against wall time (DESIGN §4; port decision D9).
+///
+/// `1.0` is real time, `0.5` is half speed, `0.0` is frozen. [`Sim::update`]
+/// integrates **scaled** wall-clock deltas into its accumulator, so a tick is
+/// still exactly [`TICK_DT`] of *sim* time — what stretches is the wall-clock
+/// spacing between ticks. Nothing inside a tick can tell what the speed is
+/// unless it reads this resource: `FixedTick::dt_secs` does not move, physics
+/// does not move, and an [`InputTrace`](crate::InputTrace) is indexed by tick
+/// number, so **a replay is unaffected by the speed history of the run it was
+/// recorded from** (`tests/sim_speed.rs` proves it).
+///
+/// ## The contract: written from `FixedSim`, read by the host loop
+///
+/// Slowmo is *gameplay* — a collect freeze, a hit stop, a pause — so the value
+/// is sim state and belongs to sim systems: write it as `ResMut<SimSpeed>` from
+/// a `FixedSim` system, deterministically, from tick numbers and events. It is
+/// then read exactly once per [`Sim::update`] call, **before** any tick in that
+/// call runs, which is what makes "the speed a tick sees" a meaningless
+/// question: the value in force for an update is the one the previous update's
+/// last tick left behind, and a tick that changes it changes the *next* update.
+///
+/// A host that writes it (a debug hotkey, the editor, a test) is not lying to
+/// anything — no fingerprint can move — but it is writing over whatever the
+/// game's own systems decided, so it goes through the deliberately clunky
+/// [`Sim::set_sim_speed`] rather than being part of the per-frame host API.
+///
+/// ## Exactly zero is a latch
+///
+/// A frozen sim runs no ticks, and a `FixedSim` system that does not run cannot
+/// write the resource that would un-freeze it. **A tick can stop time but
+/// cannot start it again** — only a host can, through
+/// [`set_sim_speed`](Sim::set_sim_speed). This is not a bug to be fixed with an
+/// escape hatch inside the tick (a "speed-setting systems still run while
+/// frozen" rule would be a second, invisible schedule); it is the reason a
+/// *pause menu* is a `Paused` resource that gates gameplay system sets while the
+/// tick keeps running, and `SimSpeed` is for **slowmo**, where the interesting
+/// values are `0.1..1.0` and something in the tick is always counting down.
+///
+/// ## Range
+///
+/// Reads are sanitised into `[MIN, MAX]` by [`SimSpeed::get`] — the field is
+/// public so a system can write it like any other tuple resource, and the read
+/// side, not the write side, is where the guard has to be. A non-finite speed
+/// reads as `1.0`: a NaN is a bug in the writer, and freezing the game for it
+/// hides the bug behind a symptom that looks like a hang.
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct SimSpeed(pub f32);
+
+impl SimSpeed {
+    /// Frozen. Not negative: time does not run backwards, and a sim that could
+    /// rewind would need a state history it does not keep.
+    pub const MIN: f32 = 0.0;
+    /// Four times real time. A ceiling rather than a policy — it exists so a
+    /// stray large value cannot turn one host frame into a spiral of ticks the
+    /// clamp then has to throw away.
+    pub const MAX: f32 = 4.0;
+    /// Real time.
+    pub const NORMAL: SimSpeed = SimSpeed(1.0);
+
+    /// A clamped, finite speed.
+    pub fn new(speed: f32) -> SimSpeed {
+        SimSpeed(Self::sanitise(speed))
+    }
+
+    /// The value [`Sim::update`] actually uses: clamped into `[MIN, MAX]`, with
+    /// a non-finite value read as [`NORMAL`](SimSpeed::NORMAL).
+    pub fn get(self) -> f32 {
+        Self::sanitise(self.0)
+    }
+
+    /// Write a clamped speed.
+    pub fn set(&mut self, speed: f32) {
+        self.0 = Self::sanitise(speed);
+    }
+
+    /// Whether the sim is stopped. Exactly zero, because that is the only value
+    /// that produces no ticks at all.
+    pub fn is_frozen(self) -> bool {
+        self.get() == 0.0
+    }
+
+    fn sanitise(speed: f32) -> f32 {
+        if speed.is_finite() {
+            speed.clamp(SimSpeed::MIN, SimSpeed::MAX)
+        } else {
+            1.0
+        }
+    }
+}
+
+impl Default for SimSpeed {
+    fn default() -> SimSpeed {
+        SimSpeed::NORMAL
+    }
+}
+
 /// Everything a [`Sim`] needs before its first tick.
 ///
 /// A struct rather than five constructors because the axes are independent:
@@ -118,12 +214,26 @@ pub struct Sim {
     /// Wall time of the first `update` call — the origin all sim time is
     /// measured from, so the host's clock epoch never matters.
     origin: Option<f64>,
-    /// Wall time already accounted for: ticks run, plus any backlog dropped by
+    /// Sim time already accounted for: ticks run, plus any backlog dropped by
     /// the clamp. Recomputing the outstanding time from `elapsed - origin -
-    /// consumed` on every call (rather than accumulating host deltas) is what
-    /// makes the tick count a pure function of the elapsed value the host
-    /// passes, independent of how it chopped the interval up.
+    /// consumed + warp` on every call (rather than accumulating host deltas) is
+    /// what makes the tick count a pure function of the elapsed value the host
+    /// passes, independent of how it chopped the interval up — at
+    /// [`SimSpeed::NORMAL`], where `warp` is exactly zero.
     consumed: f64,
+    /// The largest `elapsed_seconds` seen so far — the base the next update's
+    /// delta is measured from. Monotone by construction so a host clock that
+    /// jumps backwards cannot manufacture a negative delta.
+    last: f64,
+    /// Accumulated `Σ delta × (speed − 1)`: how far sim time has been dragged
+    /// away from wall time by [`SimSpeed`].
+    ///
+    /// Stored as the *difference* rather than as a scaled clock so that at speed
+    /// `1.0` every term is `delta × 0.0 == 0.0` and `warp` stays **bit-exactly**
+    /// zero forever. That is deliberate: it means introducing slowmo did not
+    /// perturb a single float in the un-slowed path, and the accumulator tests
+    /// that predate it still describe the same arithmetic.
+    warp: f64,
     alpha: f32,
     pending: Vec<InputEvent>,
 
@@ -183,6 +293,7 @@ impl Sim {
         world.insert_resource(Lighting::default());
         world.insert_resource(StatusLine::default());
         world.insert_resource(crate::ecs::RenderScale::default());
+        world.insert_resource(SimSpeed::default());
         world.insert_resource(crate::audio::AudioOut::new());
         world.insert_resource(quality);
         world.insert_resource(GenCache::new(cache));
@@ -202,6 +313,8 @@ impl Sim {
             tick_dt,
             origin: None,
             consumed: 0.0,
+            last: 0.0,
+            warp: 0.0,
             alpha: 0.0,
             pending: Vec::new(),
             draw_query,
@@ -411,6 +524,30 @@ impl Sim {
 
     // -- the loop -----------------------------------------------------------
 
+    /// The speed sim time runs at (DESIGN §4; D9). See [`SimSpeed`].
+    pub fn sim_speed(&self) -> f32 {
+        self.world
+            .get_resource::<SimSpeed>()
+            .copied()
+            .unwrap_or_default()
+            .get()
+    }
+
+    /// Overwrite the sim speed from outside the tick.
+    ///
+    /// **Not the normal path** — [`SimSpeed`] is sim state and slowmo is
+    /// gameplay, so a game writes `ResMut<SimSpeed>` in a `FixedSim` system.
+    /// This exists for the two callers that have no tick to write from: a host
+    /// or editor with a debug control, and the one case a tick provably cannot
+    /// handle itself — resuming from a frozen (`0.0`) sim, where no system runs
+    /// to raise the speed it lowered.
+    ///
+    /// Safe with respect to replays either way: the value is not recorded, not
+    /// read by a trace, and cannot move a fingerprint.
+    pub fn set_sim_speed(&mut self, speed: f32) {
+        self.world.insert_resource(SimSpeed::new(speed));
+    }
+
     /// Advance the sim to `elapsed_seconds` of host wall time and return how
     /// many ticks ran.
     ///
@@ -418,6 +555,31 @@ impl Sim {
     /// establishes the origin and never ticks. Time that goes backwards is
     /// ignored rather than trusted (a host with a jumpy clock must not be able
     /// to rewind the sim).
+    ///
+    /// ## Speed
+    ///
+    /// The wall-clock delta since the previous call is multiplied by
+    /// [`SimSpeed`] before it reaches the accumulator, so ticks stay
+    /// [`TICK_DT`] apart *in sim time* and stretch or compress in wall time.
+    /// The resource is read **once**, here, before any tick runs: a tick that
+    /// writes it is writing the speed of the next update, and no update can be
+    /// half at one speed and half at another.
+    ///
+    /// At speed `0.0` the accumulator does not advance at all: this returns `0`
+    /// and leaves [`alpha`](Sim::alpha) where it was (to the last ulp of the
+    /// host's clock — the two terms that cancel are added, not skipped), so a host that
+    /// keeps calling `update` and rendering shows a frozen — not a stuttering,
+    /// and not a fast-forwarding-on-resume — picture. Nothing about the host
+    /// loop stalls; it simply has no new ticks to draw between.
+    ///
+    /// ## The spiral-of-death clamp is in sim time
+    ///
+    /// [`MAX_ACCUMULATED`] caps the **scaled** backlog, which is the only
+    /// consistent place for it: the guard exists to bound how many ticks one
+    /// call can run, and a tick costs the same whatever the clock is doing.
+    /// The wall-clock stall it forgives therefore scales with the speed —
+    /// 0.25 s at `1.0`, a whole second at `0.25`, 62 ms at `4.0` — and the cap
+    /// is never below one tick, so no speed above zero can starve the sim.
     pub fn update(&mut self, elapsed_seconds: f64) -> u32 {
         // A NaN or infinite time would poison the origin permanently, freezing
         // the sim for good. Refuse it outright rather than latch it.
@@ -426,14 +588,32 @@ impl Sim {
             return 0;
         }
 
+        let first = self.origin.is_none();
         let origin = *self.origin.get_or_insert(elapsed_seconds);
+        if first {
+            self.last = elapsed_seconds;
+        }
 
-        let mut outstanding = (elapsed_seconds - origin) - self.consumed;
+        // Read the speed once, before any tick can touch it (see the docs
+        // above), and charge this call's delta at it. `last` only ever moves
+        // forwards, so a backwards clock contributes nothing here and is caught
+        // by the `outstanding < 0` guard below exactly as it always was.
+        let speed = self.sim_speed() as f64;
+        let delta = (elapsed_seconds - self.last).max(0.0);
+        self.last = self.last.max(elapsed_seconds);
+        let warp = self.warp + delta * (speed - 1.0);
+        // Only a delta big enough to overflow could do this, but a poisoned
+        // `warp` would wedge the sim permanently and the guard is one compare.
+        self.warp = if warp.is_finite() { warp } else { 0.0 };
+
+        let mut outstanding = (elapsed_seconds - origin) - self.consumed + self.warp;
         if !outstanding.is_finite() || outstanding < 0.0 {
             outstanding = 0.0;
         }
         // Never clamp below one tick, or a sim slower than 4 Hz could never
-        // tick at all.
+        // tick at all. The cap is in *sim* seconds — `outstanding` is already
+        // scaled — which is what makes it a bound on ticks-per-call rather than
+        // a bound that slowmo could quietly tighten or loosen.
         let backlog_cap = MAX_ACCUMULATED.max(self.tick_dt);
         if outstanding > backlog_cap {
             // Drop the backlog: charge it to `consumed` without simulating it.

@@ -33,25 +33,24 @@
 //!
 //! | group | slots | why that number |
 //! |---|---|---|
-//! | [`PLUCK_VOICES`] | 16 | the SFX workhorse; unchanged, so every steal test still means what it did |
+//! | [`PLUCK_VOICES`] | 24 | the SFX workhorse; see below |
 //! | [`DRONE_VOICES`] | 2 | ambience is one voice and a crossfade |
 //! | [`KICK_VOICES`] | 2 | a kick that overlaps itself is a flam, and one is the most a bar wants |
 //! | [`SNARE_VOICES`] | 2 | same |
 //! | [`HIHAT_VOICES`] | 3 | hats are the fastest thing a pattern plays |
 //! | [`BASS_VOICES`] | 3 | a bassline is monophonic plus its own release tail |
 //!
-//! 28 graphs, not 96 — and *fewer than the 32 the two-model version built*,
+//! 36 graphs, not 96 — and barely more than the 32 the two-model version built,
 //! while playing four more instruments. The groups are contiguous index ranges
 //! in one flat `Vec`, so [`slot_voice`](VoicePool::slot_voice) and
 //! [`active_voices`](VoicePool::active_voices) still see one pool.
 //!
 //! ### What this costs
 //!
-//! A model can only steal from **its own group**. A burst of sixteen plucks can
-//! no longer eat the bassline, which is the point; but sixteen is now a hard
-//! ceiling on simultaneous plucks rather than a soft one that could borrow an
-//! idle drone slot. Given that the previous arrangement's ceiling was also
-//! sixteen — `MAX_VOICES` slots, one voice each — nothing actually got smaller.
+//! A model can only steal from **its own group**. A burst of plucks can never
+//! eat the bassline, which is the point; but the group size is a hard ceiling on
+//! simultaneous plucks rather than a soft one that could borrow an idle drone
+//! slot.
 //!
 //! ## Stealing
 //!
@@ -61,6 +60,21 @@
 //! voice already 60 dB down is nearly inaudible, while taking the loudest is a
 //! click by construction. Age only breaks ties, which in practice means a rank of
 //! silent-but-not-yet-freed voices is consumed oldest-first.
+//!
+//! ### Held voices
+//!
+//! A voice marked with [`ParamId::HOLD`](crate::params::ParamId::HOLD) is
+//! **exempt from stealing** until it is released. That is what a looped SFX
+//! needs — a swim stroke that lives for as long as the player is swimming and is
+//! re-aimed with `SetParam` on the same [`VoiceId`] — because the alternative is
+//! a loop that silently disappears the first time something else in its group
+//! gets busy, leaving the game sending params to a voice that is not there.
+//!
+//! Hold is a *ranking* rule, not a reservation: if **every** slot in the group
+//! is held, the oldest held voice is taken anyway. A `Play` never fails and
+//! never returns nothing to play into — a game that leaks held voices gets a
+//! group that behaves like the old oldest-first pool, which is audible and
+//! debuggable, rather than a group that has gone silent for good.
 //!
 //! ## The master bus
 //!
@@ -83,12 +97,30 @@ use crate::wire::{Event, VoiceId, EVENT_SIZE};
 
 /// Simultaneous [`Pluck`] voices — the SFX group.
 ///
-/// DESIGN §8: *"voice count is bounded by design taste, not CPU"* — the spike
-/// measured 0.45% of a core for one patch, so sixteen is roughly 7% in the worst
-/// case and the real limit is how much a listener can pick apart. This is the
-/// number `MAX_VOICES` used to be, kept because nothing about the SFX case
-/// changed when the music models arrived.
-pub const PLUCK_VOICES: usize = 16;
+/// DESIGN §8: *"voice count is bounded by design taste, not CPU"*, and the bench
+/// is what says the second half is still true. Sixteen was the number
+/// `MAX_VOICES` used to be; the 3dimenshift port raised it to **24** because
+/// its SFX vocabulary is 41 sounds rather than a demo's four, and because
+/// looped sounds now sit in this group *held* (see the module docs) — a held
+/// swim stroke is a slot that a burst of impacts cannot borrow, so the burst
+/// needs its own headroom.
+///
+/// The cost, measured native-release with `--example audition` (128-frame
+/// quantum at 48 kHz, so a 2 666 µs budget), sixteen → twenty-four:
+///
+/// | bench | 16 | 24 |
+/// |---|---|---|
+/// | `bench bgm`, every music group full + a full SFX burst | 56.5 µs, **2.12%** | 65.3 µs, **2.45%** |
+/// | `bench`, this group saturated *continuously* | 62.4 µs, **2.34%** | 89.9 µs, **3.37%** |
+///
+/// About 3.4 µs per extra pluck. The first row is the number the 3% gate was
+/// written about — a real SFX burst decays — and it passes. The second row is a
+/// pathological ceiling that no event-driven game reaches: it holds all
+/// twenty-four slots sounding forever by retriggering them just under the
+/// pluck's own decay time, and it is over 3%. Worth knowing, not worth sizing
+/// for; if that ever becomes a real load, this constant is where the answer
+/// goes (twenty is ~2.9% on that bench).
+pub const PLUCK_VOICES: usize = 24;
 
 /// Simultaneous [`Drone`] voices. Ambience is one voice; two exist so a
 /// crossfade between two beds is expressible.
@@ -248,6 +280,10 @@ struct Slot {
     /// Monotonic counter at the moment this slot was last triggered. Ties in the
     /// steal ranking break towards the smaller value.
     started: u64,
+    /// [`ParamId::HOLD`]: this voice is exempt from stealing. Cleared by a fresh
+    /// [`trigger`](Slot::trigger) and by [`release`](Slot::release), so it can
+    /// only ever be true for a voice the game is currently holding on purpose.
+    held: bool,
     gain: f32,
     pan: f32,
     /// Target and current mix gains per channel. Panning is smoothed as a pair
@@ -264,6 +300,7 @@ impl Slot {
             armed: false,
             voice: VoiceId(u32::MAX),
             started: 0,
+            held: false,
             gain: 1.0,
             pan: 0.0,
             target: (0.707, 0.707),
@@ -311,12 +348,22 @@ impl Slot {
         match id {
             ParamId::GAIN => self.set_mix(value, self.pan, false),
             ParamId::PAN => self.set_mix(self.gain, value, false),
+            // Never reaches the engine: hold is a property of the *slot*, and a
+            // patch that received it would have to ignore it anyway. `>= 0.5`
+            // rather than `!= 0.0` so a NaN reads as "not held" — the safe
+            // direction, since an unreleasable hold is the failure mode with
+            // consequences.
+            ParamId::HOLD => self.held = value >= 0.5,
             _ if self.armed => engine!(&mut self.engine, set_param, id, value),
             _ => {}
         }
     }
 
+    /// Release the note *and* the hold: a voice that has been told to stop is a
+    /// voice the game is done with, so keeping it exempt from stealing would
+    /// reserve a slot for a sound that is already fading out.
     fn release(&mut self) {
+        self.held = false;
         if self.armed {
             engine!(&mut self.engine, release)
         }
@@ -337,6 +384,9 @@ impl Slot {
             _ => return,
         }
         self.armed = true;
+        // A new note never inherits the previous occupant's hold — including
+        // when this slot *was* the held voice a full group forced us to take.
+        self.held = false;
     }
 }
 
@@ -463,6 +513,14 @@ impl VoicePool {
         self.find(voice).is_some()
     }
 
+    /// Whether `voice` is sounding **and** exempt from stealing
+    /// ([`ParamId::HOLD`]). `false` for a voice that has finished or been
+    /// stolen, which is the same answer [`is_playing`](VoicePool::is_playing)
+    /// gives and for the same reason.
+    pub fn is_held(&self, voice: VoiceId) -> bool {
+        self.find(voice).is_some_and(|at| self.slots[at].held)
+    }
+
     // -- control ------------------------------------------------------------
 
     /// Apply one event.
@@ -538,24 +596,49 @@ impl VoicePool {
     ///
     /// The search is confined to `model`'s group (module docs): a hi-hat cannot
     /// take the bass's slot, however quiet the bass happens to be. Within the
-    /// group the policy is unchanged — free slots first (in order, so a quiet
-    /// scene reuses the first slot and the rest stay cold); otherwise the
-    /// quietest, ties to the oldest.
+    /// group:
+    ///
+    /// 1. a **free** slot, in order (so a quiet scene reuses the first slot and
+    ///    the rest stay cold);
+    /// 2. otherwise the quietest **unheld** voice, ties to the oldest;
+    /// 3. otherwise — every slot in the group held — the **oldest held** one.
+    ///
+    /// Step 3 is why this returns a slot rather than an `Option`: a `Play` that
+    /// could fail would put a silent-sound branch in every caller, and "the
+    /// game held all 24 slots" is a bug to be *heard* (the oldest loop stops),
+    /// not one to be swallowed.
     fn claim(&mut self, model: Model) -> (usize, bool) {
         let group = model.slots();
         if let Some(at) = self.slots[group.clone()].iter().position(|s| !s.active()) {
             return (group.start + at, false);
         }
-        let mut best = group.start;
-        for at in group.start + 1..group.end {
-            let (a, b) = (&self.slots[at], &self.slots[best]);
+        let mut best: Option<usize> = None;
+        for at in group.clone() {
+            if self.slots[at].held {
+                continue;
+            }
+            let Some(current) = best else {
+                best = Some(at);
+                continue;
+            };
+            let (a, b) = (&self.slots[at], &self.slots[current]);
             let quieter = a.level() < b.level();
             let tied_and_older = a.level() == b.level() && a.started < b.started;
             if quieter || tied_and_older {
-                best = at;
+                best = Some(at);
             }
         }
-        (best, true)
+        let at = best.unwrap_or_else(|| {
+            // Every slot held. Take the oldest — the loop that has been running
+            // longest is the one most likely to have been forgotten about, and
+            // age is the only ordering here that cannot be gamed by a voice
+            // whose envelope happens to be at a quiet moment.
+            group
+                .clone()
+                .min_by_key(|&at| self.slots[at].started)
+                .unwrap_or(group.start)
+        });
+        (at, true)
     }
 
     // -- rendering ----------------------------------------------------------

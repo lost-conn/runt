@@ -42,6 +42,9 @@ fn the_shared_param_vocabulary_matches_the_synths() {
     assert_eq!(ParamId::PAN.0, 1);
     assert_eq!(ParamId::PITCH.0, 2);
     assert_eq!(ParamId::CUTOFF.0, 3);
+    // Appended for D15's steal exemption; `runt_audio::params::ParamId::HOLD`
+    // is the same number on the other side of the wire.
+    assert_eq!(ParamId::HOLD.0, 4);
 }
 
 // ---------------------------------------------------------------------------

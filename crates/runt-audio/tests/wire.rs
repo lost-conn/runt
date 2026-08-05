@@ -87,11 +87,31 @@ fn an_unknown_kind_is_skipped_not_guessed_at() {
 
 #[test]
 fn the_shared_param_vocabulary_is_pinned() {
-    // Restated in `runt_core::audio::ParamId`. These four numbers are the wire.
+    // Restated in `runt_core::audio::ParamId`. These numbers are the wire, and
+    // the list only ever grows at the end — an id is never reused, because a
+    // build on the other side of a postMessage may be older than this one.
     assert_eq!(ParamId::GAIN.0, 0);
     assert_eq!(ParamId::PAN.0, 1);
     assert_eq!(ParamId::PITCH.0, 2);
     assert_eq!(ParamId::CUTOFF.0, 3);
+    assert_eq!(ParamId::HOLD.0, 4);
+}
+
+#[test]
+fn hold_needs_no_new_wire_bytes() {
+    // D15's steal exemption is a `SetParam`, which is the point: the 32-byte
+    // record is untouched, so a worklet built before `HOLD` existed decodes the
+    // event perfectly and merely forwards an id its patches ignore.
+    let held = Event::SetParam {
+        voice: VoiceId(11),
+        id: ParamId::HOLD,
+        value: 1.0,
+    };
+    let bytes = wire::encode(&[held]);
+    assert_eq!(bytes.len(), EVENT_SIZE);
+    assert_eq!(bytes[0], 1, "still a SetParam record");
+    assert_eq!(&bytes[2..4], &4u16.to_le_bytes(), "id 4 in the id field");
+    assert_eq!(wire::decode_all(&bytes), vec![held]);
 }
 
 #[test]

@@ -118,6 +118,17 @@ impl ParamId {
     pub const PITCH: ParamId = ParamId(2);
     /// Multiplier on the patch's filter cutoff.
     pub const CUTOFF: ParamId = ParamId(3);
+    /// **Not a sound parameter**: `≥ 0.5` exempts the voice from being stolen
+    /// when its group fills up, anything else releases the exemption.
+    ///
+    /// For a *looped* sound the sim keeps re-aiming — a swim stroke that runs
+    /// while the player is swimming — where losing the slot to a steal would
+    /// leave the game sending `SetParam` to a voice that no longer exists. Sent
+    /// immediately after the [`AudioOut::play`] that starts the loop, and
+    /// cleared (or [`AudioOut::stop`]ped) when it ends. The engine does nothing
+    /// with it: like every id here it is a number the synth understands, and
+    /// `runt_audio`'s pool is what acts on it.
+    pub const HOLD: ParamId = ParamId(4);
 }
 
 /// One instruction for whatever is making sound.

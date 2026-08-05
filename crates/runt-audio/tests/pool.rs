@@ -78,8 +78,8 @@ fn a_drone_holds_until_it_is_stopped() {
 #[test]
 fn the_pool_fills_to_its_cap_and_then_steals_the_quietest() {
     let mut p = pool();
-    // Sixteen voices at descending gains. Voice 0 is the quietest by a factor of
-    // sixteen, so once the envelopes have moved it is unambiguously the one a
+    // A full SFX group at ascending gains. Voice 0 is the quietest by a wide
+    // margin, so once the envelopes have moved it is unambiguously the one a
     // steal should take.
     for i in 0..PLUCK_VOICES as u32 {
         p.apply(play(i, PLUCK, i as u64, 0.05 + i as f32 * 0.06, 0.0));
@@ -128,6 +128,202 @@ fn a_free_slot_is_always_preferred_to_a_steal() {
     assert_eq!(p.active_voices(), 0);
     p.apply(play(99, PLUCK, 99, 1.0, 0.0));
     assert_eq!(p.stats().stolen, 0, "nothing was sounding; nothing was stolen");
+}
+
+// ---------------------------------------------------------------------------
+// Held voices (D15)
+// ---------------------------------------------------------------------------
+
+/// `SetParam HOLD` — how a game marks a looped voice.
+fn hold(voice: u32, held: bool) -> Event {
+    Event::SetParam {
+        voice: VoiceId(voice),
+        id: ParamId::HOLD,
+        value: if held { 1.0 } else { 0.0 },
+    }
+}
+
+/// Fill the pluck group with ascending gains, so voice 0 is the quietest and is
+/// therefore the slot every steal wants.
+fn full_pluck_group(p: &mut VoicePool) {
+    for i in 0..PLUCK_VOICES as u32 {
+        p.apply(play(i, PLUCK, 7, 0.05 + i as f32 * 0.04, 0.0));
+    }
+    render(p, 2_400); // past every attack, before any decay finishes
+}
+
+#[test]
+fn a_held_voice_is_skipped_by_the_steal_that_would_have_taken_it() {
+    let mut p = pool();
+    full_pluck_group(&mut p);
+
+    // Voice 0 is a swim-stroke loop: quietest in the group, and the next steal
+    // would take it. Holding it moves the steal onto voice 1.
+    p.apply(hold(0, true));
+    assert!(p.is_held(VoiceId(0)));
+
+    p.apply(play(99, PLUCK, 7, 1.0, 0.0));
+    assert_eq!(p.stats().stolen, 1);
+    assert!(p.is_playing(VoiceId(0)), "a held voice must survive a steal");
+    assert!(
+        !p.is_playing(VoiceId(1)),
+        "the steal should have moved to the quietest *unheld* voice"
+    );
+    assert!(p.is_playing(VoiceId(99)));
+
+    // And it keeps surviving: a burst the size of the whole group cannot reach
+    // it, which is the property a loop needs to be addressable at all.
+    for i in 0..PLUCK_VOICES as u32 {
+        p.apply(play(200 + i, PLUCK, 7, 1.0, 0.0));
+        render(&mut p, 256);
+    }
+    assert!(
+        p.is_playing(VoiceId(0)),
+        "{} steals later, the held loop is still there",
+        p.stats().stolen
+    );
+    assert!(p.is_held(VoiceId(0)));
+}
+
+#[test]
+fn a_held_voice_takes_params_and_gives_its_slot_back_when_told_to() {
+    // The swim stroke's whole lifecycle: play, hold, re-aim while it runs, then
+    // release. `SetParam` on a held voice is the reason hold exists — if the
+    // slot had been stolen these would be counted stale instead.
+    let mut p = pool();
+    p.apply(play(0, PLUCK, 7, 0.5, 0.0));
+    p.apply(hold(0, true));
+    full_pluck_group_around(&mut p);
+
+    p.apply(Event::SetParam {
+        voice: VoiceId(0),
+        id: ParamId::PITCH,
+        value: 1.5,
+    });
+    p.apply(Event::SetParam {
+        voice: VoiceId(0),
+        id: ParamId::GAIN,
+        value: 0.9,
+    });
+    assert_eq!(p.stats().stale_addressed, 0, "the loop was still addressable");
+
+    // Releasing the hold puts it back in the ranking: it is the oldest and (at
+    // this point) not the loudest, so the next steal is free to take it.
+    p.apply(hold(0, false));
+    assert!(!p.is_held(VoiceId(0)));
+    assert!(p.is_playing(VoiceId(0)));
+    for i in 0..PLUCK_VOICES as u32 {
+        p.apply(play(300 + i, PLUCK, 7, 1.0, 0.0));
+        render(&mut p, 256); // let the new voices reach a level worth comparing
+    }
+    assert!(
+        !p.is_playing(VoiceId(0)),
+        "an unheld voice is stealable again"
+    );
+}
+
+/// Fill the rest of the pluck group around whatever is already playing.
+fn full_pluck_group_around(p: &mut VoicePool) {
+    for i in 1..PLUCK_VOICES as u32 {
+        p.apply(play(i, PLUCK, 7, 0.05 + i as f32 * 0.04, 0.0));
+    }
+    render(p, 2_400);
+}
+
+#[test]
+fn a_stop_releases_the_hold_as_well_as_the_note() {
+    let mut p = pool();
+    p.apply(play(0, PLUCK, 7, 0.5, 0.0));
+    p.apply(hold(0, true));
+    assert!(p.is_held(VoiceId(0)));
+    p.apply(Event::Stop { voice: VoiceId(0) });
+    assert!(
+        !p.is_held(VoiceId(0)),
+        "a voice the game has finished with must not keep reserving a slot"
+    );
+}
+
+#[test]
+fn with_every_slot_held_the_oldest_held_voice_is_taken_anyway() {
+    // The escape hatch. A `Play` must never fail, so a group that has been held
+    // to the last slot degrades to plain oldest-first stealing rather than going
+    // deaf.
+    let mut p = pool();
+    for i in 0..PLUCK_VOICES as u32 {
+        p.apply(play(i, PLUCK, 7, 1.0, 0.0));
+        p.apply(hold(i, true));
+    }
+    render(&mut p, 2_400);
+    assert_eq!(p.active_voices(), PLUCK_VOICES);
+    for i in 0..PLUCK_VOICES as u32 {
+        assert!(p.is_held(VoiceId(i)));
+    }
+
+    p.apply(play(99, PLUCK, 7, 1.0, 0.0));
+    assert_eq!(p.stats().stolen, 1);
+    assert!(p.is_playing(VoiceId(99)), "the play must be heard regardless");
+    assert!(!p.is_playing(VoiceId(0)), "the oldest held voice went");
+    for i in 1..PLUCK_VOICES as u32 {
+        assert!(p.is_playing(VoiceId(i)), "voice {i} was not the oldest");
+    }
+
+    // The slot it took is a *fresh* voice: it must not inherit the exemption of
+    // the loop it displaced, or one all-held burst would hold the group forever.
+    assert!(
+        !p.is_held(VoiceId(99)),
+        "a new voice never inherits the previous occupant's hold"
+    );
+    p.apply(play(100, PLUCK, 7, 1.0, 0.0));
+    assert!(!p.is_playing(VoiceId(99)), "…so it is stealable like any other");
+}
+
+#[test]
+fn hold_is_per_slot_and_never_reaches_a_patch() {
+    // `ParamId::HOLD` is handled at the slot. If it ever fell through to the
+    // engine the patch would ignore it (they ignore unknown ids), so the
+    // observable claim is the one that matters: holding a voice changes nothing
+    // about the sound it makes.
+    let mut a = pool();
+    let mut b = pool();
+    a.apply(play(0, PLUCK, 7, 0.8, -0.3));
+    b.apply(play(0, PLUCK, 7, 0.8, -0.3));
+    b.apply(hold(0, true));
+    b.apply(Event::SetParam {
+        voice: VoiceId(0),
+        id: ParamId::HOLD,
+        value: 0.25, // below the threshold: not held
+    });
+    b.apply(hold(0, true));
+    assert_eq!(render(&mut a, 24_000), render(&mut b, 24_000));
+
+    // NaN reads as "not held" — the safe direction for a flag whose failure mode
+    // is an unreleasable slot.
+    let mut c = pool();
+    c.apply(play(0, PLUCK, 7, 0.8, 0.0));
+    c.apply(Event::SetParam {
+        voice: VoiceId(0),
+        id: ParamId::HOLD,
+        value: f32::NAN,
+    });
+    assert!(!c.is_held(VoiceId(0)));
+}
+
+#[test]
+fn holding_one_group_leaves_the_others_alone() {
+    // Hold is a within-group rule; it must not leak across the partition.
+    let mut p = pool();
+    for i in 0..PLUCK_VOICES as u32 {
+        p.apply(play(i, PLUCK, 7, 1.0, 0.0));
+        p.apply(hold(i, true));
+    }
+    render(&mut p, 2_400);
+    // A hi-hat burst still steals hi-hats, unaffected by a fully held SFX group.
+    for i in 0..16u32 {
+        p.apply(play(500 + i, PatchId::new("hihat"), i as u64, 1.0, 0.0));
+        render(&mut p, 128);
+    }
+    assert!(p.is_playing(VoiceId(0)), "the held plucks are untouched");
+    assert!(p.active_voices() <= MAX_VOICES);
 }
 
 // ---------------------------------------------------------------------------
@@ -397,15 +593,20 @@ fn the_restructure_costs_fewer_graphs_than_the_arrangement_it_replaced() {
     // owning one of every model; with six models that is 96 engines. This is the
     // number that has to stay small, and it is smaller than the *two*-model
     // version's 32.
-    let one_of_each = 16 * Model::ALL.len();
-    // 16 slots x 2 models is what the pool built before the music models
-    // arrived; `one_of_each` is what the *old rule* would build now.
-    let two_model_pool = 16 * 2;
-    assert_eq!(MAX_VOICES, 28);
+    let one_of_each = PLUCK_VOICES * Model::ALL.len();
+    // 24 plucks + 2 drone + 2 kick + 2 snare + 3 hihat + 3 bass.
+    assert_eq!(MAX_VOICES, 36);
     assert!(MAX_VOICES < one_of_each / 3, "{MAX_VOICES} vs {one_of_each}");
-    assert!(
-        MAX_VOICES < two_model_pool,
-        "{MAX_VOICES} is not fewer than the {two_model_pool} the two-model pool built"
+
+    // Where the graphs went, now that the SFX group has been sized for a real
+    // game rather than for a demo: everything that is *not* the SFX group still
+    // costs twelve engines between five models, which is the saving grouping
+    // bought. Growing PLUCK_VOICES is a separate, bench-gated decision and this
+    // must not quietly absorb a second model getting fat.
+    let music = MAX_VOICES - PLUCK_VOICES;
+    assert_eq!(
+        music, 12,
+        "the five non-SFX models cost {music} graphs, not 12"
     );
 }
 

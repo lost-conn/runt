@@ -47,9 +47,11 @@ fn main() {
 /// CPU cost of a full pool, against the realtime budget.
 ///
 /// The spike measured one patch at 10.10 µs native / 11.99 µs wasm against a
-/// 2 666 µs budget; this is the same measurement for sixteen voices, which is
-/// the number that decides whether `MAX_VOICES` is a taste decision or a
-/// performance one.
+/// 2 666 µs budget; this is the same measurement for a **saturated SFX group**,
+/// which is the number that decides whether [`PLUCK_VOICES`] is a taste decision
+/// or a performance one. Deliberately pathological: it retriggers every slot
+/// just under the pluck's decay time, so the group never goes quiet. `bench bgm`
+/// is the realistic worst case.
 fn bench() {
     const SR: f32 = 48_000.0;
     const QUANTUM: usize = 128;
@@ -236,7 +238,8 @@ fn bench_bgm() {
     // Every music group full at once. The song cannot produce this; a denser
     // one could.
     let music = run("every BGM group full", 3, 3, 0);
-    let everything = run("...+ a 16-voice SFX burst", 3, 3, runt_audio::PLUCK_VOICES as u32);
+    let label = format!("...+ a {}-voice SFX burst", runt_audio::PLUCK_VOICES);
+    let everything = run(&label, 3, 3, runt_audio::PLUCK_VOICES as u32);
     println!();
     println!("the song costs      {:.2} us over silence", song - idle);
     println!("the SFX burst adds  {:.2} us over the full BGM", everything - music);

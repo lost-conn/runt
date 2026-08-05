@@ -90,7 +90,7 @@ pub use runt_mesh::{HeightField, MeshData as Mesh, Quality, TerrainParams, Terra
 pub use scene::{
     load_scene, save_scene, SceneDesc, SceneError, TextureEntry, TEXTURED_SCENE_RON,
 };
-pub use sim::{Sim, SimConfig, MAX_ACCUMULATED, TICK_DT};
+pub use sim::{Sim, SimConfig, SimSpeed, MAX_ACCUMULATED, TICK_DT};
 pub use texture::{
     NoiseSpec, NormalMode, NormalSpec, TextureHandle, TextureLibrary, TextureSpec,
 };
