@@ -846,7 +846,7 @@ impl Renderer {
                 }),
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: Some(wgpu::Face::Back),
+                    cull_mode: state.cull,
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -1851,6 +1851,9 @@ pub struct PipelineState {
     pub blend: wgpu::BlendState,
     pub depth_write: bool,
     pub depth_compare: wgpu::CompareFunction,
+    /// Which face to drop, or `None` to draw both
+    /// ([`TWO_SIDED`](MaterialVariant::TWO_SIDED)).
+    pub cull: Option<wgpu::Face>,
     /// The pipeline's debug label; also the name a capture tool shows.
     pub label: &'static str,
 }
@@ -1862,15 +1865,16 @@ pub struct PipelineState {
 /// being right is the difference between "two looks share a pipeline" and "two
 /// looks share a pipeline *by accident*".
 ///
-/// | key | blend | depth write | depth test |
-/// |---|---|---|---|
-/// | *(none of the below)* | replace | yes | `Less` |
-/// | [`TRANSPARENT`] | `src·α + dst·(1−α)` | **no** | `Less` |
-/// | [`ADDITIVE`] | `src·α + dst` | **no** | `Less` |
-/// | `TRANSPARENT \| ADDITIVE` | additive — it wins | **no** | `Less` |
-/// | + [`DEPTH_GREATER`] | *(unchanged)* | *(unchanged)* | **`Greater`** |
+/// | key | blend | depth write | depth test | cull |
+/// |---|---|---|---|---|
+/// | *(none of the below)* | replace | yes | `Less` | back |
+/// | [`TRANSPARENT`] | `src·α + dst·(1−α)` | **no** | `Less` | back |
+/// | [`ADDITIVE`] | `src·α + dst` | **no** | `Less` | back |
+/// | `TRANSPARENT \| ADDITIVE` | additive — it wins | **no** | `Less` | back |
+/// | + [`DEPTH_GREATER`] | *(unchanged)* | *(unchanged)* | **`Greater`** | *(unchanged)* |
+/// | + [`TWO_SIDED`] | *(unchanged)* | *(unchanged)* | *(unchanged)* | **none** |
 ///
-/// Two decisions worth stating out loud:
+/// Three decisions worth stating out loud:
 ///
 /// - **Additive beats alpha** when a key carries both, the way `LIVE_TEX` beats
 ///   `TEXTURE` in [`draw::resolve_variant`]: the combination is meaningless
@@ -1880,15 +1884,18 @@ pub struct PipelineState {
 ///   perfectly good "fill in what is hidden" pass, and folding the two together
 ///   would have made the see-through-walls silhouette a special case instead of
 ///   two composable bits.
-///
-/// Backface culling stays on for every variant. A camera-facing quad whose CPU
-/// basis is built right is wound right, and turning culling off for blended
-/// draws would silently double the fill cost of the one population that can
-/// least afford it.
+/// - **Backface culling is on unless a key asks for it off.** A camera-facing
+///   quad whose CPU basis is built right is wound right, and dropping culling
+///   for blended draws wholesale would silently double the fill cost of the one
+///   population that can least afford it. [`TWO_SIDED`] is therefore its own
+///   opt-in bit rather than a consequence of any other — the surfaces that need
+///   it (a pond seen from underneath, a waterfall sheet) are a handful, and
+///   they say so.
 ///
 /// [`TRANSPARENT`]: MaterialVariant::TRANSPARENT
 /// [`ADDITIVE`]: MaterialVariant::ADDITIVE
 /// [`DEPTH_GREATER`]: MaterialVariant::DEPTH_GREATER
+/// [`TWO_SIDED`]: MaterialVariant::TWO_SIDED
 pub fn render_state(variant: MaterialVariant) -> PipelineState {
     let (blend, label) = if variant.contains(MaterialVariant::ADDITIVE) {
         (
@@ -1921,6 +1928,11 @@ pub fn render_state(variant: MaterialVariant) -> PipelineState {
             wgpu::CompareFunction::Greater
         } else {
             wgpu::CompareFunction::Less
+        },
+        cull: if variant.contains(MaterialVariant::TWO_SIDED) {
+            None
+        } else {
+            Some(wgpu::Face::Back)
         },
         label,
     }

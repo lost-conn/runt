@@ -11,9 +11,10 @@ use runt_core::Renderer;
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// The bits the *shader source* branches on: everything except the three that
+/// The bits the *shader source* branches on: everything except the four that
 /// only select fixed-function state (`TRANSPARENT`, `ADDITIVE`,
-/// `DEPTH_GREATER`), which cannot change whether a module compiles.
+/// `DEPTH_GREATER`, `TWO_SIDED`), which cannot change whether a module
+/// compiles.
 const SHADER_BITS: [MaterialVariant; 8] = [
     MaterialVariant::VERTEX_COLOR,
     MaterialVariant::TEXTURE,
@@ -31,13 +32,14 @@ const SHADER_BITS: [MaterialVariant; 8] = [
 /// Every combination of the flags the WGSL can branch on — 256 of them.
 ///
 /// The sweep follows [`SHADER_BITS`] rather than `FLAGS` so that adding a
-/// *look* extends the coverage automatically. It stops short of all 8192 keys
-/// on purpose: the three render-state bits produce byte-identical WGSL (nothing
-/// reads `F_TRANSPARENT`), so crossing them in would octuple a GPU test's
-/// runtime to compile the same 256 modules eight times each. What they select
-/// instead of a branch is covered without a device by
+/// *look* extends the coverage automatically. It stops short of all 16384 keys
+/// on purpose: the four render-state bits produce byte-identical WGSL (nothing
+/// reads `F_TRANSPARENT`), so crossing them in would multiply a GPU test's
+/// runtime sixteenfold to compile the same 256 modules over and over. What they
+/// select instead of a branch is covered without a device by
 /// `the_render_state_comes_from_the_key`, and their effect on the *cache* by
-/// `every_state_combination_is_its_own_pipeline`.
+/// `every_state_combination_is_its_own_pipeline`. `TWO_SIDED`'s effect on the
+/// *pixels* — the half no cache test can see — is `tests/two_sided.rs`.
 ///
 /// `FRESNEL` and `EMISSIVE_SWEEP` are the two branching bits *not* in here, and
 /// that is a gap rather than a decision: they were appended after this list was
@@ -77,6 +79,7 @@ fn variant_source_declares_every_flag_with_the_right_value() {
     assert!(src.contains("const F_PHASE_CIRCLE: bool = false;"));
     assert!(src.contains("const F_BILLBOARD_UNLIT: bool = false;"));
     assert!(src.contains("const F_VERTEX_WAVE: bool = false;"));
+    assert!(src.contains("const F_TWO_SIDED: bool = false;"));
     assert!(src.ends_with(material::BASE_SHADER), "base source is appended verbatim");
 
     let none = material::variant_source(material::BASE_SHADER, MaterialVariant::NONE);
@@ -144,6 +147,7 @@ fn variant_keys_behave_as_bitflags() {
     assert_eq!(MaterialVariant::FRESNEL.bits(), 1 << 10);
     assert_eq!(MaterialVariant::EMISSIVE_SWEEP.bits(), 1 << 11);
     assert_eq!(MaterialVariant::VERTEX_WAVE.bits(), 1 << 12);
+    assert_eq!(MaterialVariant::TWO_SIDED.bits(), 1 << 13);
 
     // The flag list and the bits agree, so no key can be generated that the
     // preprocessor would not emit a const for.
@@ -152,7 +156,7 @@ fn variant_keys_behave_as_bitflags() {
         assert!(!union.contains(flag), "duplicate flag bit {:#06b}", flag.bits());
         union |= flag;
     }
-    assert_eq!(union.bits(), 0b1_1111_1111_1111);
+    assert_eq!(union.bits(), 0b11_1111_1111_1111);
 
     // The four looks that replace the lighting term rather than feeding it.
     // Exactly one wins per fragment; the mask is what says which four they are.
@@ -185,6 +189,7 @@ fn the_render_state_comes_from_the_key() {
     assert_eq!(opaque.blend, wgpu::BlendState::REPLACE);
     assert!(opaque.depth_write);
     assert_eq!(opaque.depth_compare, Less);
+    assert_eq!(opaque.cull, Some(wgpu::Face::Back));
     // Every pre-D2 key must still describe exactly the pipeline that was
     // hardcoded before D2 existed — that is what "opaque frames are unchanged"
     // means at this layer.
@@ -228,6 +233,28 @@ fn the_render_state_comes_from_the_key() {
         opaque_greater.depth_write,
         "an inverted depth test is not a blend"
     );
+
+    // TWO_SIDED touches the cull field and nothing else — it composes with every
+    // other state bit the way DEPTH_GREATER does.
+    let two_sided = render_state(MaterialVariant::TWO_SIDED);
+    assert_eq!(two_sided.cull, None);
+    assert_eq!(two_sided.blend, opaque.blend);
+    assert_eq!(two_sided.depth_compare, opaque.depth_compare);
+    assert_eq!(two_sided.depth_write, opaque.depth_write);
+    let two_sided_additive = render_state(MaterialVariant::TWO_SIDED | MaterialVariant::ADDITIVE);
+    assert_eq!(two_sided_additive.cull, None);
+    assert_eq!(two_sided_additive.blend, additive.blend);
+    assert!(!two_sided_additive.depth_write);
+    // …and nothing else touches it: every key without the bit still culls back
+    // faces, which is what "opaque frames are unchanged" means one field over.
+    for bits in 0..(1u32 << 13) {
+        let variant = MaterialVariant::from_bits(bits);
+        assert_eq!(
+            render_state(variant).cull,
+            Some(wgpu::Face::Back),
+            "key {bits:#015b} lost its back-face cull without asking"
+        );
+    }
 }
 
 #[test]
@@ -294,25 +321,30 @@ fn every_state_combination_is_its_own_pipeline() {
         }
     };
 
-    // Every combination of the three state bits, over two different looks, so a
+    // Every combination of the four state bits, over two different looks, so a
     // cache collision *between* the two halves of the key would show up too.
+    // `TWO_SIDED` is in here rather than in the compile sweep for exactly this
+    // reason: it generates the same WGSL as its twin without the bit, so the
+    // cache is the only place a collision could hide.
+    const STATE_BITS: [MaterialVariant; 4] = [
+        MaterialVariant::TRANSPARENT,
+        MaterialVariant::ADDITIVE,
+        MaterialVariant::DEPTH_GREATER,
+        MaterialVariant::TWO_SIDED,
+    ];
     let mut keys = Vec::new();
     for look in [MaterialVariant::NONE, MaterialVariant::VERTEX_COLOR] {
-        for bits in 0..8u32 {
+        for bits in 0..(1u32 << STATE_BITS.len()) {
             let mut variant = look;
-            if bits & 1 != 0 {
-                variant |= MaterialVariant::TRANSPARENT;
-            }
-            if bits & 2 != 0 {
-                variant |= MaterialVariant::ADDITIVE;
-            }
-            if bits & 4 != 0 {
-                variant |= MaterialVariant::DEPTH_GREATER;
+            for (i, flag) in STATE_BITS.iter().enumerate() {
+                if bits & (1 << i) != 0 {
+                    variant |= *flag;
+                }
             }
             keys.push(variant);
         }
     }
-    assert_eq!(keys.len(), 16);
+    assert_eq!(keys.len(), 32);
 
     for variant in &keys {
         renderer.ensure_pipeline(*variant);

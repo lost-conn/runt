@@ -221,15 +221,49 @@ impl MaterialVariant {
     ///
     /// [`FrameUniform::time`]: crate::FrameUniform::time
     pub const VERTEX_WAVE: MaterialVariant = MaterialVariant(1 << 12);
+    /// Draw both faces: `cull_mode: None` instead of the back-face cull every
+    /// other key carries.
+    ///
+    /// The original is `3dimenshift/shaders/fx/water.gdshader:2`'s
+    /// `cull_disabled` — a pond surface is one sheet of triangles and the
+    /// swimmer is meant to see it from underneath, where a culled sheet is a
+    /// hole in the world. Waterfalls are the same argument in the vertical.
+    ///
+    /// # Pipeline-only, and the first bit that is
+    ///
+    /// [`TRANSPARENT`], [`ADDITIVE`] and [`DEPTH_GREATER`] also select
+    /// fixed-function state rather than a shader branch, but they select the
+    /// *blend* and *depth* halves that live in the pipeline descriptor beside
+    /// the module. This one is the same kind of thing one field over
+    /// ([`PipelineState::cull`]), and it gets a `const` in the preprocessor for
+    /// the same reason they do: the flag list is the declaration of the key
+    /// space, not a list of things the WGSL reads.
+    ///
+    /// It does **not** join `tests/material_variants.rs`'s `SHADER_BITS` sweep,
+    /// because crossing a bit that cannot change a module's bytes into a
+    /// combinatorial *compile* sweep doubles its runtime to compile the same
+    /// modules twice. What it does instead is keyed like any other bit, which
+    /// `every_state_combination_is_its_own_pipeline` covers.
+    ///
+    /// Culling is a real saving on the population that can least afford fill,
+    /// so this is opt-in per material rather than a global loosening — a
+    /// two-sided draw pays double fragment cost on every triangle it has.
+    ///
+    /// [`TRANSPARENT`]: MaterialVariant::TRANSPARENT
+    /// [`ADDITIVE`]: MaterialVariant::ADDITIVE
+    /// [`DEPTH_GREATER`]: MaterialVariant::DEPTH_GREATER
+    /// [`PipelineState::cull`]: crate::PipelineState::cull
+    pub const TWO_SIDED: MaterialVariant = MaterialVariant(1 << 13);
 
     /// Every declared flag, with the WGSL `const` it maps to. The order here is
     /// the order the preprocessor emits, so generated sources are stable.
     ///
     /// The render-state bits are in here with the rest even though nothing in
-    /// the WGSL reads `F_TRANSPARENT`, `F_ADDITIVE` or `F_DEPTH_GREATER`: this
-    /// list is the *declaration* of the key space, and a bit missing from it
-    /// would be a key the preprocessor silently could not describe.
-    pub const FLAGS: [(&'static str, MaterialVariant); 13] = [
+    /// the WGSL reads `F_TRANSPARENT`, `F_ADDITIVE`, `F_DEPTH_GREATER` or
+    /// `F_TWO_SIDED`: this list is the *declaration* of the key space, and a bit
+    /// missing from it would be a key the preprocessor silently could not
+    /// describe.
+    pub const FLAGS: [(&'static str, MaterialVariant); 14] = [
         ("F_VERTEX_COLOR", MaterialVariant::VERTEX_COLOR),
         ("F_TEXTURE", MaterialVariant::TEXTURE),
         ("F_RAMP", MaterialVariant::RAMP),
@@ -243,6 +277,7 @@ impl MaterialVariant {
         ("F_FRESNEL", MaterialVariant::FRESNEL),
         ("F_EMISSIVE_SWEEP", MaterialVariant::EMISSIVE_SWEEP),
         ("F_VERTEX_WAVE", MaterialVariant::VERTEX_WAVE),
+        ("F_TWO_SIDED", MaterialVariant::TWO_SIDED),
     ];
 
     /// The two blend bits, as one mask: the draws that leave the opaque
@@ -264,7 +299,8 @@ impl MaterialVariant {
             | MaterialVariant::BILLBOARD_UNLIT.0
             | MaterialVariant::FRESNEL.0
             | MaterialVariant::EMISSIVE_SWEEP.0
-            | MaterialVariant::VERTEX_WAVE.0,
+            | MaterialVariant::VERTEX_WAVE.0
+            | MaterialVariant::TWO_SIDED.0,
     );
 
     /// The four bits that each *replace* the lighting term rather than feeding
