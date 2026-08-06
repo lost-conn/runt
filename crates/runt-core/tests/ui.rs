@@ -514,6 +514,73 @@ fn an_atlas_quad_samples_the_texel_its_uv_names() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn a_raw_image_atlas_lands_texel_for_texel() {
+    // `UiAtlasImage`'s path (P7's glyph bake): pixels the *game* generated,
+    // uploaded under a handle the game chose, sampled by uv exactly as a baked
+    // `TextureSpec` would be. The one door into the texture registry that does
+    // not go through a procedural spec, and the only one a bitmap font can use.
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    let device = renderer.device().clone();
+    let target = Target::new(&device, 64, 64);
+
+    // 2×2, one distinct premultiplied texel per quadrant — and deliberately
+    // **not** square-with-mips: the raw path is 1 mip and any size, which is
+    // what a 128×56 glyph grid needs.
+    let handle = TextureHandle(0xf0_0d);
+    let pixels: Vec<u8> = vec![
+        255, 0, 0, 255, // (0,0) red
+        0, 255, 0, 255, // (1,0) green
+        0, 0, 255, 255, // (0,1) blue
+        128, 128, 128, 128, // (1,1) half-alpha grey, premultiplied
+    ];
+    renderer.upload_ui_atlas(handle, 2, 2, &pixels);
+    assert!(renderer.textures().contains(handle), "not resident");
+    // Idempotent: a host may pump the resource every frame.
+    renderer.upload_ui_atlas(handle, 2, 2, &pixels);
+    assert_eq!(renderer.textures().len(), 1);
+
+    let bare = frame(&mut renderer, &target, 1.0, &[], None);
+    let quad = |uv: [f32; 4]| UiQuad::textured([16.0, 16.0, 32.0, 32.0], uv, [1.0; 4]);
+
+    let red = frame(&mut renderer, &target, 1.0, &[quad([0.0, 0.0, 0.5, 0.5])], Some(handle));
+    assert_rgba(red.at(24, 24), over([1.0, 0.0, 0.0, 1.0], bare.at(24, 24)), "texel (0,0)");
+    let green = frame(&mut renderer, &target, 1.0, &[quad([0.5, 0.0, 1.0, 0.5])], Some(handle));
+    assert_rgba(green.at(24, 24), over([0.0, 1.0, 0.0, 1.0], bare.at(24, 24)), "texel (1,0)");
+    let blue = frame(&mut renderer, &target, 1.0, &[quad([0.0, 0.5, 0.5, 1.0])], Some(handle));
+    assert_rgba(blue.at(24, 24), over([0.0, 0.0, 1.0, 1.0], bare.at(24, 24)), "texel (0,1)");
+
+    // The half-alpha texel composites as premultiplied rather than being
+    // multiplied by its own alpha a second time.
+    let grey = frame(&mut renderer, &target, 1.0, &[quad([0.5, 0.5, 1.0, 1.0])], Some(handle));
+    let want = over(
+        [128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0],
+        bare.at(24, 24),
+    );
+    assert_rgba(grey.at(24, 24), want, "the premultiplied texel");
+}
+
+#[test]
+fn a_malformed_raw_image_is_refused_rather_than_handed_to_wgpu() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    // Too few bytes for the size it claims: a warning and nothing resident,
+    // rather than a validation error inside `write_texture`.
+    renderer.upload_ui_atlas(TextureHandle(1), 4, 4, &[0u8; 8]);
+    assert!(!renderer.textures().contains(TextureHandle(1)));
+    renderer.upload_ui_atlas(TextureHandle(2), 0, 4, &[]);
+    assert!(!renderer.textures().contains(TextureHandle(2)));
+    // …and a batch naming a handle that never arrived draws untextured rather
+    // than panicking, which the pass already promised.
+    let device = renderer.device().clone();
+    let target = Target::new(&device, 32, 32);
+    let quad = UiQuad::textured([0.0, 0.0, 8.0, 8.0], [0.0, 0.0, 1.0, 1.0], [1.0; 4]);
+    frame(&mut renderer, &target, 1.0, &[quad], Some(TextureHandle(1)));
+}
+
+#[test]
 fn ui_stays_surface_crisp_at_half_render_scale() {
     let Some(mut renderer) = renderer() else {
         return;

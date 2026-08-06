@@ -914,6 +914,107 @@ impl TextureRegistry {
         self.textures.is_empty()
     }
 
+    /// Make `handle` resident from raw RGBA8 pixels the caller already has —
+    /// the [`UiAtlasImage`](crate::ui::UiAtlasImage) path, and the only way
+    /// into this registry that does not go through a
+    /// [`TextureSpec`](crate::texture::TextureSpec).
+    ///
+    /// Idempotent: a handle that is already resident is left exactly alone, so
+    /// a host may call this every frame and pay one hash lookup.
+    ///
+    /// Unlike [`resolve`](TextureRegistry::resolve) this is **not** square, has
+    /// **no mip chain** and touches **no cache**. All three are the same
+    /// decision: the images that come in this way are HUD atlases sampled at
+    /// their own texel size by a nearest sampler, so a chain would be dead
+    /// memory, a square would be wasted memory, and a store entry would be a
+    /// cache of something the game rebuilt in a microsecond anyway.
+    ///
+    /// The normal map is the registry's own flat 1×1, so the resulting
+    /// [`GpuTexture`] is complete enough for the ordinary material path too —
+    /// which is what would let a game put an icon on a world-space quad without
+    /// a second mechanism, if one ever wanted to.
+    pub fn insert_image(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        handle: TextureHandle,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) {
+        if self.textures.contains_key(&handle) {
+            return;
+        }
+        let expected = (width as usize) * (height as usize) * 4;
+        if width == 0 || height == 0 || rgba.len() != expected {
+            log::warn!(
+                "runt-ui: image {:#018x} is {width}×{height} but carries {} bytes (wanted \
+                 {expected}); not uploaded",
+                handle.0,
+                rgba.len()
+            );
+            return;
+        }
+
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let albedo = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ui atlas image"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: BAKE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            albedo.as_image_copy(),
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
+
+        // A flat normal and an inert params block, so the entry is a complete
+        // `GpuTexture` and the material path cannot trip over it. The same 1×1
+        // `(128, 128, 255)` texel `new` builds for untextured materials, and for
+        // the same reason: perturbing the normal by nothing.
+        let normal = upload_target(
+            device,
+            queue,
+            1,
+            std::slice::from_ref(&vec![128, 128, 255, 255]),
+            "ui atlas normal",
+        );
+        let params = create_params(device, queue, &TextureUniform::inert());
+        let bind_group = create_bind_group(
+            device,
+            &self.layout,
+            &self.sampler,
+            &albedo,
+            &normal,
+            &params,
+            "ui atlas bind group",
+        );
+        log::info!("runt-ui: atlas {:#018x} uploaded ({width}×{height})", handle.0);
+        self.textures.insert(
+            handle,
+            GpuTexture {
+                albedo,
+                normal,
+                params,
+                bind_group,
+            },
+        );
+    }
+
     /// Resolve `spec` at `resolution` to a resident texture, in this order:
     ///
     /// 1. **Memory.** Already baked this session → nothing happens.

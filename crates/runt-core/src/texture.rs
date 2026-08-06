@@ -847,7 +847,7 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 /// The texture-side twin of [`MeshHandle`](crate::registry::MeshHandle) — equal
 /// handles mean "the same pixels", so two materials naming the same spec at the
 /// same resolution share one GPU texture without anyone arranging it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TextureHandle(pub u64);
 
 /// Handle → the spec (and resolution) that produced it, as a world resource.

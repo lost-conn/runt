@@ -82,7 +82,7 @@ pub use draw::{Aabb, DrawItem, DrawStats, FrameParams, Frustum, InstanceRun};
 pub use ecs::{
     default_horizon, project_phase_fx, DemoScene, FixedSim, GeneratorRef, GlobalTransform,
     Interpolated, Lighting, MeshRef, PhaseFx, PostSim, QualityTier, RenderScale, Spin, Startup,
-    StatusLine, TerrainSurface, TickCount, Transform, Visibility,
+    StatusLine, TerrainSurface, TickCount, Transform, Viewport, Visibility,
 };
 pub use engine::Engine;
 pub use gen::{GeneratorSpec, Shading};
@@ -101,7 +101,7 @@ pub use sim::{Sim, SimConfig, SimSpeed, MAX_ACCUMULATED, TICK_DT};
 pub use texture::{
     NoiseSpec, NormalMode, NormalSpec, TextureHandle, TextureLibrary, TextureSpec,
 };
-pub use ui::{UiBatch, UiPass, UiQuad, PREMULTIPLIED_BLEND};
+pub use ui::{UiAtlasImage, UiBatch, UiPass, UiQuad, PREMULTIPLIED_BLEND};
 pub use noise::{CellReturn, Fractal, Lattice};
 pub use trace::{InputTrace, TickEvent};
 
@@ -569,6 +569,24 @@ impl Renderer {
             resolution,
             store,
         )
+    }
+
+    /// Make a game-drawn atlas resident under `handle` (see
+    /// [`UiAtlasImage`](ui::UiAtlasImage)).
+    ///
+    /// Idempotent and cheap to call every frame: a resident handle returns
+    /// after one hash lookup. Through an [`Engine`] the `UiAtlasImage` resource
+    /// is pumped through here once per frame and this is that door — a host
+    /// driving the `Renderer` directly calls it itself, or never.
+    pub fn upload_ui_atlas(
+        &mut self,
+        handle: texture::TextureHandle,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) {
+        self.textures
+            .insert_image(&self.device, &self.queue, handle, width, height, rgba);
     }
 
     /// Number of shader variants compiled so far.

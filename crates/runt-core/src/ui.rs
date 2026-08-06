@@ -221,6 +221,53 @@ impl UiBatch {
 }
 
 // ---------------------------------------------------------------------------
+// Getting an atlas in
+// ---------------------------------------------------------------------------
+
+/// A game-authored atlas, as raw pixels: the one way to make
+/// [`UiBatch::atlas`] name something the game drew itself.
+///
+/// [`TextureLibrary`](crate::texture::TextureLibrary) is the engine's texture
+/// door and it takes a [`TextureSpec`](crate::texture::TextureSpec) — a
+/// *procedural* material of noise octaves and gradient ramps, which is exactly
+/// the right vocabulary for a cliff face and cannot express a bitmap font. A
+/// glyph atlas is the opposite kind of content: a few hundred bytes of authored
+/// coverage that no generator would ever produce. So this is a second, much
+/// smaller door, and it is deliberately UI-shaped rather than a general image
+/// loader — the engine still has no file formats, no decoders and no notion of
+/// an "asset".
+///
+/// # Contract
+///
+/// - `rgba` is `width · height · 4` bytes, row-major, **premultiplied** (see
+///   the module docs: a white-on-transparent font writes `rgb = a`).
+/// - `handle` is the game's to choose and must be unique to these pixels. The
+///   registry is content-addressed everywhere else; here the *game* is the
+///   content-addressing, because only it knows what went into the bake.
+/// - Uploaded **once**, the first frame it is present and not already resident,
+///   and never re-read. Changing the pixels means a new handle.
+///
+/// Empty (the default) means "no atlas of my own", which is every game that
+/// draws only solid quads.
+#[derive(Resource, Clone, Debug, Default, PartialEq)]
+pub struct UiAtlasImage {
+    pub handle: TextureHandle,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl UiAtlasImage {
+    /// Is there anything here worth uploading? Checks the length as well as the
+    /// size, so a half-built image is "nothing" rather than a panic in wgpu.
+    pub fn is_valid(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.rgba.len() == (self.width as usize) * (self.height as usize) * 4
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The GPU side
 // ---------------------------------------------------------------------------
 

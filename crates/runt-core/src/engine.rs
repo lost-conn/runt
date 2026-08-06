@@ -264,6 +264,31 @@ impl Engine {
         };
         self.renderer.set_ui_batch(quads, atlas);
 
+        // …and the atlas those quads sample, if the game drew one itself
+        // (`ui::UiAtlasImage`). Uploaded on the first frame it is present and
+        // ignored on every frame after: `upload_ui_atlas` is a hash lookup once
+        // the handle is resident, which is what lets this sit in the frame path
+        // rather than in a load hook the port would have to reach for.
+        if let Some(image) = self.sim.world().get_resource::<crate::ui::UiAtlasImage>() {
+            if image.is_valid() {
+                self.renderer.upload_ui_atlas(
+                    image.handle,
+                    image.width,
+                    image.height,
+                    &image.rgba,
+                );
+            }
+        }
+
+        // The **inbound** half of the UI seam (`ecs::Viewport`): tell the world
+        // how big the screen its HUD is being laid out on is. Written here, and
+        // therefore read by the *next* tick — one frame stale, which is what a
+        // resize costs and what a HUD cannot see.
+        let seen = crate::ecs::Viewport::new(width, height);
+        if self.sim.world().get_resource::<crate::ecs::Viewport>() != Some(&seen) {
+            self.sim.world_mut().insert_resource(seen);
+        }
+
         // The phase circle the world is asking for (D1, `ecs::PhaseFx`),
         // resolved against *this* frame's camera and aspect. Read before
         // `frame_params` only so the borrow of the world ends first; a world

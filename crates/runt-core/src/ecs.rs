@@ -96,6 +96,66 @@ impl StatusLine {
     }
 }
 
+/// The size, in logical pixels, of the view the host last handed
+/// [`Engine::render`](crate::Engine::render) — i.e. the coordinate space
+/// [`UiBatch`](crate::ui::UiBatch) quads are measured in.
+///
+/// The **inbound** half of the UI seam. `UiBatch` says what the HUD looks like
+/// and this says how big the screen it is being laid out on is: without it a
+/// game can draw a bar 16 px from the top-left corner and cannot draw one 16 px
+/// from the *right* edge, which is where half of every HUD lives. The engine
+/// owns the number because only the engine sees the resize.
+///
+/// **A render value living in the world**, exactly like [`RenderScale`] and
+/// [`PhaseFx`]: nothing in the engine reads it inside a tick, so no simulation
+/// state and no replay fingerprint can depend on it. It is *written* by
+/// [`Engine::render`], which runs after the tick, so a tick sees the size the
+/// last frame was drawn at — one frame stale, which for a HUD is invisible and
+/// for a resize is one frame of the old layout.
+///
+/// [`ZERO`](Viewport::ZERO) is the value before any frame has been drawn (and
+/// in every headless sim). A HUD system should treat it as "no screen yet" and
+/// draw nothing rather than divide by it.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
+pub struct Viewport {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Viewport {
+    /// No frame has been drawn yet. [`Default`], and what a headless sim has.
+    pub const ZERO: Viewport = Viewport {
+        width: 0,
+        height: 0,
+    };
+
+    pub const fn new(width: u32, height: u32) -> Viewport {
+        Viewport { width, height }
+    }
+
+    /// Has a frame been drawn? False for [`ZERO`](Viewport::ZERO) and for any
+    /// degenerate size a host might report while a window is minimised.
+    pub const fn is_known(self) -> bool {
+        self.width > 0 && self.height > 0
+    }
+
+    pub fn size(self) -> Vec2 {
+        Vec2::new(self.width as f32, self.height as f32)
+    }
+
+    /// Width ÷ height, or 1.0 when unknown — the same guard
+    /// [`project_phase_fx`] applies, so a game reconstructing the frame's
+    /// camera gets the engine's answer rather than a NaN.
+    pub fn aspect(self) -> f32 {
+        if self.is_known() {
+            self.width as f32 / self.height as f32
+        } else {
+            1.0
+        }
+    }
+}
+
 /// The device/LOD quality multiplier for this session (DESIGN §6, §11).
 ///
 /// Read once, at scene load, and turned into a [`Quality`] per generator via the
@@ -966,5 +1026,26 @@ mod phase_fx_tests {
             project_phase_fx(&Mat4::IDENTITY, 1.0, &fx),
             (Vec2::ZERO, 0.0)
         );
+    }
+
+    #[test]
+    fn a_viewport_is_unknown_until_a_frame_has_been_drawn() {
+        // The value every headless sim has, and the one a HUD system must read
+        // as "no screen yet" rather than dividing by.
+        let none = Viewport::default();
+        assert_eq!(none, Viewport::ZERO);
+        assert!(!none.is_known());
+        // …and it still answers, rather than handing back a NaN.
+        assert_eq!(none.aspect(), 1.0);
+        assert_eq!(none.size(), Vec2::ZERO);
+
+        let seen = Viewport::new(1920, 1080);
+        assert!(seen.is_known());
+        assert!((seen.aspect() - 16.0 / 9.0).abs() < 1e-6);
+        assert_eq!(seen.size(), Vec2::new(1920.0, 1080.0));
+
+        // A minimised window is not a screen either.
+        assert!(!Viewport::new(1920, 0).is_known());
+        assert!(!Viewport::new(0, 1080).is_known());
     }
 }
