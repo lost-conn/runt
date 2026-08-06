@@ -17,6 +17,15 @@
 //! own scene and a setup that registers its `FixedSim` systems. Neither program
 //! adds a line of code to this file.
 //!
+//! There is one more hook, and it is a *frame* hook rather than a load one:
+//! [`RunConfig::with_frame`] runs a game's closure against the whole
+//! [`Engine`] between the tick and the draw. It exists because offscreen
+//! viewports (a tutorial card showing a second world — see
+//! [`Engine::render_to_texture`](runt_core::Engine::render_to_texture)) are
+//! work that has to happen inside the frame and needs the *engine*, which no
+//! system inside a `FixedSim` can borrow. The host still knows nothing about
+//! what the closure does; it knows only when to call it.
+//!
 //! The one thing that *looks* like an exception is the status line (see
 //! [`Host::sync_status`]): the engine has no text renderer, so a game writes
 //! [`StatusLine`](runt_core::StatusLine) and the host paints it with whatever
@@ -74,11 +83,34 @@ pub use audio::AudioConfig;
 /// function pointer cannot carry it. Boxing costs one allocation per process.
 pub type SetupFn = Box<dyn FnOnce(&mut Sim)>;
 
+/// A hook that runs against the whole [`Engine`] once per frame, after the
+/// tick(s) that frame ran and **before** the frame is drawn.
+///
+/// The one thing a game legitimately needs the host's frame loop for: work that
+/// takes `&mut Engine` rather than `&mut Sim`. Concretely, offscreen viewports
+/// — [`Engine::render_to_texture`](runt_core::Engine::render_to_texture) draws
+/// a second `Sim` into a texture that this same frame's HUD then samples — and
+/// nothing inside a `FixedSim` system can do it: a system borrows the world,
+/// the renderer is not *in* the world (DESIGN §4 keeps render state out of
+/// reach of a tick precisely so no fingerprint can depend on it), and a second
+/// world cannot be a resource of the first without making one world own the
+/// other's clock.
+///
+/// This is still not game logic in the host (DESIGN §2). The host calls a
+/// closure it knows nothing about at a point in the frame only it can name; the
+/// closure is the game's, and it lives in the game's crate.
+///
+/// `FnMut` rather than [`SetupFn`]'s `FnOnce`: it runs every frame, and the
+/// state it usually carries — the demo `Sim`, its clock, which tutorial card is
+/// open — is state it has to keep between them.
+pub type FrameFn = Box<dyn FnMut(&mut Engine)>;
+
 /// Everything the host needs to know about the program it is hosting.
 ///
 /// Deliberately small. If something wants to be in here that is not a title, a
-/// scene, a quality tier or a setup hook, it is probably engine state and
-/// belongs behind [`SetupFn`].
+/// scene, a quality tier or a hook, it is probably engine state and belongs
+/// behind [`SetupFn`] — or, if it has to happen inside every frame, behind
+/// [`FrameFn`].
 pub struct RunConfig {
     /// Window title natively; the base of `document.title` on web. A
     /// [`StatusLine`](runt_core::StatusLine) replaces it once a game writes one.
@@ -91,6 +123,12 @@ pub struct RunConfig {
     pub quality: Option<f32>,
     /// Run once against the sim before the first tick.
     pub setup: Option<SetupFn>,
+    /// Run every frame against the engine, after that frame's ticks and before
+    /// it is drawn (see [`FrameFn`] and [`with_frame`](RunConfig::with_frame)).
+    ///
+    /// `None` — every program that has no offscreen viewport to draw — costs a
+    /// branch on an `Option` per frame and nothing else.
+    pub on_frame: Option<FrameFn>,
     /// Run once after the event loop exits, on the sim it left behind.
     ///
     /// Where `runt-ball --record` writes its input trace. **Native only**: a web
@@ -134,6 +172,7 @@ impl RunConfig {
             scene_ron: scene_ron.into(),
             quality: None,
             setup: None,
+            on_frame: None,
             on_exit: None,
             cache_name: None,
             audio: None,
@@ -161,6 +200,37 @@ impl RunConfig {
 
     pub fn with_setup(mut self, setup: impl FnOnce(&mut Sim) + 'static) -> RunConfig {
         self.setup = Some(Box::new(setup));
+        self
+    }
+
+    /// Run `frame` every frame, against the whole [`Engine`], after that
+    /// frame's ticks and **before** it is drawn (see [`FrameFn`]).
+    ///
+    /// The order is the point. A tutorial card's viewport has to be *finished*
+    /// when the HUD quad that samples it is drawn, and the HUD is drawn inside
+    /// [`Engine::render`](runt_core::Engine::render) — so the offscreen pass
+    /// belongs after the tick that decided what the card should show and before
+    /// the frame that shows it. Running it after `render` would put a
+    /// one-frame-stale picture in every card, forever, and running it before
+    /// `update` would show the *previous* tick's world in a card sitting beside
+    /// a HUD showing this one's.
+    ///
+    /// ```no_run
+    /// use runt_app::RunConfig;
+    /// use runt_core::{RenderTarget, Sim};
+    ///
+    /// // The tutorial's world: a second `Sim`, ticked and drawn by the hook.
+    /// let mut demo = Sim::new();
+    /// let card = RenderTarget(0);
+    /// let config = RunConfig::engine_demo().with_frame(move |engine| {
+    ///     demo.update(engine.tick_count() as f64 * runt_core::TICK_DT);
+    ///     // The game's HUD samples `card.handle()` from its own `UiBatch`.
+    ///     engine.render_to_texture(card, &mut demo, 320, 180);
+    /// });
+    /// runt_app::run_with(config);
+    /// ```
+    pub fn with_frame(mut self, frame: impl FnMut(&mut Engine) + 'static) -> RunConfig {
+        self.on_frame = Some(Box::new(frame));
         self
     }
 
@@ -229,6 +299,10 @@ struct Host {
     /// Turns the polled pad state into events. Lives beside the poller rather
     /// than inside it so both platforms share one definition of "changed".
     pad_diff: gamepad::PadDiffer,
+    /// The game's per-frame hook, if it asked for one
+    /// ([`RunConfig::with_frame`]). Called in [`Host::render`], between the
+    /// tick and the draw.
+    on_frame: Option<FrameFn>,
     /// What the program is called when it has nothing to say.
     title: String,
     /// The last [`StatusLine`](runt_core::StatusLine) painted, so an unchanged
@@ -354,6 +428,7 @@ impl Host {
             stick: input::VirtualStick::new(),
             pads: gamepad::Pads::new(),
             pad_diff: gamepad::PadDiffer::new(),
+            on_frame: run.on_frame,
             title: run.title,
             shown_status: String::new(),
             audio,
@@ -451,6 +526,22 @@ impl Host {
         // render rather than after, so a sound is on its way while the picture
         // is still being drawn.
         self.engine.sim_mut().drain_audio(self.audio.as_mut());
+
+        // The game's own frame work, between the tick and the draw (see
+        // `RunConfig::with_frame`). This is where an offscreen viewport is
+        // rendered: the tick that decided what the card should show has run,
+        // and the HUD quad that samples the card has not been drawn yet.
+        //
+        // Split borrow rather than `if let Some(f) = &mut self.on_frame` inside
+        // a method call: the hook and the engine are sibling fields, and the
+        // hook is handed the engine, not the host — a hook cannot reach the
+        // surface, the window or the audio device, which is what keeps DESIGN
+        // §2's line ("hosts contain no engine logic") pointing the same way
+        // through the seam.
+        if let Some(on_frame) = self.on_frame.as_mut() {
+            on_frame(&mut self.engine);
+        }
+
         self.engine
             .render(&view, self.config.width, self.config.height);
 
@@ -805,4 +896,116 @@ pub fn wasm_init() {
 pub fn wasm_start() {
     wasm_init();
     run();
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use runt_core::{RenderTarget, UiBatch, UiQuad};
+
+    const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+    const SIZE: u32 = 64;
+
+    /// What the frame hook is *for*, driven through the same sequence
+    /// [`Host::render`] drives it in: tick → hook → draw.
+    ///
+    /// The call site itself cannot be tested here — [`Host`] owns a `Window` and
+    /// a `Surface` and there is no headless one — so this stands the two claims
+    /// that survive without a window: the hook is called once per frame with the
+    /// whole engine, and it is called at a point where its offscreen target is
+    /// already resident for the draw that follows. The one line of ordering
+    /// inside `Host::render` is the part held by review.
+    #[test]
+    fn the_frame_hook_runs_once_a_frame_between_the_tick_and_the_draw() {
+        let mut engine = match pollster::block_on(runt_core::Engine::headless(FORMAT)) {
+            Ok(e) => e,
+            Err(e) => return eprintln!("SKIP frame hook (no GPU adapter): {e}"),
+        };
+        let target = engine
+            .device()
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("frame hook target"),
+                size: wgpu::Extent3d {
+                    width: SIZE,
+                    height: SIZE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        // A HUD in the game's world, so the frame has something to mirror —
+        // `Engine::render` copies the batch out of the world, which is what
+        // makes `ui_quad_count` a witness to whether the draw has happened yet.
+        let card = RenderTarget(0);
+        let mut hud = UiBatch::new();
+        hud.set_texture(Some(card.handle()));
+        hud.textured([0.0, 0.0, 32.0, 32.0], [0.0, 0.0, 1.0, 1.0], [1.0; 4]);
+        engine.sim_mut().world_mut().insert_resource(hud);
+
+        // What the hook saw, per call: (its own call index, the engine's tick
+        // count, how many HUD quads the *renderer* was holding).
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let log = seen.clone();
+        // The tutorial world: a second `Sim`, owned by the closure, which is
+        // the entire reason the hook is `FnMut` and takes `&mut Engine`.
+        let mut demo = runt_core::Sim::new();
+        let mut config = RunConfig::engine_demo().with_frame(move |engine| {
+            let calls = log.borrow().len();
+            let hud = engine.renderer().ui_quad_count();
+            log.borrow_mut().push((calls, engine.tick_count(), hud));
+            demo.update(calls as f64 * runt_core::TICK_DT);
+            engine.render_to_texture(card, &mut demo, 48, 32);
+        });
+
+        assert!(
+            RunConfig::engine_demo().on_frame.is_none(),
+            "a program that never asks for a frame hook must not have one"
+        );
+        let mut on_frame = config.on_frame.take().expect("with_frame stored the hook");
+
+        // Three frames of `Host::render`'s body, in its order.
+        for frame in 0..3u32 {
+            engine.update(frame as f64 * 4.0 * runt_core::TICK_DT);
+            on_frame(&mut engine);
+            engine.render(&target, SIZE, SIZE);
+        }
+
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 3, "the hook runs once per frame: {seen:?}");
+        // Frame 0 is the one that can tell the order: the renderer is holding
+        // no HUD yet, because `Engine::render` has not run. Had the hook been
+        // called after the draw, the first thing it saw would have been this
+        // frame's quads — and its viewport would have been one frame stale in
+        // every card, forever.
+        assert_eq!(seen[0].2, 0, "the hook ran after the draw");
+        assert!(seen[1].1 > 0, "the hook runs after the tick: {seen:?}");
+        assert_eq!(seen[1].2, 1, "later frames see the previous frame's HUD");
+
+        // And the thing the hook exists to do actually landed: the viewport is
+        // resident, at its own size, under the handle the HUD names.
+        assert_eq!(engine.renderer().render_target_size(card), Some((48, 32)));
+        assert!(engine.renderer().textures().contains(card.handle()));
+        assert_eq!(engine.renderer().ui_quad_count(), 1);
+    }
+
+    /// A quad-and-atlas host still has a whole `UiBatch` to hand over: the
+    /// batch's texture runs are opt-in, and the two-line construction below is
+    /// the whole migration for a game that used to build one by struct literal.
+    #[test]
+    fn a_batch_is_built_rather_than_declared() {
+        let mut batch = UiBatch::new();
+        batch.atlas = Some(runt_core::TextureHandle(1));
+        batch.push(UiQuad::solid([0.0, 0.0, 4.0, 4.0], [1.0; 4]));
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.runs().count(), 1, "one atlas is still one run");
+    }
 }
