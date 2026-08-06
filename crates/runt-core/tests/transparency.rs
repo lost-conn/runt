@@ -12,6 +12,15 @@
 //!    over an opaque floor, checked against the blend arithmetic done by hand,
 //!    plus the phase circle's edge fringe checked against `strength`.
 //!
+//! **The screen effect is in these frames.** A circle with a radius on it turns
+//! on `blit.wgsl`'s luminance inversion (see `tests/phase_screen.rs`), and this
+//! rig aims one — so anything the probes read *inside* the circle is the blend
+//! result seen through that effect. Rather than dodge it, the expectations
+//! compose the two: [`phase_screen_color`] is applied to the colour the blend
+//! arithmetic predicts, which incidentally pins the thing neither test could
+//! see alone — that the effect's circle and the material shaders' discard
+//! circle are the same circle, to the pixel.
+//!
 //! The pixel values are golden in the sense that matters: they are the exact
 //! result of `src·α + dst·(1−α)` (and of `src·α + dst`) on colours chosen so the
 //! answer is a round number, not a hash of one machine's rasterizer. A hash
@@ -22,6 +31,7 @@
 use bevy_ecs::prelude::*;
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use runt_core::draw::{build_draw_list, sort_draw_list_for_view, DrawItem};
+use runt_core::ecs::{phase_screen_color, PHASE_EDGE};
 use runt_core::registry::{MeshHandle, MeshLibrary};
 use runt_core::texture::TextureLibrary;
 use runt_core::{Material, MaterialVariant, Mesh, MeshRef, Renderer, Transform};
@@ -277,24 +287,26 @@ impl Frame {
         d.length() < PHASE_RADIUS
     }
 
-    /// The brightest red on the vertical slice of the pixel column through
-    /// `center` that the circle covers.
-    ///
-    /// Red because the floor and the phase-only quad are *both* 0.2 of it: over
-    /// that slice, any red above 0.2 came from something whitening a fragment,
-    /// which is the only thing the fringe does. The slice is bounded to the
-    /// circle so the yellow world-only quad further down the column — which is
-    /// supposed to be bright — cannot answer for it.
-    fn column_max_red(&self, center: Vec2) -> f32 {
-        let x = (((center.x * 0.5 + 0.5) * WIDTH as f32).round() as usize).min(WIDTH as usize - 1);
-        let cy = (0.5 - center.y * 0.5) * HEIGHT as f32;
-        // The radius is in NDC-Y units — half the frame's height is 1.0 of them.
-        let half = PHASE_RADIUS * HEIGHT as f32 * 0.5 + 2.0;
-        let top = (cy - half).max(0.0) as usize;
-        let bottom = ((cy + half) as usize).min(HEIGHT as usize - 1);
-        (top..=bottom)
-            .map(|y| self.pixels[(y * WIDTH as usize + x) * 4] as f32 / 255.0)
-            .fold(0.0f32, f32::max)
+    /// The pixel at `(x, y)`, `0..1`.
+    fn pixel(&self, x: u32, y: u32) -> Vec3 {
+        let i = ((y * WIDTH + x) * 4) as usize;
+        Vec3::new(
+            self.pixels[i] as f32,
+            self.pixels[i + 1] as f32,
+            self.pixels[i + 2] as f32,
+        ) / 255.0
+    }
+
+    /// Aspect-corrected distance from the circle's centre to a pixel's centre,
+    /// in NDC-Y units — the shader's own measure, so a distance compares
+    /// directly against [`PHASE_RADIUS`] and [`PHASE_EDGE`].
+    fn pixel_distance(x: u32, y: u32, center: Vec2) -> f32 {
+        let mut d = Vec2::new(
+            (x as f32 + 0.5) / WIDTH as f32 * 2.0 - 1.0,
+            1.0 - (y as f32 + 0.5) / HEIGHT as f32 * 2.0,
+        ) - center;
+        d.x *= WIDTH as f32 / HEIGHT as f32;
+        d.length()
     }
 }
 
@@ -480,11 +492,17 @@ fn one_of_each_new_state_over_an_opaque_floor() {
     assert!(glow.cmpgt(floor).all(), "additive must only ever add");
 
     // Phase-only (params.x = 1): visible inside the circle, gone outside it.
+    //
+    // Inside is also where the screen effect is at full strength, so the
+    // expectation is the quad's colour *through* it. That the two agree is the
+    // coincidence claim: the effect and the discard read the same `phase` out
+    // of the same frame block, and a probe deep inside one circle would not sit
+    // deep inside a differently placed other one.
     let center = frame.project(PHASE_ONLY_AT);
     assert!(frame.inside_circle(PHASE_ONLY_AT, center));
     assert_rgb(
         frame.sample(PHASE_ONLY_AT),
-        PHASED.truncate(),
+        phase_screen_color(PHASED.truncate(), 1.0),
         "phase-only quad inside the circle",
     );
     let corner = PHASE_ONLY_AT + Vec3::new(0.8, 0.8, 0.0);
@@ -504,6 +522,16 @@ fn one_of_each_new_state_over_an_opaque_floor() {
     );
 }
 
+/// The fringe is `strength` and nothing else — asked as "what did raising it
+/// change, and where".
+///
+/// It used to be asked as "how red did the circle's column get", which worked
+/// while the fringe was the last thing to touch those pixels. It is not any
+/// more: `blit.wgsl`'s screen effect now sits between the fringe and the
+/// framebuffer, and it *darkens* what the fringe whitened — a whitened edge
+/// inverts to a dark one — so brightness on its own no longer reads the fringe
+/// at all. What still does, and what the claim was always about, is the
+/// difference between two frames that differ in nothing but `strength`.
 #[test]
 fn the_fringe_is_strength_and_nothing_else() {
     let Some(off) = render_blended_frame(0.0) else {
@@ -512,26 +540,48 @@ fn the_fringe_is_strength_and_nothing_else() {
     let on = render_blended_frame(1.0).expect("the adapter worked a moment ago");
 
     let center = off.project(PHASE_ONLY_AT);
-    // The floor and the phase-only quad are both 0.2 red, and the circle's
-    // vertical extent falls entirely inside the quad, so this column has no
-    // other source of red at all.
-    let dark = off.column_max_red(center);
-    let lit = on.column_max_red(center);
-    println!("fringe: max red {dark:.3} off, {lit:.3} on");
-    assert!(
-        dark <= PHASED.x + 3.0 / 255.0,
-        "strength 0 must draw no fringe, but something on the column reached {dark}"
+    // A pixel either way, so a half-texel disagreement about where a pixel is
+    // cannot indict the band it is in.
+    let slack = 2.0 / HEIGHT as f32;
+    let (mut worst, mut worst_at) = (0.0f32, (0u32, 0u32));
+    let mut strayed = 0u32;
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let delta = (on.pixel(x, y) - off.pixel(x, y)).abs().max_element();
+            if delta <= 1.0 / 255.0 {
+                continue;
+            }
+            if worst < delta {
+                worst = delta;
+                worst_at = (x, y);
+            }
+            // Everything `strength` touches is within the fringe band of the
+            // circle's edge. This is the "nothing else" half, and it is a
+            // *global* claim: one stray pixel anywhere in the frame — a fringe
+            // leaking onto the floor, a boundary that moved — fails it.
+            if (Frame::pixel_distance(x, y, center) - PHASE_RADIUS).abs() > PHASE_EDGE + slack {
+                strayed += 1;
+            }
+        }
+    }
+    println!(
+        "fringe: peak change {worst:.3} at {worst_at:?}, {strayed} pixels outside the edge band"
+    );
+    assert_eq!(
+        strayed, 0,
+        "strength changed pixels away from the circle's edge"
     );
     assert!(
-        lit > 0.6,
-        "strength 1 should whiten the circle's edge hard, but the column peaked at {lit}"
+        worst > 0.1,
+        "strength 1 should draw a hard fringe, but the frame moved by only {worst}"
     );
 
     // The fringe is *decoration*: it may not move the boundary. Both frames
-    // agree about what exists on either side of it.
+    // agree about what exists on either side of it — the phased quad, through
+    // the screen effect, inside; the floor, untouched, outside.
     assert_rgb(
         on.sample(PHASE_ONLY_AT),
-        PHASED.truncate(),
+        phase_screen_color(PHASED.truncate(), 1.0),
         "the middle of the circle is untouched by the fringe",
     );
     assert_rgb(

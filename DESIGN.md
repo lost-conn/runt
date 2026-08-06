@@ -148,8 +148,9 @@ one action produce one press instead of two.
   changes. True GPU instancing (per-instance vertex buffer) is the first
   optimization once the same (mesh, material) repeats a lot — the sort order
   already groups for it.
-- **Passes:** clear → opaque forward → (when render scale < 1, see §11) a
-  fullscreen nearest blit from the internal target to the host's view →
+- **Passes:** clear → opaque forward → (when render scale < 1, see §11, *or*
+  when the phase circle is up) a fullscreen nearest blit from the internal
+  target to the host's view, which is also where the phase screen effect runs →
   (later, in order of likely need) transparent-sorted pass, simple shadow map
   for the key light (capability-gated resolution), post tonemap/vignette. No
   render-graph framework; a hand-rolled ordered pass list is enough at this
@@ -541,6 +542,16 @@ content cost is zero:
   the same single submit into the host's view, and pixels bit-identical to
   what the renderer produced before the feature existed. That is a test
   (`tests/render_scale.rs`), not an intention.
+- **Unless the phase circle is up** (2026-08-06). The screen effect —
+  luminance inverted and 40% desaturated inside the circle, the port's
+  signature look — has to read the finished frame, and the fullscreen pass is
+  the only place that holds one, so it rides this one rather than adding a
+  second. The consequence is that a *native-resolution* frame with a circle in
+  it now takes the offscreen detour too: one full-screen read and write it did
+  not use to pay, charged only while the circle is actually up, and gone again
+  at radius zero — where the old path is still bit-identical
+  (`tests/phase_screen.rs`). The HUD escapes it for free, because the UI pass
+  is encoded after this one and straight onto the host's view.
 - The value is a `RenderScale` **resource**, like §7's live-texture switch, so
   a game can bind it to a key from one `FixedSim` system and have it work on
   both hosts. Nothing in a tick reads it, so no fingerprint can move when it

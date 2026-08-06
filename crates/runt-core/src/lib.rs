@@ -52,8 +52,8 @@ pub mod ui;
 /// [`material::BASE_SHADER`].
 pub const SKY_SHADER: &str = include_str!("sky.wgsl");
 
-/// The render-scale blit's WGSL: one fullscreen triangle, nearest sampler
-/// (DESIGN §11). Standalone like [`SKY_SHADER`]; see
+/// The fullscreen pass's WGSL: one triangle, a nearest sampler, and the phase
+/// circle's screen effect (DESIGN §11, §5). Standalone like [`SKY_SHADER`]; see
 /// [`Renderer::render_scaled`].
 pub const BLIT_SHADER: &str = include_str!("blit.wgsl");
 
@@ -346,6 +346,11 @@ pub struct Renderer {
 
     frame_buffer: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
+    /// The frame block's layout, kept because the fullscreen pass is compiled
+    /// lazily and needs it long after [`new`](Renderer::new) has returned. The
+    /// material and sky pipelines take theirs from the same value at
+    /// construction, which is what guarantees one buffer serves all three.
+    frame_layout: wgpu::BindGroupLayout,
 
     /// [`FrameUniform::phase`] and [`FrameUniform::time`], held between frames.
     ///
@@ -418,7 +423,12 @@ struct Offscreen {
     bind_group: wgpu::BindGroup,
 }
 
-/// The upscale pass: one pipeline, one nearest sampler, one layout.
+/// The fullscreen pass: one pipeline, one nearest sampler, one layout. Serves
+/// both the render-scale upscale and the phase circle's screen effect, which
+/// are the same fetch (see `blit.wgsl`).
+///
+/// `layout` is the *source* group's — group 1. Group 0 is the frame block, whose
+/// layout the renderer already owns.
 struct Blit {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
@@ -493,6 +503,7 @@ impl Renderer {
             pipeline_layout,
             frame_buffer,
             frame_bind_group,
+            frame_layout,
             phase: [0.0; 4],
             time: [0.0; 4],
             sky_pipeline,
@@ -613,10 +624,14 @@ impl Renderer {
     /// `center` is NDC (`-1..1`, +Y up), `radius` is in NDC-Y units with the X
     /// axis aspect-corrected, and `strength` (`0..1`) drives the edge fringe.
     /// A radius of zero is the resting state: world geometry solid, phase
-    /// geometry gone.
+    /// geometry gone, screen untouched.
     ///
     /// Cheap enough to call every frame — it writes two `vec4`s into the frame
-    /// uniform that were already being written — and invisible to the sim.
+    /// uniform that were already being written — and invisible to the sim. Not
+    /// free at the *pass* level, though: a radius above
+    /// [`PHASE_MIN_RADIUS`](crate::ecs::PHASE_MIN_RADIUS) turns the screen
+    /// effect on, and that makes even a native-resolution frame draw offscreen
+    /// and copy (see [`render_scaled`](Renderer::render_scaled)).
     pub fn set_phase_fx(&mut self, center: glam::Vec2, radius: f32, strength: f32) {
         self.phase = [center.x, center.y, radius.max(0.0), strength.clamp(0.0, 1.0)];
     }
@@ -794,17 +809,40 @@ impl Renderer {
     /// As [`render`](Renderer::render), drawing the scene at `scale` × the
     /// view's size and blitting it up (DESIGN §11's resolution lever).
     ///
-    /// At [`RenderScale::MAX`] this *is* [`render`](Renderer::render): same
-    /// encoder, same passes, same one submit, straight into the host's view. No
-    /// internal target exists, nothing is sampled, and the pixels are bit for
-    /// bit what they were before this method did. That equivalence is the whole
-    /// design constraint — the screenshot suite pins it.
+    /// At [`RenderScale::MAX`], with the phase circle at rest, this *is*
+    /// [`render`](Renderer::render): same encoder, same passes, same one submit,
+    /// straight into the host's view. No internal target exists, nothing is
+    /// sampled, and the pixels are bit for bit what they were before this method
+    /// did. That equivalence is the whole design constraint — the screenshot
+    /// suite pins it.
     ///
     /// Below it: the depth attachment and the color target are both sized by
     /// [`RenderScale::size`], the entire existing pass sequence runs into that
     /// internal color target, and one extra fullscreen pass copies it to the
     /// real view through a **nearest** sampler. Both passes ride the same
     /// encoder, so a scaled frame is still exactly one submission.
+    ///
+    /// # The phase circle takes the same road
+    ///
+    /// The screen effect — luminance inverted and desaturated inside the circle
+    /// (DESIGN §5, `blit.wgsl`) — needs the *finished* frame as an input, so it
+    /// has to run after everything that draws into it and before anything that
+    /// must escape it. The fullscreen pass is already exactly that point, so the
+    /// effect rides it rather than adding a pass of its own: with the circle on,
+    /// one fetch does the copy and the inversion together.
+    ///
+    /// The price is paid on the other side of the seam. A native-resolution
+    /// frame with the circle up can no longer draw straight into the host's
+    /// view — there would be nothing to read — so it allocates the internal
+    /// target and copies once, which is a full-screen read plus a full-screen
+    /// write it did not use to pay. That is the cheapest honest version of a
+    /// post-process on a forward renderer with no G-buffer, and it is charged
+    /// only while the circle is actually up: at radius zero the old path is
+    /// taken unchanged, down to the byte.
+    ///
+    /// The HUD is unaffected for free, because it is encoded *after* this pass
+    /// and straight onto `view`. That is the original's behaviour and it is a
+    /// property of the ordering rather than of a flag anyone has to maintain.
     ///
     /// `aspect` is deliberately *not* recomputed from the scaled size: the frame
     /// is stretched back over the host's rectangle, so the projection that
@@ -829,6 +867,12 @@ impl Renderer {
         // and blitting a texture onto itself at 1:1 would be pure waste and one
         // more thing to get wrong.
         let scaled = (render_width, render_height) != (width, height);
+        // Two reasons to draw offscreen and copy, and only one of them is the
+        // resolution. The screen effect has to read the finished frame, so a
+        // circle that is actually up forces the detour even at native scale;
+        // the same 0.001 the shaders test against decides it, so "off" means
+        // the same thing on both sides of the seam.
+        let fullscreen = scaled || self.phase[2] > ecs::PHASE_MIN_RADIUS;
 
         self.ensure_depth(render_width, render_height);
 
@@ -855,14 +899,14 @@ impl Renderer {
         for run in &runs {
             self.ensure_pipeline(run.variant);
         }
-        if scaled {
+        if fullscreen {
             self.ensure_blit();
             self.ensure_offscreen(render_width, render_height);
         }
 
         // The pass writes here; `view` is what the blit writes, if there is one.
         let target = match &self.offscreen {
-            Some(off) if scaled => &off.view,
+            Some(off) if fullscreen => &off.view,
             _ => view,
         };
         let depth_view = &self.depth.as_ref().expect("depth ensured").2;
@@ -961,11 +1005,11 @@ impl Renderer {
         self.visible = visible;
         self.runs = runs;
 
-        if scaled {
+        if fullscreen {
             let blit = self.blit.as_ref().expect("blit ensured");
             let off = self.offscreen.as_ref().expect("offscreen ensured");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("render-scale blit"),
+                label: Some("fullscreen (blit + phase screen)"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
@@ -988,7 +1032,11 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&blit.pipeline);
-            pass.set_bind_group(0, &off.bind_group, &[]);
+            // The same frame block the world pass read: the effect's circle is
+            // built from `phase` and `viewport` so it lands exactly where the
+            // material shaders' discard boundary did.
+            pass.set_bind_group(0, &self.frame_bind_group, &[]);
+            pass.set_bind_group(1, &off.bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
 
@@ -1039,7 +1087,10 @@ impl Renderer {
     ///
     /// Introspection for a host's status line and for the tests that pin the
     /// rounding; the allocation is sticky, so this reports what *exists* rather
-    /// than what the last frame used.
+    /// than what the last frame used. It is also not only a *scale* target any
+    /// more — the phase circle's screen effect allocates one at the host's own
+    /// size — so a `Some` equal to the view size means "the fullscreen pass ran
+    /// at 1:1", not "the scale is wrong".
     pub fn scaled_target_size(&self) -> Option<(u32, u32)> {
         self.offscreen.as_ref().map(|o| (o.width, o.height))
     }
@@ -1235,12 +1286,14 @@ impl Renderer {
         }
     }
 
-    /// Compile the blit pipeline, once, the first time a scaled frame needs it.
+    /// Compile the fullscreen pipeline, once, the first time a frame needs it —
+    /// because it is scaled, or because the phase circle is on.
     ///
     /// Lazy rather than built in [`new`](Renderer::new) so that the common case
-    /// — a host that never leaves native resolution — pays nothing for this
-    /// feature: no shader module, no sampler, no pipeline. The sky pipeline is
-    /// eager because every frame draws a sky; no frame at 1.0 blits.
+    /// — a host at native resolution with no circle up — pays nothing for
+    /// either feature: no shader module, no sampler, no pipeline. The sky
+    /// pipeline is eager because every frame draws a sky; plenty of frames
+    /// never touch this one.
     fn ensure_blit(&mut self) {
         if self.blit.is_some() {
             return;
@@ -1248,7 +1301,7 @@ impl Renderer {
         let layout = self
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("blit source layout"),
+                label: Some("fullscreen source layout"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
@@ -1275,20 +1328,26 @@ impl Renderer {
         let pipeline_layout = self
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("blit pipeline layout"),
-                bind_group_layouts: &[Some(&layout)],
+                label: Some("fullscreen pipeline layout"),
+                // Frame at 0, source at 1. The frame block keeps the number it
+                // has in every other pipeline in the engine — the alternative,
+                // hanging it off group 1 to leave the source where it was, would
+                // make this the one shader where `@group(0)` means something
+                // else. Group 1 is the hole the material layout leaves, so
+                // nothing collides.
+                bind_group_layouts: &[Some(&self.frame_layout), Some(&layout)],
                 immediate_size: 0,
             });
         let shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("render-scale blit"),
+                label: Some("fullscreen pass"),
                 source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
             });
         let pipeline = self
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("render-scale blit"),
+                label: Some("fullscreen pass"),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
@@ -1320,7 +1379,7 @@ impl Renderer {
         // pixels are the feature; a `Linear` here would be a blur that costs the
         // same and looks like a mistake.
         let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("blit nearest"),
+            label: Some("fullscreen nearest"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -1330,7 +1389,7 @@ impl Renderer {
             ..Default::default()
         });
         log::info!(
-            "render scale: blit pipeline compiled (nearest, {:?})",
+            "fullscreen pass: pipeline compiled (nearest, {:?})",
             self.target_format
         );
         self.blit = Some(Blit {
@@ -1385,7 +1444,7 @@ impl Renderer {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blit source"),
+            label: Some("fullscreen source"),
             layout: &blit.layout,
             entries: &[
                 wgpu::BindGroupEntry {

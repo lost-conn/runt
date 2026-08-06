@@ -355,6 +355,48 @@ impl Default for PhaseFx {
     }
 }
 
+/// Below this radius the circle is **off**: nothing is inside it, so world
+/// geometry is solid, phase-only geometry is gone, and the screen effect is a
+/// plain copy.
+///
+/// `shader.wgsl`, `blit.wgsl` and Godot's `phase_common.gdshaderinc` all spell
+/// the same 0.001, and it is here as well because the renderer has to make a
+/// *pass-level* decision on it — a frame with the circle on needs the fullscreen
+/// pass, and one with it off must not pay for it (see
+/// [`Renderer::render_scaled`](crate::Renderer::render_scaled)).
+pub const PHASE_MIN_RADIUS: f32 = 0.001;
+
+/// Half-width of the smoothstep at the circle's edge, in NDC-Y units.
+///
+/// The band `shader.wgsl` smears its fringe over and the band `blit.wgsl` fades
+/// the screen effect over — the same number in both, because a boundary that
+/// disagreed with itself would draw two edges.
+pub const PHASE_EDGE: f32 = 0.03;
+
+/// The screen effect inside the circle, on one colour: the CPU twin of
+/// `blit.wgsl`'s fragment (DESIGN §5's signature look).
+///
+/// `circle` is the mask — 1 deep inside, 0 outside, the smoothstep in between —
+/// and the return is what the framebuffer ends up holding. A twin rather than a
+/// second implementation: nothing in the engine calls this, and it exists so a
+/// test can state the expected pixel as arithmetic instead of as a hash of one
+/// machine's rasterizer, exactly as [`sky::gradient`](crate::sky::gradient)
+/// does for the background.
+///
+/// The inversion is *additive* (`c + (1 − 2·luma)`) rather than a per-channel
+/// complement, which is what keeps the hue: the pixel is reflected about the
+/// grey axis instead of about each primary. Then 40% of the way to its own grey.
+/// Both are `phase_screen_effect.gdshader`'s, value for value. Note that the
+/// result is **not** clamped — the shader hands an out-of-range colour to the
+/// blend stage and the target format does the clamping, so a caller comparing
+/// against read-back bytes has to clamp too.
+pub fn phase_screen_color(color: Vec3, circle: f32) -> Vec3 {
+    let luma = |c: Vec3| c.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+    let inverted = color + Vec3::splat(1.0 - 2.0 * luma(color));
+    let desaturated = inverted.lerp(Vec3::splat(luma(inverted)), 0.4);
+    color.lerp(desaturated, circle)
+}
+
 /// Padding added to the farthest-corner distance under [`PhaseFx::cover`], in
 /// NDC-Y units.
 ///
