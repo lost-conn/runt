@@ -54,6 +54,29 @@
 //! no buffer is allocated. The frame is byte-identical to one from an engine
 //! without this module in it.
 //!
+//! # One atlas, unless the batch says otherwise
+//!
+//! [`UiBatch::atlas`] is still the frame's texture: one handle, set once, that
+//! every textured quad samples. That is what a HUD wants — a glyph grid and an
+//! icon sheet baked into one image is one bind group and one draw.
+//!
+//! What a *demo viewport* wants is different: a quad that samples an offscreen
+//! scene target (a second world rendered by
+//! [`Renderer::render_to_texture`](crate::Renderer::render_to_texture)),
+//! sitting in the same painter's order as the panel behind it and the caption
+//! over it. So a batch may also carry **texture runs**:
+//! [`UiBatch::set_texture`] marks the point in the list where the texture
+//! changes, and the pass draws one instanced call per run.
+//!
+//! Runs are *consecutive*, never sorted. Painter's order is the batch's only
+//! ordering rule and grouping quads by texture would quietly break it — a
+//! viewport drawn over its own caption is not a cheaper frame, it is a wrong
+//! one. The cost of that choice is one draw call per texture change, which a
+//! layout controls by pushing its quads in the order it already wanted.
+//!
+//! A batch that never calls `set_texture` is exactly one run, and the pass
+//! encodes exactly the commands it encoded before runs existed.
+//!
 //! # Rings and arcs are quads too
 //!
 //! There is deliberately **no arc/ring shader mode**. The plan left it to the
@@ -167,8 +190,9 @@ impl UiQuad {
 pub struct UiBatch {
     pub quads: Vec<UiQuad>,
     /// The texture every [`textured`](UiQuad::textured) quad in this batch
-    /// samples — one atlas per batch, set once by the game (usually at load,
-    /// from the glyph/icon bake) and left alone.
+    /// samples, unless a [run](UiBatch::set_texture) overrides it — one atlas
+    /// per batch, set once by the game (usually at load, from the glyph/icon
+    /// bake) and left alone.
     ///
     /// `None` binds a 1×1 white texel instead, so solid quads work with zero
     /// setup: a game that only ever draws bars and panels never touches the
@@ -184,6 +208,28 @@ pub struct UiBatch {
     /// to bake an atlas is exactly the hitch the load-time bake exists to
     /// prevent.
     pub atlas: Option<TextureHandle>,
+    /// Where the sampled texture changes, as `(first quad index, texture)`,
+    /// ascending. `None` means "back to [`atlas`](UiBatch::atlas)".
+    ///
+    /// Private because the ascending-and-deduplicated invariant is what makes
+    /// [`runs`](UiBatch::runs) a partition of the quad list rather than a set
+    /// of overlapping claims about it; [`set_texture`](UiBatch::set_texture) is
+    /// the only way to add one. Empty — the case every HUD written before this
+    /// existed is in — means one run over everything.
+    switches: Vec<(u32, Option<TextureHandle>)>,
+}
+
+/// A contiguous stretch of quads sharing one texture: what the pass turns into
+/// a single instanced draw.
+///
+/// `texture` is the run's *override*, not its resolved texture — `None` means
+/// the batch's [`atlas`](UiBatch::atlas), which may itself be `None` (the white
+/// texel). Resolution happens at encode time, where the registry is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UiRun {
+    pub first: u32,
+    pub count: u32,
+    pub texture: Option<TextureHandle>,
 }
 
 impl UiBatch {
@@ -193,12 +239,79 @@ impl UiBatch {
 
     /// Drop every quad, keeping the allocation (and the atlas). The first call
     /// of a HUD system's frame.
+    ///
+    /// The texture runs go with the quads they described — a run list that
+    /// outlived its quads would name indices that no longer exist — so a HUD
+    /// that samples a second texture re-declares it each frame, exactly like it
+    /// re-pushes the quad.
     pub fn clear(&mut self) {
         self.quads.clear();
+        self.switches.clear();
     }
 
     pub fn push(&mut self, quad: UiQuad) {
         self.quads.push(quad);
+    }
+
+    /// Every quad pushed *after* this call samples `texture` — `None` meaning
+    /// the batch's own [`atlas`](UiBatch::atlas).
+    ///
+    /// Painter's order is untouched: this marks a boundary in the list, it does
+    /// not move anything across one. Calling it twice with the same value, or
+    /// before any quad, costs nothing — the switch is folded rather than
+    /// recorded, so a layout may bracket every widget with one without turning
+    /// a HUD into a hundred draw calls.
+    pub fn set_texture(&mut self, texture: Option<TextureHandle>) {
+        if self.texture() == texture {
+            return;
+        }
+        let first = self.quads.len() as u32;
+        // A switch at the same index as the last one replaces it: nothing was
+        // drawn between them, so the earlier value never applied to anything.
+        match self.switches.last_mut() {
+            Some(last) if last.0 == first => last.1 = texture,
+            _ => self.switches.push((first, texture)),
+        }
+    }
+
+    /// The texture the *next* pushed quad will sample, as an override: `None`
+    /// is the batch atlas.
+    pub fn texture(&self) -> Option<TextureHandle> {
+        self.switches.last().and_then(|(_, texture)| *texture)
+    }
+
+    /// The batch as the pass draws it: consecutive runs, in painter's order,
+    /// covering every quad exactly once. Empty runs are skipped, so the
+    /// iterator is empty for an empty batch and yields exactly one item for the
+    /// overwhelmingly common single-texture case.
+    pub fn runs(&self) -> impl Iterator<Item = UiRun> + '_ {
+        let total = self.quads.len() as u32;
+        // The quads pushed before the first `set_texture` — the whole batch
+        // when there was never one.
+        let lead = match self.switches.first() {
+            Some(&(first, _)) => first,
+            None => total,
+        };
+        let switched = self.switches.iter().enumerate();
+        let switched = switched.map(move |(i, &(first, texture))| {
+            // A run ends where the next switch begins, or at the last quad.
+            let end = match self.switches.get(i + 1) {
+                Some(&(next, _)) => next,
+                None => total,
+            };
+            UiRun {
+                first,
+                count: end.saturating_sub(first),
+                texture,
+            }
+        });
+        std::iter::once(UiRun {
+            first: 0,
+            count: lead,
+            texture: None,
+        })
+        .chain(switched)
+        .filter(|run| run.count > 0)
     }
 
     /// [`UiQuad::solid`], pushed.
@@ -311,6 +424,10 @@ pub struct UiPass {
     /// The last atlas complained about, so a batch naming a texture that never
     /// arrives says so once rather than every frame.
     warned_atlas: Option<TextureHandle>,
+    /// Each run's resolved bind-group key, computed before the pass opens
+    /// because building a group needs `&mut self` and recording one needs
+    /// `&self`. A field rather than a local so a steady HUD allocates nothing.
+    resolved: Vec<Option<TextureHandle>>,
     instances: wgpu::Buffer,
     capacity: u32,
 }
@@ -481,6 +598,7 @@ impl UiPass {
             _white: white,
             atlas_groups: HashMap::new(),
             warned_atlas: None,
+            resolved: Vec::new(),
             instances: create_quad_buffer(device, INITIAL_QUAD_CAPACITY),
             capacity: INITIAL_QUAD_CAPACITY,
         }
@@ -494,14 +612,18 @@ impl UiPass {
     /// Upload `quads` and encode the pass over `view`, which must be the
     /// **surface** view (post-blit) at `width` × `height`.
     ///
-    /// One `write_buffer` and one `draw` for the whole batch, whatever is in it:
-    /// there is no per-quad state, so a 200-quad HUD is one draw call. Loads
-    /// rather than clears — this paints *over* the frame that is already there.
+    /// One `write_buffer` for the whole batch and one `draw` **per texture
+    /// run**: there is no per-quad state, so a 200-quad HUD on one atlas is
+    /// still one draw call, and a HUD with a demo viewport in the middle of it
+    /// is three. Loads rather than clears — this paints *over* the frame that
+    /// is already there.
     ///
-    /// Never called with an empty batch (the caller checks), which is what makes
-    /// "no HUD" mean "no pass".
+    /// `runs` must partition `quads` in painter's order (see
+    /// [`UiBatch::runs`]); each run's `texture` falls back to `atlas` when it is
+    /// `None`. Never called with an empty batch (the caller checks), which is
+    /// what makes "no HUD" mean "no pass".
     ///
-    /// Ten parameters is past clippy's taste for the same reason
+    /// Eleven parameters is past clippy's taste for the same reason
     /// [`Renderer::render_scaled`](crate::Renderer::render_scaled)'s eight are:
     /// they are the GPU handles, the host's rectangle and the frame's content,
     /// three groups with nothing in common, and a struct would only move the
@@ -516,10 +638,12 @@ impl UiPass {
         width: u32,
         height: u32,
         quads: &[UiQuad],
+        runs: &[UiRun],
         atlas: Option<TextureHandle>,
         textures: &TextureRegistry,
     ) {
         debug_assert!(!quads.is_empty(), "the caller skips the pass when empty");
+        debug_assert!(!runs.is_empty(), "a non-empty batch has at least one run");
         let (w, h) = (width.max(1) as f32, height.max(1) as f32);
         queue.write_buffer(
             &self.uniform,
@@ -532,12 +656,17 @@ impl UiPass {
         self.grow(device, quads.len() as u32);
         queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(quads));
 
-        // Resolved before the pass starts, because building a bind group needs
-        // `&mut self` and recording one needs `&self`.
-        let group = match self.ensure_atlas(device, atlas, textures) {
-            Some(handle) => &self.atlas_groups[&handle],
-            None => &self.white_group,
-        };
+        // Every run's bind group, resolved before the pass starts, because
+        // building one needs `&mut self` and recording it needs `&self`. Moved
+        // out of `self` for the duration for the same borrow-splitting reason
+        // the renderer moves its working sets out of itself.
+        let mut resolved = std::mem::take(&mut self.resolved);
+        resolved.clear();
+        for run in runs {
+            let key = self.ensure_atlas(device, run.texture.or(atlas), textures);
+            resolved.push(key);
+        }
+
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("ui"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -556,10 +685,26 @@ impl UiPass {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.uniform_group, &[]);
-        pass.set_bind_group(1, group, &[]);
         pass.set_vertex_buffer(0, self.instances.slice(..));
-        // Six vertices, `quads.len()` instances: the whole HUD, in one call.
-        pass.draw(0..6, 0..quads.len() as u32);
+        // Six vertices, the run's instances: one call per texture, and — for
+        // the batch that never switched — one call for the whole HUD, which is
+        // the command stream this pass encoded before runs existed, byte for
+        // byte.
+        let mut bound: Option<Option<TextureHandle>> = None;
+        for (run, key) in runs.iter().zip(&resolved) {
+            if bound != Some(*key) {
+                let group = match key {
+                    Some(handle) => &self.atlas_groups[handle],
+                    None => &self.white_group,
+                };
+                pass.set_bind_group(1, group, &[]);
+                bound = Some(*key);
+            }
+            pass.draw(0..6, run.first..run.first + run.count);
+        }
+
+        drop(pass);
+        self.resolved = resolved;
     }
 
     /// Make sure this batch's atlas has a bind group, returning the key to look
@@ -710,6 +855,86 @@ mod tests {
         batch.clear();
         assert!(batch.is_empty());
         assert_eq!(batch.atlas, Some(TextureHandle(7)), "the atlas is set once");
+    }
+
+    #[test]
+    fn a_batch_that_never_switches_texture_is_one_run() {
+        let mut batch = UiBatch::new();
+        assert_eq!(batch.runs().count(), 0, "an empty batch draws nothing");
+
+        batch.solid([0.0, 0.0, 1.0, 1.0], [1.0; 4]);
+        batch.textured([0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0], [1.0; 4]);
+        let runs: Vec<UiRun> = batch.runs().collect();
+        assert_eq!(
+            runs,
+            vec![UiRun {
+                first: 0,
+                count: 2,
+                texture: None
+            }],
+            "one texture is one draw"
+        );
+    }
+
+    #[test]
+    fn texture_runs_partition_the_batch_in_painters_order() {
+        let viewport = TextureHandle::render_target(0);
+        let mut batch = UiBatch::new();
+        batch.atlas = Some(TextureHandle(7));
+
+        // A panel, a viewport quad, a caption over it: the demo-card layout,
+        // which is the whole reason runs exist.
+        batch.solid([0.0, 0.0, 100.0, 60.0], [0.0, 0.0, 0.0, 1.0]);
+        batch.set_texture(Some(viewport));
+        batch.textured([4.0, 4.0, 92.0, 40.0], [0.0, 0.0, 1.0, 1.0], [1.0; 4]);
+        batch.set_texture(None);
+        batch.textured([8.0, 48.0, 8.0, 8.0], [0.0, 0.0, 0.1, 0.1], [1.0; 4]);
+        batch.textured([16.0, 48.0, 8.0, 8.0], [0.1, 0.0, 0.2, 0.1], [1.0; 4]);
+
+        let run = |first, count, texture| UiRun {
+            first,
+            count,
+            texture,
+        };
+        let runs: Vec<UiRun> = batch.runs().collect();
+        let want = vec![run(0, 1, None), run(1, 1, Some(viewport)), run(2, 2, None)];
+        assert_eq!(runs, want);
+        // A partition: consecutive, gapless, covering every quad exactly once.
+        let covered: u32 = runs.iter().map(|r| r.count).sum();
+        assert_eq!(covered, batch.len() as u32);
+        let ends = |run: &UiRun| run.first + run.count;
+        assert!(
+            runs.windows(2).all(|w| ends(&w[0]) == w[1].first),
+            "the runs leave a gap or overlap: {runs:?}"
+        );
+
+        batch.clear();
+        assert_eq!(batch.runs().count(), 0, "the runs go with their quads");
+        assert_eq!(batch.texture(), None, "…and so does the current texture");
+    }
+
+    #[test]
+    fn switching_to_the_same_texture_costs_no_run() {
+        let handle = TextureHandle::render_target(3);
+        let mut batch = UiBatch::new();
+        // Bracketing every widget with a `set_texture` is a legitimate way to
+        // write a layout, and it must not turn one draw into five.
+        batch.set_texture(Some(handle));
+        batch.set_texture(Some(handle));
+        batch.solid([0.0, 0.0, 1.0, 1.0], [1.0; 4]);
+        batch.set_texture(Some(handle));
+        batch.solid([0.0, 0.0, 1.0, 1.0], [1.0; 4]);
+        assert_eq!(batch.runs().count(), 1);
+
+        // Switches with nothing between them collapse to the last one — the
+        // earlier value never applied to a quad.
+        batch.set_texture(None);
+        batch.set_texture(Some(TextureHandle(9)));
+        batch.solid([0.0, 0.0, 1.0, 1.0], [1.0; 4]);
+        let runs: Vec<UiRun> = batch.runs().collect();
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_eq!(runs[1].texture, Some(TextureHandle(9)));
+        assert_eq!(runs[1].first, 2);
     }
 
     #[test]

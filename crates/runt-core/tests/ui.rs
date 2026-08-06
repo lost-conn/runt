@@ -171,7 +171,7 @@ fn frame(
 ) -> Pixels {
     let device = renderer.device().clone();
     let queue = renderer.queue().clone();
-    renderer.set_ui_batch(quads, atlas);
+    renderer.set_ui_quads(quads, atlas);
     renderer.render_scaled(
         &target.view,
         target.width,
@@ -671,7 +671,7 @@ fn two_hundred_quads_are_one_batch() {
     // 9.6 kB upload, not draw calls.
     let device = renderer.device().clone();
     let mut bench = |quads: &[UiQuad]| {
-        renderer.set_ui_batch(quads, None);
+        renderer.set_ui_quads(quads, None);
         let start = std::time::Instant::now();
         for _ in 0..50 {
             renderer.render_scaled(

@@ -1015,6 +1015,68 @@ impl TextureRegistry {
         );
     }
 
+    /// Make `handle` resolve to a texture the caller rendered rather than baked
+    /// — the offscreen scene target path
+    /// ([`Renderer::render_to_texture`](crate::Renderer::render_to_texture)).
+    ///
+    /// **Replaces** rather than skipping, unlike
+    /// [`insert_image`](TextureRegistry::insert_image): the two doors have
+    /// opposite lifetimes. An image's handle *is* its pixels, so a second
+    /// upload under the same handle is a no-op by definition; a render target's
+    /// handle is a *name*, and the reason to re-register one is that the target
+    /// behind it was reallocated at a new size — dropping the old entry is the
+    /// whole point of the call.
+    ///
+    /// `color` must be `TEXTURE_BINDING`-usable and of a filterable format
+    /// (every surface format is). The normal map and params are the registry's
+    /// own flat 1×1 and inert block, exactly as `insert_image` builds them, so
+    /// the entry is a complete [`GpuTexture`] and a material may name it
+    /// without anything special happening.
+    pub fn insert_render_target(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        handle: TextureHandle,
+        color: wgpu::Texture,
+    ) {
+        let normal = upload_target(
+            device,
+            queue,
+            1,
+            std::slice::from_ref(&vec![128, 128, 255, 255]),
+            "scene target normal",
+        );
+        let params = create_params(device, queue, &TextureUniform::inert());
+        let bind_group = create_bind_group(
+            device,
+            &self.layout,
+            &self.sampler,
+            &color,
+            &normal,
+            &params,
+            "scene target bind group",
+        );
+        self.textures.insert(
+            handle,
+            GpuTexture {
+                albedo: color,
+                normal,
+                params,
+                bind_group,
+            },
+        );
+    }
+
+    /// Forget `handle`, dropping its GPU textures with it.
+    ///
+    /// Only ever right for a handle whose contents are a *name* rather than a
+    /// hash — a dropped render target. Removing a baked texture would be
+    /// removing something the content address says is still true, and the next
+    /// draw that named it would silently bake it again.
+    pub fn remove(&mut self, handle: TextureHandle) -> bool {
+        self.textures.remove(&handle).is_some()
+    }
+
     /// Resolve `spec` at `resolution` to a resident texture, in this order:
     ///
     /// 1. **Memory.** Already baked this session → nothing happens.

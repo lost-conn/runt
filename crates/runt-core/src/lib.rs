@@ -101,7 +101,7 @@ pub use sim::{Sim, SimConfig, SimSpeed, MAX_ACCUMULATED, TICK_DT};
 pub use texture::{
     NoiseSpec, NormalMode, NormalSpec, TextureHandle, TextureLibrary, TextureSpec,
 };
-pub use ui::{UiAtlasImage, UiBatch, UiPass, UiQuad, PREMULTIPLIED_BLEND};
+pub use ui::{UiAtlasImage, UiBatch, UiPass, UiQuad, UiRun, PREMULTIPLIED_BLEND};
 pub use noise::{CellReturn, Fractal, Lattice};
 pub use trace::{InputTrace, TickEvent};
 
@@ -400,6 +400,11 @@ pub struct Renderer {
     /// The blit pipeline and its nearest sampler, compiled on first use.
     blit: Option<Blit>,
 
+    /// Offscreen scene targets, by the caller's own name (see
+    /// [`RenderTarget`]). Empty — and therefore free — for every host that
+    /// never asks for a second camera.
+    scene_targets: HashMap<RenderTarget, SceneTarget>,
+
     /// The screen-space UI pipeline, compiled the first time a frame actually
     /// has a HUD in it (see [`ensure_ui`](Renderer::ensure_ui)).
     ui: Option<ui::UiPass>,
@@ -410,7 +415,76 @@ pub struct Renderer {
     /// is: nothing in a tick may read it. The `Vec` is reused, so a steady HUD
     /// allocates nothing after its first frame.
     ui_quads: Vec<ui::UiQuad>,
+    /// The batch's texture runs, copied alongside its quads. Always covers
+    /// `ui_quads` exactly; a batch that never switched texture is one run.
+    ui_runs: Vec<ui::UiRun>,
     ui_atlas: Option<texture::TextureHandle>,
+}
+
+/// A caller-named offscreen scene target: somewhere to draw a **second camera**
+/// — usually a second [`Sim`], with its own world — that a UI quad or a
+/// material can then sample.
+///
+/// The name is the caller's and it is all the identity there is. Handing the
+/// same `RenderTarget` to
+/// [`render_to_texture`](Renderer::render_to_texture) every frame re-uses one
+/// texture; handing a different one allocates a second. The
+/// [`TextureHandle`] it resolves to is stable, pure and
+/// knowable before the first frame ([`RenderTarget::handle`]), so a game can
+/// write it into a UI layout at build time.
+///
+/// # Why two worlds are safe to share one renderer
+///
+/// Nothing in the renderer is per-world. Meshes and textures are keyed by
+/// *content* — `MeshHandle::of(&mesh)` is the geometry's hash and
+/// `TextureHandle` is the spec's — so two `Sim`s that generated the same rock
+/// resolve to the same handle and share one upload, and two that generated
+/// different rocks cannot collide. The libraries are arguments to each render
+/// call rather than state, so "which world is this?" never has to be a question
+/// the registries can answer wrongly. The one identifier that is *not* content
+/// — this target's own — lives in the reserved half of the handle space
+/// ([`TextureHandle::RESERVED_BIT`](texture::TextureHandle::RESERVED_BIT)),
+/// where no hash can reach it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RenderTarget(pub u32);
+
+impl RenderTarget {
+    /// The handle this target's colour texture is registered under — what a
+    /// [`UiQuad`] samples and what a
+    /// [`Material`] could name.
+    ///
+    /// Pure and total: valid to call before the target exists, which is what
+    /// lets a HUD be written against a viewport that has not been rendered yet
+    /// (it draws the white texel until the first frame lands, exactly like an
+    /// atlas that has not been baked).
+    pub const fn handle(self) -> texture::TextureHandle {
+        texture::TextureHandle::render_target(self.0)
+    }
+}
+
+/// One offscreen scene target: colour, depth, and a frame block of its own.
+///
+/// The colour texture itself is not here — it lives in the renderer's
+/// [`TextureRegistry`](bake::TextureRegistry) under
+/// [`RenderTarget::handle`], which is what makes it samplable by the UI pass
+/// and the material path without a second lookup table. This struct holds the
+/// parts only the *writing* side needs.
+///
+/// **The frame uniform is per-target, and that is the whole point.** The
+/// renderer has one `frame_buffer` for the main frame; a second camera writing
+/// its view-projection into that buffer would be seen by whichever pass
+/// executes last, not by the pass it was written for — `queue.write_buffer` is
+/// ordered against *submissions*, not against passes inside one. A buffer per
+/// target sidesteps the question entirely: each pass binds a block nothing else
+/// writes, so the two cameras cannot see each other's matrices however the
+/// caller interleaves the calls.
+struct SceneTarget {
+    width: u32,
+    height: u32,
+    view: wgpu::TextureView,
+    depth: wgpu::TextureView,
+    frame_buffer: wgpu::Buffer,
+    frame_bind_group: wgpu::BindGroup,
 }
 
 /// The internal color target for a scaled frame, plus the bind group that
@@ -519,8 +593,10 @@ impl Renderer {
             depth: None,
             offscreen: None,
             blit: None,
+            scene_targets: HashMap::new(),
             ui: None,
             ui_quads: Vec::new(),
+            ui_runs: Vec::new(),
             ui_atlas: None,
         }
     }
@@ -674,9 +750,33 @@ impl Renderer {
     /// `Renderer` directly and never calling this never sees the UI path.
     /// Through an [`Engine`], the [`UiBatch`] resource is mirrored here once per
     /// frame and this is that door.
-    pub fn set_ui_batch(&mut self, quads: &[ui::UiQuad], atlas: Option<texture::TextureHandle>) {
+    pub fn set_ui_batch(&mut self, batch: &ui::UiBatch) {
+        self.ui_quads.clear();
+        self.ui_quads.extend_from_slice(&batch.quads);
+        self.ui_runs.clear();
+        self.ui_runs.extend(batch.runs());
+        self.ui_atlas = batch.atlas;
+    }
+
+    /// [`set_ui_batch`](Renderer::set_ui_batch) for a caller that has quads
+    /// rather than a [`UiBatch`]: one texture for all of them, which is what
+    /// this method took before batches could carry
+    /// [runs](ui::UiBatch::set_texture).
+    ///
+    /// Kept as its own door rather than folded in, because a `&[UiQuad]` is
+    /// what a test rig and a hand-rolled host actually hold, and building a
+    /// whole batch to hand one over would be ceremony.
+    pub fn set_ui_quads(&mut self, quads: &[ui::UiQuad], atlas: Option<texture::TextureHandle>) {
         self.ui_quads.clear();
         self.ui_quads.extend_from_slice(quads);
+        self.ui_runs.clear();
+        if !quads.is_empty() {
+            self.ui_runs.push(ui::UiRun {
+                first: 0,
+                count: quads.len() as u32,
+                texture: None,
+            });
+        }
         self.ui_atlas = atlas;
     }
 
@@ -910,96 +1010,17 @@ impl Renderer {
             _ => view,
         };
         let depth_view = &self.depth.as_ref().expect("depth ensured").2;
-        let mut issued = 0u32;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("opaque forward"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_bind_group(0, &self.frame_bind_group, &[]);
-
-            // The sky goes first, with the depth test off, rather than last at
-            // the far plane. Drawing it last would save the one fullscreen
-            // overdraw that geometry then covers — but only in a frame that is
-            // mostly covered, and it would make the background depend on the
-            // depth attachment's clear value and on `LessEqual` semantics for
-            // correctness. The frame is being cleared anyway; one guaranteed
-            // fullscreen write is the cheap, unconditional version.
-            pass.set_pipeline(&self.sky_pipeline);
-            pass.draw(0..3, 0..1);
-
-            // Slot 1 is set once for the whole frame. Every material pipeline
-            // declares the same instance layout and every draw is a *range* of
-            // the one buffer, so there is nothing per-draw to rebind — which is
-            // exactly what the dynamic-offset bind group used to cost.
-            if !runs.is_empty() {
-                pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            }
-
-            let mut bound_variant: Option<MaterialVariant> = None;
-            let mut bound_mesh: Option<MeshHandle> = None;
-            // `None` here means "nothing bound yet", which is distinct from
-            // `Some(None)` — the default 1×1 group being bound on purpose.
-            let mut bound_texture: Option<Option<texture::TextureHandle>> = None;
-            for run in &runs {
-                let Some(gpu) = self.meshes.get(run.mesh) else {
-                    continue; // Geometry the library could not supply; warned about above.
-                };
-                if bound_variant != Some(run.variant) {
-                    let pipeline = self
-                        .pipelines
-                        .get(&run.variant)
-                        .expect("variant compiled above");
-                    pass.set_pipeline(pipeline);
-                    bound_variant = Some(run.variant);
-                }
-                // Group 2 is in the layout for every variant, so it is bound for
-                // every draw — the sort order (texture is the second key)
-                // collapses that to one set per texture per frame.
-                let wanted = run
-                    .texture
-                    .filter(|handle| self.textures.contains(*handle));
-                if bound_texture != Some(wanted) {
-                    let group = match wanted {
-                        Some(handle) => {
-                            &self.textures.get(handle).expect("filtered above").bind_group
-                        }
-                        None => self.textures.default_bind_group(),
-                    };
-                    pass.set_bind_group(2, group, &[]);
-                    bound_texture = Some(wanted);
-                }
-                if bound_mesh != Some(run.mesh) {
-                    pass.set_vertex_buffer(0, gpu.vertices.slice(..));
-                    pass.set_index_buffer(gpu.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    bound_mesh = Some(run.mesh);
-                }
-                pass.draw_indexed(0..gpu.index_count, 0, run.first..run.first + run.count);
-                issued += 1;
-            }
-        }
+        let issued = self.encode_scene(
+            &mut encoder,
+            "opaque forward",
+            target,
+            depth_view,
+            &self.frame_bind_group,
+            &runs,
+        );
 
         self.stats.draws = issued;
         self.visible = visible;
@@ -1060,6 +1081,7 @@ impl Renderer {
                 queue,
                 textures,
                 ui_quads,
+                ui_runs,
                 ui_atlas,
                 ..
             } = self
@@ -1074,6 +1096,7 @@ impl Renderer {
                 width,
                 height,
                 ui_quads,
+                ui_runs,
                 *ui_atlas,
                 textures,
             );
@@ -1093,6 +1116,230 @@ impl Renderer {
     /// at 1:1", not "the scale is wrong".
     pub fn scaled_target_size(&self) -> Option<(u32, u32)> {
         self.offscreen.as_ref().map(|o| (o.width, o.height))
+    }
+
+    // -- offscreen scene targets --------------------------------------------
+
+    /// Draw a **second camera's** scene into `target`'s offscreen texture, and
+    /// return the handle a UI quad (or a material) samples it by.
+    ///
+    /// The scene half of a frame and nothing else: geometry uploaded, textures
+    /// baked, culled, sorted, coalesced, sky, one `draw_indexed` per run —
+    /// `encode_scene`, the same code the host frame runs. Deliberately *not* in
+    /// it:
+    ///
+    /// - **No UI pass.** A viewport is a picture of a world; the HUD that
+    ///   frames it belongs to the host frame, drawn on top of the quad that
+    ///   samples this.
+    /// - **No render scale and no fullscreen pass.** The caller already chose
+    ///   the pixel count — that is what `width`/`height` *are* — so scaling it
+    ///   again would be a second opinion about the same number, and there is no
+    ///   surface here to stretch back over.
+    /// - **No phase circle.** The frame block is written with the circle at
+    ///   rest (see `frame_uniform`); a circle aimed at the host's screen has
+    ///   no meaning in another world's viewport. If a tutorial card ever needs
+    ///   to *demonstrate* phasing, this is where a per-target phase would go.
+    ///
+    /// # Every frame, or on change
+    ///
+    /// The target persists and its contents survive until something draws over
+    /// them, so a card that only changes when the tutorial step does may render
+    /// on change. Re-rendering every frame is the simpler contract and the one
+    /// the sizes are sticky for; both are supported because neither costs the
+    /// other anything.
+    ///
+    /// # One submission of its own
+    ///
+    /// This is its own encoder and its own `submit`, which is also what makes
+    /// it safe to share the renderer's *instance* buffer with the host frame:
+    /// `queue.write_buffer` lands on the queue timeline in call order, so each
+    /// submission executes against the bytes written before it. (The frame
+    /// *uniform* does not rely on that — each target owns one; see
+    /// `SceneTarget`.)
+    ///
+    /// Returns this pass's [`DrawStats`] rather than storing them, so
+    /// [`draw_stats`](Renderer::draw_stats) keeps meaning "the host frame".
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_to_texture(
+        &mut self,
+        target: RenderTarget,
+        width: u32,
+        height: u32,
+        frame: &FrameParams,
+        draws: &[DrawItem],
+        library: &MeshLibrary,
+        textures: &texture::TextureLibrary,
+    ) -> draw::DrawStats {
+        let (width, height) = (width.max(1), height.max(1));
+        self.ensure_render_target(target, width, height);
+
+        // Exactly `render_scaled`'s preamble, in exactly its order: geometry
+        // before culling (the frustum test wants measured bounds), textures
+        // after culling (nothing baked for a draw that was thrown away).
+        self.upload_missing_meshes(draws, library);
+        let mut visible = std::mem::take(&mut self.visible);
+        let mut runs = std::mem::take(&mut self.runs);
+        let mut stats = self.prepare_frame(frame, draws, &mut visible, &mut runs);
+        self.bake_missing_textures(&visible, textures);
+        self.write_instances(&visible);
+        for run in &runs {
+            self.ensure_pipeline(run.variant);
+        }
+
+        // The target's own frame block, written into the target's own buffer.
+        let uniform = self.frame_uniform(frame, width, height, [0.0; 4]);
+        let scene = self
+            .scene_targets
+            .get(&target)
+            .expect("ensured at the top of this call");
+        self.queue
+            .write_buffer(&scene.frame_buffer, 0, bytemuck::bytes_of(&uniform));
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("offscreen scene"),
+            });
+        stats.draws = self.encode_scene(
+            &mut encoder,
+            "offscreen scene",
+            &scene.view,
+            &scene.depth,
+            &scene.frame_bind_group,
+            &runs,
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        self.visible = visible;
+        self.runs = runs;
+        stats
+    }
+
+    /// Make sure `target` exists at `width` × `height`, returning the
+    /// [`TextureHandle`] it is registered under.
+    ///
+    /// Idempotent and cheap to call every frame: an existing target of the same
+    /// size is one hash lookup. A *different* size recreates the colour and
+    /// depth textures and re-registers the handle — sticky otherwise, exactly
+    /// like `ensure_offscreen`, and for the same reason: a card being dragged
+    /// or animated would otherwise reallocate on the frame it can least afford
+    /// to.
+    ///
+    /// [`render_to_texture`](Renderer::render_to_texture) calls this, so a host
+    /// only needs it to allocate a viewport *before* the first frame it draws
+    /// one — which is what a HUD that measures its card wants.
+    pub fn ensure_render_target(
+        &mut self,
+        target: RenderTarget,
+        width: u32,
+        height: u32,
+    ) -> texture::TextureHandle {
+        let (width, height) = (width.max(1), height.max(1));
+        let handle = target.handle();
+        if matches!(self.scene_targets.get(&target), Some(t) if t.width == width && t.height == height)
+        {
+            return handle;
+        }
+
+        let color = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // The surface's format, not a fixed Rgba8, for the render-scale
+            // target's reason: every material pipeline was compiled against
+            // `target_format`, and an attachment of another format is a
+            // validation error rather than a conversion. It is also what makes
+            // one pipeline cache serve both cameras.
+            format: self.target_format,
+            // `COPY_SRC` on top of the two the pass needs: a viewport nobody
+            // can read back is a viewport nobody can test, and the usage bit is
+            // free until something uses it.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth = self
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("scene target depth"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        // A frame block of this target's own — see `SceneTarget`.
+        let frame_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("scene target frame uniform"),
+            size: std::mem::size_of::<FrameUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let frame_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene target frame"),
+            layout: &self.frame_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: frame_buffer.as_entire_binding(),
+            }],
+        });
+
+        // The colour texture goes to the registry, which is what makes it
+        // samplable by handle from the UI pass and the material path alike.
+        // The registry owns it from here; this struct keeps only the parts the
+        // *writing* side needs.
+        self.textures
+            .insert_render_target(&self.device, &self.queue, handle, color);
+        log::info!(
+            "scene target {} ({:#018x}): {width}×{height}",
+            target.0,
+            handle.0
+        );
+        self.scene_targets.insert(
+            target,
+            SceneTarget {
+                width,
+                height,
+                view,
+                depth,
+                frame_buffer,
+                frame_bind_group,
+            },
+        );
+        handle
+    }
+
+    /// The size `target` is allocated at, or `None` if it does not exist.
+    pub fn render_target_size(&self, target: RenderTarget) -> Option<(u32, u32)> {
+        self.scene_targets.get(&target).map(|t| (t.width, t.height))
+    }
+
+    /// Free `target`'s textures and un-register its handle.
+    ///
+    /// A tutorial that has closed its card and will not reopen it; nothing
+    /// calls this on the way out, because dropping the renderer drops
+    /// everything anyway. A quad still naming the handle afterwards degrades to
+    /// the white texel, like any unbaked atlas.
+    pub fn drop_render_target(&mut self, target: RenderTarget) {
+        if self.scene_targets.remove(&target).is_some() {
+            self.textures.remove(target.handle());
+        }
     }
 
     // -- frame plumbing -----------------------------------------------------
@@ -1153,12 +1400,144 @@ impl Renderer {
         }
     }
 
+    /// The scene, into whatever colour and depth attachments the caller names:
+    /// clear → sky → one `draw_indexed` per coalesced run. Returns the number
+    /// of calls issued.
+    ///
+    /// The one place the forward pass is written, so
+    /// [`render_scaled`](Renderer::render_scaled) and
+    /// [`render_to_texture`](Renderer::render_to_texture) cannot drift apart —
+    /// same sort, same instancing, same state-change elision, same sky. What
+    /// the caller varies is only *where* it lands and *which frame block* it
+    /// reads, which is exactly the difference between two cameras.
+    ///
+    /// `&self`, deliberately: everything it needs is already resident by the
+    /// time it runs (the caller uploaded, baked, wrote and compiled), and
+    /// taking the working sets as an argument rather than reading them back out
+    /// of `self` is what lets the caller keep holding them.
+    fn encode_scene(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &str,
+        color: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        frame_group: &wgpu::BindGroup,
+        runs: &[draw::InstanceRun],
+    ) -> u32 {
+        let mut issued = 0u32;
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_bind_group(0, frame_group, &[]);
+
+        // The sky goes first, with the depth test off, rather than last at
+        // the far plane. Drawing it last would save the one fullscreen
+        // overdraw that geometry then covers — but only in a frame that is
+        // mostly covered, and it would make the background depend on the
+        // depth attachment's clear value and on `LessEqual` semantics for
+        // correctness. The frame is being cleared anyway; one guaranteed
+        // fullscreen write is the cheap, unconditional version.
+        pass.set_pipeline(&self.sky_pipeline);
+        pass.draw(0..3, 0..1);
+
+        // Slot 1 is set once for the whole frame. Every material pipeline
+        // declares the same instance layout and every draw is a *range* of
+        // the one buffer, so there is nothing per-draw to rebind — which is
+        // exactly what the dynamic-offset bind group used to cost.
+        if !runs.is_empty() {
+            pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+        }
+
+        let mut bound_variant: Option<MaterialVariant> = None;
+        let mut bound_mesh: Option<MeshHandle> = None;
+        // `None` here means "nothing bound yet", which is distinct from
+        // `Some(None)` — the default 1×1 group being bound on purpose.
+        let mut bound_texture: Option<Option<texture::TextureHandle>> = None;
+        for run in runs {
+            let Some(gpu) = self.meshes.get(run.mesh) else {
+                continue; // Geometry the library could not supply; warned about above.
+            };
+            if bound_variant != Some(run.variant) {
+                let pipeline = self
+                    .pipelines
+                    .get(&run.variant)
+                    .expect("variant compiled above");
+                pass.set_pipeline(pipeline);
+                bound_variant = Some(run.variant);
+            }
+            // Group 2 is in the layout for every variant, so it is bound for
+            // every draw — the sort order (texture is the second key)
+            // collapses that to one set per texture per frame.
+            let wanted = run
+                .texture
+                .filter(|handle| self.textures.contains(*handle));
+            if bound_texture != Some(wanted) {
+                let group = match wanted {
+                    Some(handle) => {
+                        &self.textures.get(handle).expect("filtered above").bind_group
+                    }
+                    None => self.textures.default_bind_group(),
+                };
+                pass.set_bind_group(2, group, &[]);
+                bound_texture = Some(wanted);
+            }
+            if bound_mesh != Some(run.mesh) {
+                pass.set_vertex_buffer(0, gpu.vertices.slice(..));
+                pass.set_index_buffer(gpu.indices.slice(..), wgpu::IndexFormat::Uint32);
+                bound_mesh = Some(run.mesh);
+            }
+            pass.draw_indexed(0..gpu.index_count, 0, run.first..run.first + run.count);
+            issued += 1;
+        }
+        issued
+    }
+
     /// `width`/`height` are the **render** target's, not the host view's — see
     /// [`FrameUniform::viewport`].
     fn write_frame_uniform(&mut self, frame: &FrameParams, width: u32, height: u32) {
+        let uniform = self.frame_uniform(frame, width, height, self.phase);
+        self.queue
+            .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    /// The frame block itself, as a value — so the main frame and an offscreen
+    /// scene target can each write their own copy into their own buffer.
+    ///
+    /// `phase` is a parameter rather than `self.phase` because the screen-space
+    /// circle belongs to the *screen*: a second camera looking at a second world
+    /// has no reason to inherit a circle aimed at the host's view, and
+    /// inheriting one would make a demo viewport's geometry vanish because
+    /// something happened on the HUD behind it.
+    fn frame_uniform(
+        &self,
+        frame: &FrameParams,
+        width: u32,
+        height: u32,
+        phase: [f32; 4],
+    ) -> FrameUniform {
         let light = frame.lighting;
         let (w, h) = (width.max(1) as f32, height.max(1) as f32);
-        let uniform = FrameUniform {
+        FrameUniform {
             view_proj: frame.view_proj.to_cols_array_2d(),
             inv_view_proj: frame.view_proj.inverse().to_cols_array_2d(),
             light_dir: light.key_dir.extend(0.0).to_array(),
@@ -1166,13 +1545,11 @@ impl Renderer {
             sky_color: light.sky_color.extend(0.0).to_array(),
             ground_color: light.ground_color.extend(0.0).to_array(),
             horizon_color: light.horizon().extend(0.0).to_array(),
-            phase: self.phase,
+            phase,
             time: self.time,
             viewport: [w, h, 1.0 / w, 1.0 / h],
             sky_params: [light.clouds, light.sun, 0.0, 0.0],
-        };
-        self.queue
-            .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&uniform));
+        }
     }
 
     /// Turn the caller's sorted list into this frame's *visible* list and the
@@ -1196,7 +1573,7 @@ impl Renderer {
     /// streams — the determinism claim survives intact, with fewer commands in
     /// it.
     ///
-    /// Returns the frame's [`DrawStats`](draw::DrawStats) with everything but
+    /// Returns the frame's [`DrawStats`] with everything but
     /// `draws` filled in — that one is the pass's to count.
     fn prepare_frame(
         &self,

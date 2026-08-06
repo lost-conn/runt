@@ -109,7 +109,7 @@ impl Rig {
         // fringe and *nothing here*, and a frame that changed with it would
         // mean the screen effect had picked up `phase.w` by accident.
         self.renderer.set_phase_fx(center, radius, 1.0);
-        self.renderer.set_ui_batch(hud, None);
+        self.renderer.set_ui_quads(hud, None);
         self.renderer.render_scaled(
             &self.view,
             WIDTH,

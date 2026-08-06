@@ -258,11 +258,10 @@ impl Engine {
         // and a world that says nothing draws no UI pass at all. A world with
         // no `UiBatch` in it (a hand-built one, an older host) is the same
         // case as an empty batch.
-        let (quads, atlas) = match self.sim.world().get_resource::<crate::ui::UiBatch>() {
-            Some(batch) => (batch.quads.as_slice(), batch.atlas),
-            None => (&[][..], None),
-        };
-        self.renderer.set_ui_batch(quads, atlas);
+        match self.sim.world().get_resource::<crate::ui::UiBatch>() {
+            Some(batch) => self.renderer.set_ui_batch(batch),
+            None => self.renderer.set_ui_quads(&[], None),
+        }
 
         // …and the atlas those quads sample, if the game drew one itself
         // (`ui::UiAtlasImage`). Uploaded on the first frame it is present and
@@ -333,6 +332,64 @@ impl Engine {
             self.sim.mesh_library(),
             self.sim.texture_library(),
         );
+    }
+
+    /// Draw **another** [`Sim`]'s scene into an offscreen texture, and return
+    /// the handle a UI quad samples it by (see
+    /// [`RenderTarget`](crate::RenderTarget)).
+    ///
+    /// [`render`](Engine::render) for a second world, minus everything that
+    /// belongs to the screen rather than to a scene: no HUD is mirrored, no
+    /// [`Viewport`](crate::ecs::Viewport) is written back, no
+    /// [`PhaseFx`](crate::ecs::PhaseFx) is projected, no render scale is
+    /// applied. What is left is the part a viewport is: aspect from the
+    /// target's own size, the demo world's camera, the demo world's draw list.
+    ///
+    /// # Why the demo world is a whole second `Sim`
+    ///
+    /// It has its own tick clock, its own entities and its own libraries, so a
+    /// tutorial card can run a scripted loop while the game is paused — and,
+    /// more importantly, nothing it does can reach the game's world. Godot's
+    /// `SubViewport` with `own_world_3d` is the same decision. The renderer is
+    /// shared, and safely so, because every handle in it is content-addressed:
+    /// two worlds that generated the same cube share one upload and two that
+    /// did not cannot collide (see [`RenderTarget`](crate::RenderTarget)).
+    ///
+    /// The demo `Sim` is the caller's to own and to [`update`](Sim::update);
+    /// this only draws it. `&mut` because building a draw list caches a query
+    /// in the world, which is what makes doing it every frame cheap.
+    pub fn render_to_texture(
+        &mut self,
+        target: crate::RenderTarget,
+        sim: &mut Sim,
+        width: u32,
+        height: u32,
+    ) -> crate::texture::TextureHandle {
+        let (width, height) = (width.max(1), height.max(1));
+        let aspect = width as f32 / height as f32;
+        // A world with no camera still draws its sky and nothing else, exactly
+        // as `render` does with the game's world: a viewport that is briefly
+        // empty beats one full of geometry projected through an identity
+        // matrix. No warning, unlike `render` — the demo world is the caller's,
+        // and a card that has not spawned its camera yet is a state a tutorial
+        // legitimately passes through.
+        let (frame, draws) = match sim.frame_params(aspect) {
+            Some(frame) => {
+                let draws = sim.draw_list();
+                (frame, draws)
+            }
+            None => (crate::FrameParams::default(), Vec::new()),
+        };
+        self.renderer.render_to_texture(
+            target,
+            width,
+            height,
+            &frame,
+            &draws,
+            sim.mesh_library(),
+            sim.texture_library(),
+        );
+        target.handle()
     }
 
     // -- accessors ----------------------------------------------------------

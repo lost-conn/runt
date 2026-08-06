@@ -426,8 +426,18 @@ impl TextureSpec {
     }
 
     /// The bake's cache key: the spec plus the resolution it was baked at.
+    ///
+    /// The top bit is cleared on the way out, which is the one place the
+    /// content-addressed half of the handle space is *defined* to be 63 bits
+    /// wide. Everything above it belongs to the engine (see
+    /// [`TextureHandle::RESERVED_BIT`]) — an offscreen scene target has to be
+    /// nameable by a `TextureHandle` too, and "improbable" is not the same
+    /// claim as "impossible". Losing one bit of a 64-bit hash costs nothing
+    /// measurable: the birthday bound over a scene's few hundred textures is
+    /// still astronomically far from 2⁶³.
     pub fn content_key(&self, resolution: u32) -> u64 {
-        crate::gen::fnv(self.param_key(), &resolution.to_le_bytes())
+        let key = crate::gen::fnv(self.param_key(), &resolution.to_le_bytes());
+        key & !TextureHandle::RESERVED_BIT
     }
 
     // -- resolution ---------------------------------------------------------
@@ -847,8 +857,50 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 /// The texture-side twin of [`MeshHandle`](crate::registry::MeshHandle) — equal
 /// handles mean "the same pixels", so two materials naming the same spec at the
 /// same resolution share one GPU texture without anyone arranging it.
+///
+/// # Two halves of the handle space
+///
+/// Content addressing answers "is this the same pixels?" for anything a
+/// *generator* produced. It cannot answer it for pixels that are produced by
+/// rendering — an offscreen scene target's contents change every frame, so its
+/// identity has to be a name rather than a hash. Those live in the top half:
+///
+/// - **bit 63 clear** — content-addressed. `content_key` masks the bit off, so
+///   this is a definition rather than a hope.
+/// - **bit 63 set** — engine-allocated ([`RESERVED_BIT`]). Today the only
+///   inhabitant is [`render_target`], the colour texture of a
+///   [`RenderTarget`](crate::RenderTarget); bits 32–62 are free for whatever
+///   kind comes next.
+///
+/// A game choosing its own handle for a
+/// [`UiAtlasImage`](crate::ui::UiAtlasImage) must therefore leave bit 63 alone.
+/// That is the one rule this split imposes on the outside world, and it is the
+/// price of two worlds' textures being safe to hold in one registry.
+///
+/// [`RESERVED_BIT`]: TextureHandle::RESERVED_BIT
+/// [`render_target`]: TextureHandle::render_target
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TextureHandle(pub u64);
+
+impl TextureHandle {
+    /// The bit that separates engine-allocated handles from content hashes —
+    /// see the type's docs.
+    pub const RESERVED_BIT: u64 = 1 << 63;
+
+    /// The handle an offscreen scene target with this id is registered under.
+    ///
+    /// Stable and pure: the same id always names the same handle, on every
+    /// run and in both worlds, so a game can write it down at build time.
+    pub const fn render_target(id: u32) -> TextureHandle {
+        TextureHandle(TextureHandle::RESERVED_BIT | id as u64)
+    }
+
+    /// Whether this handle is the engine's rather than some content's. Nothing
+    /// a bake or a `TextureLibrary` produces can answer `true`.
+    pub const fn is_reserved(self) -> bool {
+        self.0 & TextureHandle::RESERVED_BIT != 0
+    }
+}
 
 /// Handle → the spec (and resolution) that produced it, as a world resource.
 ///
@@ -1150,6 +1202,34 @@ mod tests {
         let mut other = grass();
         other.seed_offset = 4.0;
         assert_ne!(spec.param_key(), other.param_key());
+    }
+
+    #[test]
+    fn the_reserved_half_of_the_handle_space_is_unreachable_by_content() {
+        // Not "unlikely": the mask is what makes it a proof. Swept over enough
+        // specs and resolutions that a mask applied to only one branch of
+        // `content_key` would show up here.
+        for seed in 0..64 {
+            let mut spec = grass();
+            spec.seed_offset = seed as f32;
+            for resolution in [16, 64, 512, 1024] {
+                let handle = TextureHandle(spec.content_key(resolution));
+                assert!(
+                    !handle.is_reserved(),
+                    "content key {:#018x} landed in the engine's half",
+                    handle.0
+                );
+            }
+        }
+
+        // …and the engine's own names are all on the other side of the line,
+        // whatever id they carry.
+        assert!(TextureHandle::render_target(0).is_reserved());
+        assert!(TextureHandle::render_target(u32::MAX).is_reserved());
+        assert_ne!(
+            TextureHandle::render_target(0),
+            TextureHandle::render_target(1)
+        );
     }
 
     #[test]

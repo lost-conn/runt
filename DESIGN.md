@@ -156,7 +156,8 @@ one action produce one press instead of two.
   render-graph framework; a hand-rolled ordered pass list is enough at this
   scale, forever.
 - **Camera:** a `Camera` component (projection params) + host-fed viewport
-  size. Engine renders exactly one camera per `render()` call v1.
+  size. Engine renders exactly one camera per `render()` call — and, since
+  2026-08-06, one more per `render_to_texture()` call (see below).
 - **Limits:** everything above fits `downlevel_webgl2_defaults()`. Compute,
   storage buffers, and texture arrays live behind the capability gate.
 
@@ -194,6 +195,40 @@ port).** Both were written above as "later" and both are now the only path.
   ~0.24 ms of CPU (~48 ns/instance) against a ~1 ms budget. Both filters and the
   coalescer are pure functions of (list, camera, transforms), so the command
   stream is as reproducible as it was — there is simply less of it.
+
+**Render-to-texture: a second camera, a second world (2026-08-06, for the
+port's tutorial cards).** "Exactly one camera per `render()` call" is still
+true; there is now a second call.
+
+- **`Renderer::render_to_texture(RenderTarget, w, h, frame, draws, libs)`**
+  draws a scene into an offscreen colour+depth target through the *same*
+  `encode_scene` the host frame uses — same cull, same sort, same instancing,
+  same sky, same pipeline cache (the target carries `target_format`, which is
+  what lets one cache serve both). What it deliberately leaves out is
+  everything belonging to the *screen* rather than to a scene: no UI pass, no
+  render scale, no fullscreen pass, and the phase circle written at rest.
+- **`Engine::render_to_texture(target, &mut Sim, w, h)`** is that call for a
+  whole second `Sim` — its own `World`, its own clock, its own libraries, like
+  Godot's `SubViewport` with `own_world_3d`. Two worlds are safe to share one
+  renderer *because* §5's registries are content-addressed: identical geometry
+  in two worlds is one upload by construction, and different geometry cannot
+  collide. The only non-content identity — the target's own — lives in a
+  reserved half of the `TextureHandle` space (bit 63, which `content_key`
+  masks off), so "impossible" rather than "improbable".
+- **The frame block is per target.** `queue.write_buffer` is ordered against
+  *submissions*, not against passes inside one, so a second camera writing the
+  one frame uniform would be seen by whichever pass ran last. Each target owns
+  a uniform buffer and each render is its own submission; the instance buffer
+  is shared and safe on the second property alone.
+- **The UI batch can name a texture per run.** A viewport is sampled by an
+  ordinary `UiQuad`, so `UiBatch` gained texture *runs*
+  (`set_texture`) — consecutive spans, never sorted, one instanced draw each.
+  A batch that never switches is one run and encodes the commands it always
+  did. That is the whole of §13's "one atlas per batch" being relaxed: the
+  atlas is still the default, and runs are the exception a demo card needs.
+- **Cost when unused:** nothing. No target, no allocation; a HUD with no runs
+  is the same single draw; a frame with no offscreen pass is byte-identical
+  (`tests/render_to_texture.rs`, and E2's golden hash in `tests/ui.rs`).
 
 ## 6. Content pipeline — params → cache → GPU
 
