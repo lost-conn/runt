@@ -46,7 +46,7 @@ use bevy_ecs::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::ecs::TickCount;
-use crate::input::{Input, InputEvent, MOUSE_BUTTONS};
+use crate::input::{Input, InputEvent, TouchPhase, MOUSE_BUTTONS};
 
 /// One event, and the tick it belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -148,10 +148,11 @@ impl std::error::Error for TraceError {}
 /// The events are re-derived from [`Input`]'s edge sets and analog accumulators
 /// in a fixed order — keys in [`Key::ALL`] order, then mouse buttons, then
 /// motion, then the wheel, then the drive stick, then the pad (buttons in
-/// [`PadButton::ALL`](crate::input::PadButton::ALL) order, sticks, triggers) —
-/// so the encoding of a tick is a pure function of that
-/// tick's `Input` and does not depend on how the host happened to interleave its
-/// pushes. Within one key or button, order is *not* free:
+/// [`PadButton::ALL`](crate::input::PadButton::ALL) order, sticks, triggers),
+/// then the touches (see [`record_touches`]) — so the encoding of a tick is a
+/// pure function of that tick's `Input` and does not depend on how the host
+/// happened to interleave its pushes. Within one key or button, order is *not*
+/// free:
 ///
 /// | edges seen | held after | emitted |
 /// |---|---|---|
@@ -170,10 +171,11 @@ impl std::error::Error for TraceError {}
 ///
 /// [`InputEvent::FocusLost`] is never written out, because by the time this runs
 /// it has already become ordinary state: the keys it dropped appear as `KeyUp`s,
-/// the pad buttons as released `PadButton`s, and the sticks and triggers it
-/// centred as zeroed `TouchDrive`/`PadStick`/`PadTrigger`s. Replaying those
-/// reproduces the tick exactly, which is the property that matters — the trace
-/// records what the tick *saw*, not what the window manager did.
+/// the pad buttons as released `PadButton`s, the fingers it dropped as ended
+/// `Touch`es, and the sticks and triggers it centred as zeroed
+/// `TouchDrive`/`PadStick`/`PadTrigger`s. Replaying those reproduces the tick
+/// exactly, which is the property that matters — the trace records what the tick
+/// *saw*, not what the window manager did.
 pub fn record(mut trace: ResMut<InputTrace>, tick: Res<TickCount>, input: Res<Input>) {
     let now = tick.0;
     for key in crate::input::Key::ALL {
@@ -285,6 +287,58 @@ pub fn record(mut trace: ResMut<InputTrace>, tick: Res<TickCount>, input: Res<In
                     value: input.trigger(trigger),
                 },
             );
+        }
+    }
+    record_touches(&mut trace, now, &input);
+}
+
+/// The touch half of [`record`], split out because it is four passes and a
+/// reason.
+///
+/// A finger is neither an edge like a key nor a level like a stick: it is a
+/// *membership* with a position. So the tick is written as the three things that
+/// can have happened to the live set — arrivals, motions, departures — in four
+/// passes, whose order is what replays into the state the tick actually had:
+///
+/// 1. departures of ids that are **still live**,
+/// 2. arrivals,
+/// 3. motions of live touches that moved,
+/// 4. departures of ids that are **not** live.
+///
+/// Splitting the departures is the same problem the key table solves. An id in
+/// both the started and the ended list is either a tap inside one tick (not live
+/// afterwards → `Started` then `Ended`) or a platform recycling a contact number
+/// onto a new finger inside one tick (live afterwards → the old one's `Ended`
+/// must go out *first*, or the replay would end the finger that just arrived and
+/// quietly lose it for the rest of the run).
+///
+/// Only touches that moved are written, for the reason the sticks are written
+/// only when they change: ten fingers resting on the glass must not cost ten
+/// events a tick. A focus loss, as everywhere else here, is never written as
+/// itself — it comes back as the departures it caused.
+fn record_touches(trace: &mut InputTrace, now: u64, input: &Input) {
+    let event = |touch: crate::input::Touch, phase| InputEvent::Touch {
+        id: touch.id,
+        phase,
+        x: touch.pos.x,
+        y: touch.pos.y,
+    };
+    for touch in input.touches_ended() {
+        if input.touch(touch.id).is_some() {
+            trace.push(now, event(touch, TouchPhase::Ended));
+        }
+    }
+    for touch in input.touches_started() {
+        trace.push(now, event(touch, TouchPhase::Started));
+    }
+    for touch in input.touches() {
+        if input.touch_moved(touch.id) {
+            trace.push(now, event(touch, TouchPhase::Moved));
+        }
+    }
+    for touch in input.touches_ended() {
+        if input.touch(touch.id).is_none() {
+            trace.push(now, event(touch, TouchPhase::Ended));
         }
     }
 }

@@ -351,6 +351,213 @@ mod padbuttonset {
 pub use padbuttonset::PadButtonSet;
 
 // ---------------------------------------------------------------------------
+// Touch
+// ---------------------------------------------------------------------------
+
+/// What just happened to one finger.
+///
+/// A mirror of winit's `TouchPhase` (and of the browser's
+/// `touchstart`/`touchmove`/`touchend`/`touchcancel`) rather than a re-export of
+/// either: DESIGN §2 says the engine never sees a host type, and a winit
+/// dependency here would drag a windowing library into every replay, every
+/// headless test and the editor.
+///
+/// Postcard encodes a unit variant as its **index**, so append rather than
+/// insert (see [`Key`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum TouchPhase {
+    Started,
+    Moved,
+    Ended,
+    /// The system took the finger away — a gesture recogniser claimed it, the
+    /// screen locked, the browser decided the page was scrolling. [`Input`]
+    /// treats it exactly as [`TouchPhase::Ended`]; see
+    /// [`Input::touches_ended`].
+    Cancelled,
+}
+
+/// One finger, as a `FixedSim` system sees it.
+///
+/// `pos` is in **logical pixels, top-left origin, +Y down** — the coordinate
+/// system every windowing system reports touches in, and the one
+/// [`UiBatch`](crate::ui::UiBatch) already lays HUD rectangles out in. Nothing
+/// flips it on the way through, because the question a touch game asks is "is
+/// this finger inside the button I drew?", and the button is in screen space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Touch {
+    /// The host's identifier for this contact.
+    ///
+    /// Opaque, and unique only among *live* touches: a platform is free to hand
+    /// the same number to the next finger once this one lifts. A game that
+    /// remembers an id across ticks must drop it when the touch ends (that is
+    /// what [`Input::touches_ended`] is for) rather than assume ids never
+    /// repeat.
+    pub id: u64,
+    /// Where the finger is now, or — for a touch in
+    /// [`Input::touches_started`] / [`Input::touches_ended`] — where it landed
+    /// or was last seen.
+    pub pos: Vec2,
+}
+
+/// How many simultaneous fingers the engine will track.
+///
+/// Ten is every hand a player has and more contacts than most panels report.
+/// The cap exists so [`Input`] stays a fixed-size, allocation-free value —
+/// [`crate::trace::apply`] clones it every replayed tick — and so a host with a
+/// runaway digitiser cannot grow sim state without bound. Touches past the cap
+/// are dropped on arrival, which a trace then reproduces exactly, because the
+/// trace is recorded from `Input` and `Input` never saw them.
+pub const MAX_TOUCHES: usize = 10;
+
+/// A fixed-capacity list of [`Touch`]es in arrival order.
+///
+/// Arrival order rather than id order, and an array rather than a `Vec`, for the
+/// two reasons that run through this file: iteration has to be deterministic
+/// (DESIGN §3 — and id order would reshuffle a gesture the moment a platform
+/// recycled a number), and [`Input`] has to stay allocation-free because replay
+/// clones it per tick.
+mod touchlist {
+    use super::{Touch, MAX_TOUCHES};
+    use glam::Vec2;
+
+    /// A live touch plus the one bit the recorder needs: whether this tick
+    /// moved it. Kept beside the position rather than in a parallel array so a
+    /// removal cannot desynchronise the two.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Slot {
+        touch: Touch,
+        moved: bool,
+    }
+
+    const EMPTY: Slot = Slot {
+        touch: Touch {
+            id: 0,
+            pos: Vec2::ZERO,
+        },
+        moved: false,
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct TouchList {
+        slots: [Slot; MAX_TOUCHES],
+        len: u8,
+    }
+
+    impl Default for TouchList {
+        fn default() -> TouchList {
+            TouchList::new()
+        }
+    }
+
+    impl TouchList {
+        #[inline]
+        pub const fn new() -> TouchList {
+            TouchList {
+                slots: [EMPTY; MAX_TOUCHES],
+                len: 0,
+            }
+        }
+
+        /// Append `touch`. `false` when the list is full — see [`MAX_TOUCHES`].
+        pub fn push(&mut self, touch: Touch) -> bool {
+            if self.len as usize >= MAX_TOUCHES {
+                return false;
+            }
+            self.slots[self.len as usize] = Slot {
+                touch,
+                moved: false,
+            };
+            self.len += 1;
+            true
+        }
+
+        pub fn get(&self, id: u64) -> Option<Touch> {
+            self.slice()
+                .iter()
+                .find(|s| s.touch.id == id)
+                .map(|s| s.touch)
+        }
+
+        /// Move a live touch. `false` when no touch has that id — a host
+        /// reporting motion for a finger that already lifted is ignored rather
+        /// than resurrecting it.
+        ///
+        /// A move to where the touch already was is not a move: the `moved` flag
+        /// is what keeps a finger resting still from writing an event into the
+        /// trace every tick, exactly as the drive stick's change flag does.
+        pub fn set_pos(&mut self, id: u64, pos: Vec2) -> bool {
+            let Some(slot) = self.slice_mut().iter_mut().find(|s| s.touch.id == id) else {
+                return false;
+            };
+            if slot.touch.pos != pos {
+                slot.touch.pos = pos;
+                slot.moved = true;
+            }
+            true
+        }
+
+        /// Remove the touch with `id`, returning it with its last position.
+        /// Order among the survivors is preserved (`remove`, not `swap_remove`)
+        /// because arrival order is the thing this list promises.
+        pub fn remove(&mut self, id: u64) -> Option<Touch> {
+            let at = self.slice().iter().position(|s| s.touch.id == id)?;
+            let touch = self.slots[at].touch;
+            for i in at..self.len as usize - 1 {
+                self.slots[i] = self.slots[i + 1];
+            }
+            self.len -= 1;
+            Some(touch)
+        }
+
+        /// Whether this tick moved the touch with `id`.
+        pub fn moved(&self, id: u64) -> bool {
+            self.slice()
+                .iter()
+                .find(|s| s.touch.id == id)
+                .is_some_and(|s| s.moved)
+        }
+
+        pub fn clear_moved(&mut self) {
+            for slot in self.slice_mut() {
+                slot.moved = false;
+            }
+        }
+
+        pub fn clear(&mut self) {
+            self.len = 0;
+        }
+
+        #[inline]
+        pub fn len(&self) -> usize {
+            self.len as usize
+        }
+
+        #[inline]
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        /// Touches in arrival order.
+        pub fn iter(&self) -> impl Iterator<Item = Touch> + '_ {
+            self.slice().iter().map(|s| s.touch)
+        }
+
+        #[inline]
+        fn slice(&self) -> &[Slot] {
+            &self.slots[..self.len as usize]
+        }
+
+        #[inline]
+        fn slice_mut(&mut self) -> &mut [Slot] {
+            &mut self.slots[..self.len as usize]
+        }
+    }
+}
+
+pub use touchlist::TouchList;
+
+// ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
 
@@ -419,6 +626,28 @@ pub enum InputEvent {
     /// **A level, not an edge**, on the same terms as [`InputEvent::PadStick`]
     /// and [`InputEvent::TouchDrive`]. See [`Input::trigger`].
     PadTrigger { trigger: PadTrigger, value: f32 },
+    /// One finger, raw: the host's contact id, what just happened to it, and
+    /// where it is in **logical pixels, top-left origin, +Y down** (see
+    /// [`Touch`]).
+    ///
+    /// Deliberately *not* a replacement for [`InputEvent::TouchDrive`], and
+    /// deliberately not exclusive with it. `TouchDrive` is one host-synthesised
+    /// stick, which is all a one-thumb game ever wanted; this is every contact,
+    /// which is what a game that draws its own dpad, button grid and camera drag
+    /// needs — and it needs them *simultaneously*, which no single collapsed
+    /// value can express. A host may emit both (the default) because a game that
+    /// reads only `drive()` is unaffected by touches it never looks at; a game
+    /// that builds gestures out of these turns the synthesis off so the two
+    /// paths cannot double-drive the same finger.
+    ///
+    /// **Edges, not a level** — unlike the sticks. The engine keeps the live set
+    /// (see [`Input::touches`]); each event is one change to it.
+    Touch {
+        id: u64,
+        phase: TouchPhase,
+        x: f32,
+        y: f32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +682,15 @@ pub struct Input {
     /// Indexed by [`PadTrigger::index`]; see `sticks`.
     triggers: [f32; PadTrigger::COUNT],
     triggers_changed: [bool; PadTrigger::COUNT],
+    /// Fingers currently on the glass, in arrival order. Level state, like
+    /// `held`: a finger that does not move stays exactly where it was.
+    touches: TouchList,
+    /// The two per-tick edge lists, cleared in [`Input::begin_tick`] like the
+    /// key edge sets. A tap that lands and lifts inside one tick appears in
+    /// both and in `touches` in neither, which is the whole reason they are
+    /// separate lists rather than a phase tag on a live touch.
+    touches_started: TouchList,
+    touches_ended: TouchList,
 }
 
 impl Input {
@@ -475,6 +713,9 @@ impl Input {
             sticks_changed: [false; PadStick::COUNT],
             triggers: [0.0; PadTrigger::COUNT],
             triggers_changed: [false; PadTrigger::COUNT],
+            touches: TouchList::new(),
+            touches_started: TouchList::new(),
+            touches_ended: TouchList::new(),
         }
     }
 
@@ -496,6 +737,9 @@ impl Input {
         self.pad_released.clear();
         self.sticks_changed = [false; PadStick::COUNT];
         self.triggers_changed = [false; PadTrigger::COUNT];
+        self.touches_started.clear();
+        self.touches_ended.clear();
+        self.touches.clear_moved();
 
         for ev in events {
             match ev {
@@ -549,6 +793,9 @@ impl Input {
                 // and it stands until something replaces it.
                 InputEvent::PadStick { stick, dir } => self.set_stick(stick, dir),
                 InputEvent::PadTrigger { trigger, value } => self.set_trigger(trigger, value),
+                InputEvent::Touch { id, phase, x, y } => {
+                    self.apply_touch(id, phase, Vec2::new(x, y))
+                }
             }
         }
     }
@@ -578,6 +825,59 @@ impl Input {
         }
         for trigger in PadTrigger::ALL {
             self.set_trigger(trigger, 0.0);
+        }
+        // Every finger ends too, for the same reason a key is released: the
+        // `Ended` the host would have delivered is never coming, and a dpad
+        // holding a direction because the tab went to the background is the
+        // touch version of the ball rolling into the sunset. It is a cancel
+        // rather than a lift, and `Input` does not distinguish the two (see
+        // [`Input::touches_ended`]), so the touch simply leaves.
+        for touch in self.touches.iter() {
+            self.touches_ended.push(touch);
+        }
+        self.touches.clear();
+    }
+
+    /// Apply one raw touch event to the live set.
+    ///
+    /// Non-finite coordinates are *ignored* rather than zeroed, unlike the
+    /// sticks: zero is a real position (the top-left corner, where a game may
+    /// well have put a button), so a host reporting NaN must not be able to
+    /// place a finger there. A `Started` at NaN never becomes a touch at all; a
+    /// `Moved` to NaN leaves the finger where it was; an `Ended` at NaN still
+    /// ends the finger, at its last known position.
+    fn apply_touch(&mut self, id: u64, phase: TouchPhase, pos: Vec2) {
+        match phase {
+            TouchPhase::Started => {
+                if !pos.is_finite() {
+                    return;
+                }
+                // A host re-announcing a live id is a move, not a second
+                // finger — the same doctrine that keeps key auto-repeat from
+                // re-firing `just_pressed`.
+                if self.touches.set_pos(id, pos) {
+                    return;
+                }
+                let touch = Touch { id, pos };
+                // Past [`MAX_TOUCHES`] the finger does not exist as far as the
+                // sim is concerned, so it must not get a start edge either.
+                if self.touches.push(touch) {
+                    self.touches_started.push(touch);
+                }
+            }
+            TouchPhase::Moved => {
+                if pos.is_finite() {
+                    self.touches.set_pos(id, pos);
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                if pos.is_finite() {
+                    self.touches.set_pos(id, pos);
+                }
+                if let Some(touch) = self.touches.remove(id) {
+                    self.touches_ended.push(touch);
+                }
+            }
         }
     }
 
@@ -770,6 +1070,80 @@ impl Input {
     #[inline]
     pub fn trigger_changed(&self, trigger: PadTrigger) -> bool {
         self.triggers_changed[trigger.index()]
+    }
+
+    /// Every finger on the glass, in arrival order (oldest first).
+    ///
+    /// Level state, like [`held`](Input::held): a finger that does not move
+    /// stays exactly where it was, tick after tick, until it lifts. Arrival
+    /// order is deterministic and is what a trace reproduces — a game may rely
+    /// on "the first one down is first" and get the same answer on replay.
+    ///
+    /// This is raw contact data on purpose. Everything a touch *game* wants —
+    /// a floating dpad, a chorded button grid, a camera drag, all three at once
+    /// under different fingers — is a policy over this set, and policy belongs
+    /// to the game (the one built-in exception is the host's optional virtual
+    /// stick, which arrives separately as [`drive`](Input::drive)).
+    pub fn touches(&self) -> impl Iterator<Item = Touch> + '_ {
+        self.touches.iter()
+    }
+
+    /// The live touch with this id, if it is still down. What a game that
+    /// latched onto a finger last tick calls to find out where it went.
+    #[inline]
+    pub fn touch(&self, id: u64) -> Option<Touch> {
+        self.touches.get(id)
+    }
+
+    /// How many fingers are down, `0..=`[`MAX_TOUCHES`].
+    #[inline]
+    pub fn touch_count(&self) -> usize {
+        self.touches.len()
+    }
+
+    #[inline]
+    pub fn any_touch(&self) -> bool {
+        !self.touches.is_empty()
+    }
+
+    /// Fingers that landed *this tick*, at the position they landed on — a
+    /// per-tick edge list, like [`just_pressed_keys`](Input::just_pressed_keys).
+    ///
+    /// A tap that lands and lifts inside one tick appears here **and** in
+    /// [`touches_ended`](Input::touches_ended) while never appearing in
+    /// [`touches`](Input::touches), so a button grid polled once per tick cannot
+    /// miss a fast stab.
+    pub fn touches_started(&self) -> impl Iterator<Item = Touch> + '_ {
+        self.touches_started.iter()
+    }
+
+    /// Fingers that left *this tick*, at the last position they were seen.
+    ///
+    /// A lift, a system cancel and a focus loss all arrive here identically.
+    /// They are not distinguished because nothing a game does with a released
+    /// finger differs between them — every one of them means "that gesture is
+    /// over" — and collapsing them keeps `Input` (and therefore the trace) a
+    /// record of what the tick *saw* rather than of what the window manager did.
+    pub fn touches_ended(&self) -> impl Iterator<Item = Touch> + '_ {
+        self.touches_ended.iter()
+    }
+
+    /// The touch with this id if it ended this tick, at its last position.
+    ///
+    /// The counterpart to [`touch`](Input::touch) for a game holding an id: one
+    /// call answers "is my finger gone, and where did it let go?".
+    #[inline]
+    pub fn touch_ended(&self, id: u64) -> Option<Touch> {
+        self.touches_ended.get(id)
+    }
+
+    /// Whether this tick moved the live touch with `id`.
+    ///
+    /// What the trace recorder keys on, so a finger resting still costs nothing
+    /// per tick — the same trick as [`drive_changed`](Input::drive_changed).
+    #[inline]
+    pub fn touch_moved(&self, id: u64) -> bool {
+        self.touches.moved(id)
     }
 }
 
@@ -1163,6 +1537,236 @@ mod tests {
         assert!(input.pad_just_pressed(PadButton::Start));
         assert!(input.pad_just_released(PadButton::Start));
         assert!(!input.pad_held(PadButton::Start));
+    }
+
+    // -- touch ---------------------------------------------------------------
+
+    /// Shorthand for the raw event, which is otherwise four fields of noise.
+    fn touch(id: u64, phase: TouchPhase, x: f32, y: f32) -> InputEvent {
+        InputEvent::Touch { id, phase, x, y }
+    }
+
+    #[test]
+    fn a_finger_is_a_level_with_edges_at_both_ends() {
+        let mut input = Input::new();
+        assert_eq!(input.touch_count(), 0);
+        assert!(!input.any_touch());
+
+        input.begin_tick([touch(4, TouchPhase::Started, 10.0, 20.0)]);
+        assert_eq!(
+            input.touches().collect::<Vec<_>>(),
+            vec![Touch {
+                id: 4,
+                pos: Vec2::new(10.0, 20.0)
+            }]
+        );
+        assert_eq!(input.touches_started().count(), 1);
+        assert_eq!(input.touches_ended().count(), 0);
+        assert!(
+            !input.touch_moved(4),
+            "arriving is not moving — the start edge already carries where it landed"
+        );
+
+        // A tick with no events at all: the finger is still down, still there,
+        // and no longer a fresh arrival.
+        input.begin_tick([]);
+        assert_eq!(input.touch(4).map(|t| t.pos), Some(Vec2::new(10.0, 20.0)));
+        assert_eq!(input.touches_started().count(), 0);
+        assert!(!input.touch_moved(4), "a resting finger has not moved");
+
+        input.begin_tick([touch(4, TouchPhase::Moved, 12.0, 20.0)]);
+        assert_eq!(input.touch(4).map(|t| t.pos), Some(Vec2::new(12.0, 20.0)));
+        assert!(input.touch_moved(4));
+
+        // A move to where it already is is not a move — the same doctrine that
+        // keeps a still stick out of the trace.
+        input.begin_tick([touch(4, TouchPhase::Moved, 12.0, 20.0)]);
+        assert!(!input.touch_moved(4));
+
+        input.begin_tick([touch(4, TouchPhase::Ended, 12.0, 30.0)]);
+        assert_eq!(input.touch(4), None, "a lifted finger is not live");
+        assert_eq!(
+            input.touch_ended(4).map(|t| t.pos),
+            Some(Vec2::new(12.0, 30.0)),
+            "the end carries where it let go"
+        );
+        assert!(!input.any_touch());
+
+        // And the release is not re-announced on the tick after.
+        input.begin_tick([]);
+        assert_eq!(input.touch_ended(4), None);
+    }
+
+    #[test]
+    fn a_tap_inside_one_tick_shows_both_edges_and_no_live_finger() {
+        // A button grid polled once per tick must not miss a fast stab.
+        let mut input = Input::new();
+        input.begin_tick([
+            touch(1, TouchPhase::Started, 5.0, 5.0),
+            touch(1, TouchPhase::Ended, 5.0, 6.0),
+        ]);
+        assert_eq!(
+            input.touches_started().map(|t| t.pos).collect::<Vec<_>>(),
+            vec![Vec2::new(5.0, 5.0)],
+            "the start edge survives even though the finger is gone"
+        );
+        assert_eq!(
+            input.touches_ended().map(|t| t.pos).collect::<Vec<_>>(),
+            vec![Vec2::new(5.0, 6.0)]
+        );
+        assert_eq!(input.touch_count(), 0);
+    }
+
+    #[test]
+    fn fingers_are_independent_and_iterate_in_arrival_order() {
+        // The whole point of raw touch: a dpad thumb and a camera thumb at once,
+        // neither able to disturb the other.
+        let mut input = Input::new();
+        input.begin_tick([
+            touch(7, TouchPhase::Started, 100.0, 100.0),
+            touch(3, TouchPhase::Started, 300.0, 100.0),
+        ]);
+        assert_eq!(
+            input.touches().map(|t| t.id).collect::<Vec<_>>(),
+            vec![7, 3],
+            "arrival order, not id order — a gesture must not reshuffle"
+        );
+
+        input.begin_tick([touch(3, TouchPhase::Moved, 320.0, 140.0)]);
+        assert_eq!(input.touch(7).map(|t| t.pos), Some(Vec2::new(100.0, 100.0)));
+        assert_eq!(input.touch(3).map(|t| t.pos), Some(Vec2::new(320.0, 140.0)));
+        assert!(input.touch_moved(3) && !input.touch_moved(7));
+
+        // One lifting leaves the other exactly where it was, still first.
+        input.begin_tick([touch(3, TouchPhase::Ended, 320.0, 140.0)]);
+        assert_eq!(input.touches().map(|t| t.id).collect::<Vec<_>>(), vec![7]);
+        assert_eq!(input.touch(7).map(|t| t.pos), Some(Vec2::new(100.0, 100.0)));
+
+        // A third finger appends behind the survivor.
+        input.begin_tick([touch(9, TouchPhase::Started, 0.0, 0.0)]);
+        assert_eq!(
+            input.touches().map(|t| t.id).collect::<Vec<_>>(),
+            vec![7, 9]
+        );
+    }
+
+    #[test]
+    fn a_cancel_ends_a_finger_exactly_as_a_lift_does() {
+        let mut input = Input::new();
+        input.begin_tick([touch(2, TouchPhase::Started, 1.0, 1.0)]);
+        input.begin_tick([touch(2, TouchPhase::Cancelled, 1.0, 1.0)]);
+        assert_eq!(input.touch(2), None);
+        assert_eq!(input.touch_ended(2).map(|t| t.id), Some(2));
+    }
+
+    #[test]
+    fn focus_loss_ends_every_finger() {
+        let mut input = Input::new();
+        input.begin_tick([
+            touch(1, TouchPhase::Started, 10.0, 10.0),
+            touch(2, TouchPhase::Started, 20.0, 20.0),
+        ]);
+        assert_eq!(input.touch_count(), 2);
+
+        input.begin_tick([InputEvent::FocusLost]);
+        assert_eq!(
+            input.touch_count(),
+            0,
+            "a finger held across a focus loss would drive a dpad forever"
+        );
+        assert_eq!(
+            input.touches_ended().map(|t| t.id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "and it has to arrive as an end, or nothing is ever told to let go"
+        );
+
+        // Not re-announced afterwards, and a `Moved` for a forgotten finger
+        // cannot resurrect it.
+        input.begin_tick([touch(1, TouchPhase::Moved, 11.0, 11.0)]);
+        assert_eq!(input.touches_ended().count(), 0);
+        assert_eq!(input.touch_count(), 0);
+    }
+
+    #[test]
+    fn a_re_announced_id_is_a_move_not_a_second_finger() {
+        let mut input = Input::new();
+        input.begin_tick([
+            touch(5, TouchPhase::Started, 0.0, 0.0),
+            touch(5, TouchPhase::Started, 4.0, 0.0),
+        ]);
+        assert_eq!(input.touch_count(), 1);
+        assert_eq!(input.touches_started().count(), 1);
+        assert_eq!(input.touch(5).map(|t| t.pos), Some(Vec2::new(4.0, 0.0)));
+    }
+
+    #[test]
+    fn a_non_finite_position_never_places_a_finger() {
+        // Zero would be a *real* position — the top-left corner, where a game
+        // may well have put a button — so garbage is dropped, not zeroed.
+        let mut input = Input::new();
+        input.begin_tick([touch(1, TouchPhase::Started, f32::NAN, 0.0)]);
+        assert_eq!(input.touch_count(), 0);
+
+        input.begin_tick([
+            touch(2, TouchPhase::Started, 50.0, 50.0),
+            touch(2, TouchPhase::Moved, f32::INFINITY, 50.0),
+        ]);
+        assert_eq!(
+            input.touch(2).map(|t| t.pos),
+            Some(Vec2::new(50.0, 50.0)),
+            "a garbage move leaves the finger where it was"
+        );
+
+        // A garbage end still ends it, at the last position anyone believed.
+        input.begin_tick([touch(2, TouchPhase::Ended, f32::NAN, f32::NAN)]);
+        assert_eq!(input.touch_count(), 0);
+        assert_eq!(
+            input.touch_ended(2).map(|t| t.pos),
+            Some(Vec2::new(50.0, 50.0))
+        );
+    }
+
+    #[test]
+    fn the_live_set_is_capped_and_the_overflow_never_exists() {
+        let mut input = Input::new();
+        let events: Vec<InputEvent> = (0..MAX_TOUCHES as u64 + 3)
+            .map(|id| touch(id, TouchPhase::Started, id as f32, 0.0))
+            .collect();
+        input.begin_tick(events);
+        assert_eq!(input.touch_count(), MAX_TOUCHES);
+        assert_eq!(
+            input.touches_started().count(),
+            MAX_TOUCHES,
+            "a dropped finger must not get a start edge either"
+        );
+        // …and the ones past the cap are not there to move or to end.
+        input.begin_tick([touch(MAX_TOUCHES as u64 + 1, TouchPhase::Ended, 0.0, 0.0)]);
+        assert_eq!(input.touches_ended().count(), 0);
+        assert_eq!(input.touch_count(), MAX_TOUCHES);
+    }
+
+    #[test]
+    fn touch_and_the_drive_stick_are_separate_channels() {
+        // The host may synthesise a stick *and* forward the fingers; nothing
+        // one does may leak into the other, or a game reading both would be
+        // driven twice by one thumb.
+        let mut input = Input::new();
+        input.begin_tick([
+            touch(1, TouchPhase::Started, 10.0, 10.0),
+            InputEvent::TouchDrive {
+                dir: Vec2::new(0.0, 1.0),
+            },
+        ]);
+        assert_eq!(input.drive(), Vec2::new(0.0, 1.0));
+        assert_eq!(input.touch_count(), 1);
+
+        input.begin_tick([touch(1, TouchPhase::Moved, 10.0, 60.0)]);
+        assert_eq!(
+            input.drive(),
+            Vec2::new(0.0, 1.0),
+            "a raw finger does not move the synthesised stick"
+        );
+        assert!(!input.drive_changed());
     }
 
     #[test]

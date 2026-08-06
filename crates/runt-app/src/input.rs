@@ -5,7 +5,7 @@
 //! (winit) feed an engine that cannot tell them apart (DESIGN §2, §10).
 
 use glam::Vec2;
-use runt_core::Key;
+use runt_core::{InputEvent, Key};
 use winit::event::{MouseButton, TouchPhase};
 use winit::keyboard::KeyCode;
 
@@ -93,6 +93,58 @@ pub fn translate_button(button: MouseButton) -> u8 {
     }
 }
 
+/// Map a winit touch phase onto the engine's.
+///
+/// A one-to-one table rather than a re-export, because `runt-core` deliberately
+/// has no winit dependency (DESIGN §2): the engine's
+/// [`TouchPhase`](runt_core::TouchPhase) is its own type, and this is the seam.
+pub fn translate_touch_phase(phase: TouchPhase) -> runt_core::TouchPhase {
+    match phase {
+        TouchPhase::Started => runt_core::TouchPhase::Started,
+        TouchPhase::Moved => runt_core::TouchPhase::Moved,
+        TouchPhase::Ended => runt_core::TouchPhase::Ended,
+        TouchPhase::Cancelled => runt_core::TouchPhase::Cancelled,
+    }
+}
+
+/// Everything one host touch becomes, engine-side.
+///
+/// The first return is the raw [`InputEvent::Touch`] and it is **always**
+/// produced: every contact reaches the sim, so a game can build a floating dpad,
+/// a chorded button grid and a camera drag out of them at the same time. The
+/// second is the [`InputEvent::TouchDrive`] the virtual stick synthesised, and
+/// it exists only when the host was given a `stick` (see
+/// [`RunConfig::without_virtual_stick`](crate::RunConfig::without_virtual_stick))
+/// *and* the deflection moved enough to be worth an event.
+///
+/// Both at once is the safe default, not a compromise: a game that reads only
+/// [`Input::drive`](runt_core::Input::drive) is unaffected by touch events it
+/// never looks at, so the existing one-thumb path keeps working untouched. A
+/// game that reads the raw touches turns the synthesis off, and then the same
+/// finger cannot drive the ball twice down two paths.
+///
+/// A free function taking the stick by `Option<&mut _>` rather than a method on
+/// the host: the host owns a GPU device and cannot be built in a unit test, and
+/// this is the whole decision worth testing.
+pub fn touch_events(
+    stick: Option<&mut VirtualStick>,
+    id: u64,
+    phase: TouchPhase,
+    x: f32,
+    y: f32,
+) -> (InputEvent, Option<InputEvent>) {
+    let raw = InputEvent::Touch {
+        id,
+        phase: translate_touch_phase(phase),
+        x,
+        y,
+    };
+    let drive = stick
+        .and_then(|stick| stick.touch(id, phase, x, y))
+        .map(|dir| InputEvent::TouchDrive { dir });
+    (raw, drive)
+}
+
 // ---------------------------------------------------------------------------
 // Touch → virtual stick
 // ---------------------------------------------------------------------------
@@ -119,16 +171,19 @@ pub const STICK_EPSILON: f32 = 1.0 / 64.0;
 /// A touch screen as an analog stick: the first finger down anchors the centre,
 /// and dragging away from that anchor deflects it.
 ///
-/// This is the *whole* touch story, and it lives here — on the host side, next
-/// to the winit key table — because DESIGN §2 says a host translates events and
-/// does nothing else. The engine receives
-/// [`InputEvent::TouchDrive`](runt_core::InputEvent::TouchDrive) and cannot tell
-/// a finger from a gamepad.
+/// It lives here — on the host side, next to the winit key table — because
+/// DESIGN §2 says a host translates events and does nothing else. The engine
+/// receives [`InputEvent::TouchDrive`](runt_core::InputEvent::TouchDrive) and
+/// cannot tell a finger from a gamepad.
 ///
-/// **Multi-touch, v1:** the first finger down is the stick and every other one
-/// is ignored until it lifts. A second thumb for a camera or a jump is a
-/// deliberate addition later, not something to fall out of the id bookkeeping by
-/// accident.
+/// **One finger, on purpose:** the first one down is the stick and every other
+/// one is ignored until it lifts. That is not a limitation to lift here — a
+/// second thumb for a camera or a chord of buttons is *not* expressible as a
+/// single deflection, so it goes to the game raw, as
+/// [`InputEvent::Touch`](runt_core::InputEvent::Touch), and the game decides
+/// what a finger means. A program that does that turns this off entirely
+/// ([`RunConfig::without_virtual_stick`](crate::RunConfig::without_virtual_stick))
+/// so one thumb cannot drive both paths at once.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VirtualStick {
     /// `(finger id, anchor x, anchor y)` in logical pixels.
@@ -254,6 +309,102 @@ mod tests {
         assert_eq!(translate_button(MouseButton::Left), 0);
         assert_eq!(translate_button(MouseButton::Right), 1);
         assert_eq!(translate_button(MouseButton::Middle), 2);
+    }
+
+    #[test]
+    fn touch_phases_map_one_for_one() {
+        assert_eq!(
+            translate_touch_phase(TouchPhase::Started),
+            runt_core::TouchPhase::Started
+        );
+        assert_eq!(
+            translate_touch_phase(TouchPhase::Moved),
+            runt_core::TouchPhase::Moved
+        );
+        assert_eq!(
+            translate_touch_phase(TouchPhase::Ended),
+            runt_core::TouchPhase::Ended
+        );
+        assert_eq!(
+            translate_touch_phase(TouchPhase::Cancelled),
+            runt_core::TouchPhase::Cancelled
+        );
+    }
+
+    // -- raw touches beside the stick ---------------------------------------
+
+    #[test]
+    fn every_finger_reaches_the_engine_raw_even_the_ones_the_stick_ignores() {
+        let mut stick = VirtualStick::new();
+
+        let (raw, drive) = touch_events(Some(&mut stick), 1, TouchPhase::Started, 100.0, 100.0);
+        assert_eq!(
+            raw,
+            InputEvent::Touch {
+                id: 1,
+                phase: runt_core::TouchPhase::Started,
+                x: 100.0,
+                y: 100.0
+            }
+        );
+        assert_eq!(drive, None, "a fresh anchor is a centred stick");
+
+        // The second finger is invisible to the stick — and must not be
+        // invisible to the game, which is the entire point of the raw stream.
+        let (raw, drive) = touch_events(Some(&mut stick), 2, TouchPhase::Started, 500.0, 500.0);
+        assert_eq!(
+            raw,
+            InputEvent::Touch {
+                id: 2,
+                phase: runt_core::TouchPhase::Started,
+                x: 500.0,
+                y: 500.0
+            }
+        );
+        assert_eq!(drive, None);
+        let (raw, drive) = touch_events(Some(&mut stick), 2, TouchPhase::Moved, 500.0, 100.0);
+        assert!(matches!(raw, InputEvent::Touch { id: 2, .. }));
+        assert_eq!(drive, None, "the second finger does not drive the stick");
+
+        // The first one still does, and both events go out together.
+        let (raw, drive) = touch_events(
+            Some(&mut stick),
+            1,
+            TouchPhase::Moved,
+            100.0,
+            100.0 - STICK_RADIUS,
+        );
+        assert!(matches!(raw, InputEvent::Touch { id: 1, .. }));
+        let Some(InputEvent::TouchDrive { dir }) = drive else {
+            panic!("a full-radius drag drives the stick: {drive:?}");
+        };
+        assert!((dir.y - 1.0).abs() < 1e-5, "{dir:?}");
+    }
+
+    #[test]
+    fn without_the_virtual_stick_only_the_raw_touch_goes_out() {
+        // The switch's whole job: a game that builds its own controls must not
+        // also be driving `Input::drive` with the same thumb.
+        let script = [
+            (1u64, TouchPhase::Started, 100.0, 100.0),
+            (1, TouchPhase::Moved, 100.0, 100.0 - STICK_RADIUS),
+            (1, TouchPhase::Ended, 100.0, 40.0),
+            (2, TouchPhase::Started, 0.0, 0.0),
+            (2, TouchPhase::Cancelled, 0.0, 0.0),
+        ];
+        for (id, phase, x, y) in script {
+            let (raw, drive) = touch_events(None, id, phase, x, y);
+            assert_eq!(
+                raw,
+                InputEvent::Touch {
+                    id,
+                    phase: translate_touch_phase(phase),
+                    x,
+                    y
+                }
+            );
+            assert_eq!(drive, None, "synthesis is off: {phase:?} still drove");
+        }
     }
 
     // -- the virtual stick --------------------------------------------------

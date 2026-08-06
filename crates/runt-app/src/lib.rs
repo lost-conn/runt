@@ -162,6 +162,24 @@ pub struct RunConfig {
     /// (settings UI) and this field only answers "what should a machine that
     /// never opened the settings get?".
     pub integrated_gpu_scale: Option<f32>,
+    /// Whether the host synthesises a [`VirtualStick`](input::VirtualStick) from
+    /// the touch screen, on top of the raw
+    /// [`InputEvent::Touch`](runt_core::InputEvent::Touch)es it always forwards.
+    ///
+    /// `true` by default, which is the behaviour every existing program has: one
+    /// thumb anywhere on the glass drives
+    /// [`Input::drive`](runt_core::Input::drive), and the game needs to know
+    /// nothing about fingers. The raw events flow underneath it regardless, and
+    /// that is safe precisely because a game which does not read them cannot be
+    /// affected by them.
+    ///
+    /// A game that *does* read them — a floating dpad, a button grid, a camera
+    /// drag, all live at once under different fingers — sets this to `false`
+    /// ([`without_virtual_stick`](RunConfig::without_virtual_stick)). Otherwise
+    /// the finger driving its dpad would also be deflecting the engine's stick,
+    /// and anything still reading `drive()` would get double-driven by one
+    /// thumb.
+    pub virtual_stick: bool,
 }
 
 impl RunConfig {
@@ -177,6 +195,7 @@ impl RunConfig {
             cache_name: None,
             audio: None,
             integrated_gpu_scale: None,
+            virtual_stick: true,
         }
     }
 
@@ -250,6 +269,17 @@ impl RunConfig {
         self
     }
 
+    /// Stop synthesising the one-thumb drive stick, leaving only the raw
+    /// [`InputEvent::Touch`](runt_core::InputEvent::Touch) stream — for a game
+    /// that builds its own touch controls out of
+    /// [`Input::touches`](runt_core::Input::touches). See
+    /// [`virtual_stick`](RunConfig::virtual_stick) for why this is opt-*out*
+    /// rather than opt-in.
+    pub fn without_virtual_stick(mut self) -> RunConfig {
+        self.virtual_stick = false;
+        self
+    }
+
     /// See [`cache_name`](RunConfig::cache_name).
     pub fn with_cache_name(mut self, name: impl Into<String>) -> RunConfig {
         self.cache_name = Some(name.into());
@@ -291,8 +321,10 @@ struct Host {
     /// winit reports absolute cursor positions; the engine wants deltas.
     last_cursor: Option<(f64, f64)>,
     /// Touch screens as an analog stick (see [`input::VirtualStick`]). One per
-    /// window, because the anchor is a property of the surface being touched.
-    stick: input::VirtualStick,
+    /// window, because the anchor is a property of the surface being touched;
+    /// `None` for a game that asked for raw touches only
+    /// ([`RunConfig::without_virtual_stick`]).
+    stick: Option<input::VirtualStick>,
     /// Gamepads, or `None` where the platform has none to give (see
     /// [`gamepad::Pads`]). Polled once a frame in [`Host::render`].
     pads: Option<gamepad::Pads>,
@@ -425,7 +457,7 @@ impl Host {
             engine,
             start: web_time::Instant::now(),
             last_cursor: None,
-            stick: input::VirtualStick::new(),
+            stick: run.virtual_stick.then(input::VirtualStick::new),
             pads: gamepad::Pads::new(),
             pad_diff: gamepad::PadDiffer::new(),
             on_frame: run.on_frame,
@@ -629,15 +661,22 @@ impl Host {
                 self.engine.push_input(InputEvent::Wheel { dy });
                 true
             }
-            // Touch → virtual stick. winit delivers these on Android, iOS, Web
-            // and Windows touch screens, and the translation is identical on all
-            // of them because it happens in logical pixels.
+            // Touch. winit delivers these on Android, iOS, Web and Windows touch
+            // screens, and the translation is identical on all of them because
+            // it happens in logical pixels.
+            //
+            // Every contact is forwarded raw, always; the virtual stick is an
+            // *extra* the host may also synthesise from it (see
+            // [`input::touch_events`]).
             WindowEvent::Touch(touch) => {
                 let scale = self.window.scale_factor().max(f64::MIN_POSITIVE);
                 let x = (touch.location.x / scale) as f32;
                 let y = (touch.location.y / scale) as f32;
-                if let Some(dir) = self.stick.touch(touch.id, touch.phase, x, y) {
-                    self.engine.push_input(InputEvent::TouchDrive { dir });
+                let (raw, drive) =
+                    input::touch_events(self.stick.as_mut(), touch.id, touch.phase, x, y);
+                self.engine.push_input(raw);
+                if let Some(drive) = drive {
+                    self.engine.push_input(drive);
                 }
                 true
             }
@@ -645,12 +684,15 @@ impl Host {
             // normally arrive never will, so tell the engine to let go of
             // everything rather than leaving the ball rolling into the sunset.
             WindowEvent::Focused(false) => {
-                self.stick.reset();
+                if let Some(stick) = self.stick.as_mut() {
+                    stick.reset();
+                }
                 // `FocusLost` already drops every held pad button, centres both
-                // sticks and releases both triggers engine-side, so the differ
-                // only has to agree that it did — pushing the releases as well
-                // would double every one of them into the trace. Exactly the
-                // stance `VirtualStick::reset` takes.
+                // sticks, releases both triggers and ends every live touch
+                // engine-side, so the differ only has to agree that it did —
+                // pushing the releases as well would double every one of them
+                // into the trace. Exactly the stance `VirtualStick::reset`
+                // takes.
                 self.pad_diff.forget();
                 self.engine.push_input(InputEvent::FocusLost);
                 true
@@ -908,6 +950,27 @@ mod tests {
 
     const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
     const SIZE: u32 = 64;
+
+    /// The default has to stay "stick on", because every program written before
+    /// raw touch existed relies on one thumb driving
+    /// [`Input::drive`](runt_core::Input::drive) and none of them will be
+    /// rewritten to ask for it.
+    #[test]
+    fn the_virtual_stick_is_on_until_a_game_says_otherwise() {
+        assert!(RunConfig::engine_demo().virtual_stick);
+        assert!(RunConfig::new("t", "").virtual_stick);
+        assert!(
+            !RunConfig::engine_demo()
+                .without_virtual_stick()
+                .virtual_stick
+        );
+        // …and it composes with the other builders rather than resetting them.
+        let config = RunConfig::engine_demo()
+            .without_virtual_stick()
+            .with_quality(0.5);
+        assert!(!config.virtual_stick);
+        assert_eq!(config.quality, Some(0.5));
+    }
 
     /// What the frame hook is *for*, driven through the same sequence
     /// [`Host::render`] drives it in: tick → hook → draw.

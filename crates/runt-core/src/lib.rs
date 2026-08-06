@@ -86,7 +86,7 @@ pub use ecs::{
 };
 pub use engine::Engine;
 pub use gen::{GeneratorSpec, Shading};
-pub use input::{Input, InputEvent, Key, PadButton, PadStick, PadTrigger};
+pub use input::{Input, InputEvent, Key, PadButton, PadStick, PadTrigger, Touch, TouchPhase};
 pub use material::{Material, MaterialVariant};
 pub use physics::{
     AabbCollider, Ball, BallController, Grounded, OverlapEvent, RollSpin, SphereCollider, Trigger,
