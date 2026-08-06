@@ -14,7 +14,7 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// The bits the *shader source* branches on: everything except the three that
 /// only select fixed-function state (`TRANSPARENT`, `ADDITIVE`,
 /// `DEPTH_GREATER`), which cannot change whether a module compiles.
-const SHADER_BITS: [MaterialVariant; 7] = [
+const SHADER_BITS: [MaterialVariant; 8] = [
     MaterialVariant::VERTEX_COLOR,
     MaterialVariant::TEXTURE,
     MaterialVariant::RAMP,
@@ -22,18 +22,27 @@ const SHADER_BITS: [MaterialVariant; 7] = [
     MaterialVariant::NORMAL_MAP,
     MaterialVariant::PHASE_CIRCLE,
     MaterialVariant::BILLBOARD_UNLIT,
+    // The one bit the *vertex* stage branches on. In here rather than only in
+    // `tests/vertex_wave.rs` because a vertex branch can fail to compile
+    // against any fragment branch, and 256 modules is still under a second.
+    MaterialVariant::VERTEX_WAVE,
 ];
 
-/// Every combination of the flags the WGSL can branch on — 128 of them.
+/// Every combination of the flags the WGSL can branch on — 256 of them.
 ///
 /// The sweep follows [`SHADER_BITS`] rather than `FLAGS` so that adding a
-/// *look* extends the coverage automatically. It stops short of all 1024 keys
+/// *look* extends the coverage automatically. It stops short of all 8192 keys
 /// on purpose: the three render-state bits produce byte-identical WGSL (nothing
 /// reads `F_TRANSPARENT`), so crossing them in would octuple a GPU test's
-/// runtime to compile the same 128 modules eight times each. What they select
+/// runtime to compile the same 256 modules eight times each. What they select
 /// instead of a branch is covered without a device by
 /// `the_render_state_comes_from_the_key`, and their effect on the *cache* by
 /// `every_state_combination_is_its_own_pipeline`.
+///
+/// `FRESNEL` and `EMISSIVE_SWEEP` are the two branching bits *not* in here, and
+/// that is a gap rather than a decision: they were appended after this list was
+/// written and crossing them in would quadruple it again. Both are exercised
+/// end to end by `tests/transparency.rs` and by the port's own frames.
 ///
 /// The sweep includes combinations the draw list will never emit
 /// (`TEXTURE | LIVE_TEX`, with and without the rest). They stay in on purpose:
@@ -67,6 +76,7 @@ fn variant_source_declares_every_flag_with_the_right_value() {
     assert!(src.contains("const F_DEPTH_GREATER: bool = false;"));
     assert!(src.contains("const F_PHASE_CIRCLE: bool = false;"));
     assert!(src.contains("const F_BILLBOARD_UNLIT: bool = false;"));
+    assert!(src.contains("const F_VERTEX_WAVE: bool = false;"));
     assert!(src.ends_with(material::BASE_SHADER), "base source is appended verbatim");
 
     let none = material::variant_source(material::BASE_SHADER, MaterialVariant::NONE);
@@ -133,6 +143,7 @@ fn variant_keys_behave_as_bitflags() {
     assert_eq!(MaterialVariant::BILLBOARD_UNLIT.bits(), 1 << 9);
     assert_eq!(MaterialVariant::FRESNEL.bits(), 1 << 10);
     assert_eq!(MaterialVariant::EMISSIVE_SWEEP.bits(), 1 << 11);
+    assert_eq!(MaterialVariant::VERTEX_WAVE.bits(), 1 << 12);
 
     // The flag list and the bits agree, so no key can be generated that the
     // preprocessor would not emit a const for.
@@ -141,7 +152,7 @@ fn variant_keys_behave_as_bitflags() {
         assert!(!union.contains(flag), "duplicate flag bit {:#06b}", flag.bits());
         union |= flag;
     }
-    assert_eq!(union.bits(), 0b1111_1111_1111);
+    assert_eq!(union.bits(), 0b1_1111_1111_1111);
 
     // The four looks that replace the lighting term rather than feeding it.
     // Exactly one wins per fragment; the mask is what says which four they are.

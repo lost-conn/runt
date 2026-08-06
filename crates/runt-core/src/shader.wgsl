@@ -94,6 +94,14 @@ struct TexParams {
 };
 @group(2) @binding(3) var<uniform> tex: TexParams;
 
+// `F_VERTEX_WAVE`'s two crossed-sine ratios. Constants in
+// `fx/water.gdshader:29-30` rather than uniforms, and constants here for the
+// same reason: they are what makes the pair read as a *crossed* swell instead
+// of one diagonal wave, and an author who could retune them would only ever
+// retune them wrong.
+const WAVE_CROSS_FREQ: f32 = 1.3;
+const WAVE_CROSS_SPEED: f32 = 0.85;
+
 struct VSOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
@@ -142,8 +150,31 @@ fn vs_main(
     // `InstanceRaw` writes one — so this is the same matrix the uniform held,
     // and the multiply below is the same arithmetic on the same bits.
     let model = mat4x4<f32>(m0, m1, m2, m3);
-    let world = model * vec4<f32>(pos, 1.0);
+    var local = pos;
+    if (F_VERTEX_WAVE) {
+        // `fx/water.gdshader:27-33`, verbatim: the two sines are sampled in
+        // *world* space (so a ribbon and the pond it falls into share one wave
+        // field rather than each swaying in its own frame) and the displacement
+        // is applied to the **local** vertex, which is what Godot's `VERTEX.y +=`
+        // does after it has read `MODEL_MATRIX * VERTEX` for the phase.
+        //
+        // `frame.time.x` is the render clock and only ever that: this moves
+        // pixels, never state (see `MaterialVariant::VERTEX_WAVE`).
+        let wp = (model * vec4<f32>(pos, 1.0)).xyz;
+        let amplitude = params.x;
+        let frequency = params.y;
+        let speed = params.z;
+        let w = sin(wp.x * frequency + frame.time.x * speed)
+            + sin(wp.z * frequency * WAVE_CROSS_FREQ + frame.time.x * speed * WAVE_CROSS_SPEED);
+        local.y = local.y + w * amplitude * 0.5;
+    }
+    let world = model * vec4<f32>(local, 1.0);
     out.clip = frame.view_proj * world;
+    // The *displaced* position, where Godot's water shader carried the
+    // undisplaced one across to its fragment stage. The difference is confined
+    // to the Y plane of a triplanar blend on a surface whose normal is mostly
+    // Y — i.e. weighted almost to nothing — and "where this fragment actually
+    // is" is the only thing a shading input called `world_pos` can mean.
     out.world_pos = world.xyz;
     // Rotating the normal by the model matrix is exact for the uniform-scale
     // transforms the engine places entities with; non-uniform scale would want

@@ -184,6 +184,43 @@ impl MaterialVariant {
     ///
     /// [`VERTEX_COLOR`]: MaterialVariant::VERTEX_COLOR
     pub const EMISSIVE_SWEEP: MaterialVariant = MaterialVariant(1 << 11);
+    /// Two crossed sines displacing the vertex along its **local +Y**, on the
+    /// render clock — a water surface swaying, and the only *vertex*-stage look
+    /// in the set so far.
+    ///
+    /// The original is `3dimenshift/shaders/fx/water.gdshader:27-33`, verbatim:
+    ///
+    /// ```text
+    /// wp = (MODEL_MATRIX * vec4(VERTEX, 1)).xyz
+    /// w  = sin(wp.x·frequency + TIME·speed)
+    ///    + sin(wp.z·frequency·1.3 + TIME·speed·0.85)
+    /// VERTEX.y += w · amplitude · 0.5
+    /// ```
+    ///
+    /// The two ratios (`1.3` across Z, `0.85` on the second sine's clock) are
+    /// what stop the pair reading as one diagonal wave, and they are constants
+    /// in the original rather than uniforms — so they are constants here too
+    /// (`WAVE_CROSS_FREQ` / `WAVE_CROSS_SPEED` in `shader.wgsl`). The three
+    /// numbers that *are* authored ride in [`Material::params`]`.xyz`.
+    ///
+    /// # It is a render-clock effect and nothing else
+    ///
+    /// The phase comes from [`FrameUniform::time`]`.x`, which is host wall
+    /// seconds and is **never** a simulation input (DESIGN §4). Nothing on the
+    /// CPU knows where a displaced vertex ended up: a swimmer's membership test,
+    /// a collider, a raycast all see the undisplaced surface. That is the
+    /// original's arrangement too — Godot's water body does its swim maths
+    /// against the ribbon's analytic frames and the shader sways the mesh
+    /// alone — and it is why this can be a pure GPU bit with no CPU half.
+    ///
+    /// Because the displacement moves geometry *outside* the mesh's own bounds,
+    /// a culler that trusts the source AABB can pop a swaying surface at a
+    /// grazing angle. Godot's own answer is `custom_aabb`, grown by a wave
+    /// margin; this engine's culling is per-draw against the same bounds, so a
+    /// caller that cares wants its mesh built with the margin already in it.
+    ///
+    /// [`FrameUniform::time`]: crate::FrameUniform::time
+    pub const VERTEX_WAVE: MaterialVariant = MaterialVariant(1 << 12);
 
     /// Every declared flag, with the WGSL `const` it maps to. The order here is
     /// the order the preprocessor emits, so generated sources are stable.
@@ -192,7 +229,7 @@ impl MaterialVariant {
     /// the WGSL reads `F_TRANSPARENT`, `F_ADDITIVE` or `F_DEPTH_GREATER`: this
     /// list is the *declaration* of the key space, and a bit missing from it
     /// would be a key the preprocessor silently could not describe.
-    pub const FLAGS: [(&'static str, MaterialVariant); 12] = [
+    pub const FLAGS: [(&'static str, MaterialVariant); 13] = [
         ("F_VERTEX_COLOR", MaterialVariant::VERTEX_COLOR),
         ("F_TEXTURE", MaterialVariant::TEXTURE),
         ("F_RAMP", MaterialVariant::RAMP),
@@ -205,6 +242,7 @@ impl MaterialVariant {
         ("F_BILLBOARD_UNLIT", MaterialVariant::BILLBOARD_UNLIT),
         ("F_FRESNEL", MaterialVariant::FRESNEL),
         ("F_EMISSIVE_SWEEP", MaterialVariant::EMISSIVE_SWEEP),
+        ("F_VERTEX_WAVE", MaterialVariant::VERTEX_WAVE),
     ];
 
     /// The two blend bits, as one mask: the draws that leave the opaque
@@ -225,7 +263,8 @@ impl MaterialVariant {
             | MaterialVariant::PHASE_CIRCLE.0
             | MaterialVariant::BILLBOARD_UNLIT.0
             | MaterialVariant::FRESNEL.0
-            | MaterialVariant::EMISSIVE_SWEEP.0,
+            | MaterialVariant::EMISSIVE_SWEEP.0
+            | MaterialVariant::VERTEX_WAVE.0,
     );
 
     /// The four bits that each *replace* the lighting term rather than feeding
@@ -340,15 +379,21 @@ pub struct Material {
     /// | [`PHASE_CIRCLE`] | mode | — | — | — |
     /// | [`FRESNEL`] | — | rim power | — | — |
     /// | [`EMISSIVE_SWEEP`] | un-swept gain | progress | fade width | swept gain |
+    /// | [`VERTEX_WAVE`] | amplitude | frequency | speed | — |
     ///
-    /// `x` is shared, which is why the two consumers of it are: the phase
-    /// circle's mode is a property of *phase* geometry and the sweep is a
-    /// property of a wire, and no draw is both. The rest is reserved for ramp
-    /// threshold/softness/… as those variants land. Uploaded whole from the
-    /// start so a new variant never changes the uniform layout.
+    /// `x` is shared, which is why the consumers of it are: the phase circle's
+    /// mode is a property of *phase* geometry, the sweep is a property of a
+    /// wire and the wave is a property of a water surface, and no draw is more
+    /// than one of those. That is the same resolution rule the rest of the key
+    /// space uses — a combination is *defined* rather than forbidden, and the
+    /// definition is "whichever variant reads the slot gets the number the
+    /// author put there". The rest is reserved for ramp threshold/softness/… as
+    /// those variants land. Uploaded whole from the start so a new variant never
+    /// changes the uniform layout.
     ///
     /// [`FRESNEL`]: MaterialVariant::FRESNEL
     /// [`EMISSIVE_SWEEP`]: MaterialVariant::EMISSIVE_SWEEP
+    /// [`VERTEX_WAVE`]: MaterialVariant::VERTEX_WAVE
     ///
     /// [`PHASE_CIRCLE`]: MaterialVariant::PHASE_CIRCLE
     /// [`PHASE_WORLD_ONLY`]: Material::PHASE_WORLD_ONLY
