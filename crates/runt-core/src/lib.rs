@@ -27,6 +27,13 @@ pub mod camera;
 pub mod collide;
 pub mod draw;
 pub mod ecs;
+/// The in-game scene editor's toolkit (DESIGN §10a). Off by default with the
+/// rest of the tooling; a wasm player compiles it away entirely.
+#[cfg(feature = "editor")]
+pub mod editor;
+/// The editor's manipulator handles. Feature-gated with [`editor`].
+#[cfg(feature = "editor")]
+pub mod editor_gizmo;
 pub mod engine;
 pub mod gen;
 pub mod input;
@@ -91,6 +98,13 @@ pub use ecs::{
     Interpolated, Lighting, MeshRef, PhaseFx, PostSim, QualityTier, RenderScale, Spin, Startup,
     StatusLine, TerrainSurface, TickCount, Transform, Viewport, Visibility,
 };
+#[cfg(feature = "editor")]
+pub use editor::{
+    Axis, Drag, DragKind, EditError, EditableScene, EditorState, OpLog, PaletteEntry, Ray, Snap,
+    Tool,
+};
+#[cfg(feature = "editor")]
+pub use editor_gizmo::{Gizmo, GizmoMesh, GizmoPart};
 pub use engine::Engine;
 pub use gen::{GeneratorSpec, Shading};
 pub use input::{Input, InputEvent, Key, PadButton, PadStick, PadTrigger, Touch, TouchPhase};

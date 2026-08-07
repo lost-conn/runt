@@ -544,6 +544,37 @@ survives the venue change intact. What is dropped is rinch, the CPU bridge, and
 `runt-editor`. Scene arrangement — place/transform/pick, save scene RON — is
 still wanted and is still unbuilt; it lands in-game too when it lands.
 
+**Scene arrangement landed** (`runt_core::editor` + `editor_gizmo`, behind an
+`editor` feature that implies `reflect`). The doctrine it is built on, which is
+the part worth restating here rather than in the module:
+
+> **Every edit is a data operation on the scene description, never a direct
+> world poke.**
+
+An edit does not write a `Transform`; it applies an *op* to the thing the level
+file is made of, and the game then re-realizes the affected world. Undo/redo,
+saving, and one day shipping level editing to a player all fall out of that one
+decision instead of each needing machinery: the op log **is** the undo stack (a
+`Vec` and a cursor; undo is `apply(invert(op))`), and the thing being edited is
+already the thing that gets written out, so there is no export step that could
+disagree with the screen.
+
+The engine half is game-agnostic and almost entirely pure functions — screen
+rays, a gizmo hit test, drag maths, snapping, a bounded op log. What a level
+*is* sits behind one trait, `EditableScene`, whose associated `Id` must be
+stable across a reload and whose associated `Op` must carry enough to invert
+exactly. The engine deliberately owns **no** editor resource and **no** editor
+system: every piece of the state is parameterized by the game's id type, so the
+resource is the game's and the engine hands it the pieces. `EditorState::dirty`
+is the whole hot-reload contract — the engine says *that* the description
+changed and never how much of the world to rebuild, because a full respawn and a
+surgical one are both correct and only the game knows which it can afford.
+
+The pointer is the editor's own, moved by `Input::mouse_delta` and clamped to
+the viewport, because runt has no cursor seam at all and a delta-driven cursor
+is the one shape that is identical on native and web *and* survives a trace
+replay.
+
 ## 11. Capability gates
 
 Two **independent** axes, probed once at startup, stored as a resource,

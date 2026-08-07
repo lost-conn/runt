@@ -10,6 +10,13 @@ default = []
 # never pays for it — `cargo tree --target wasm32-unknown-unknown -p runt-app`
 # must stay free of `bevy_reflect`.
 reflect = ["dep:bevy_reflect"]
+# The in-game scene editor (DESIGN §10a): picking, gizmos, the op log, and the
+# `EditableScene` seam a game implements over its own level format. Implies
+# `reflect` because the tweak panel *is* the property editor for a selection —
+# there is no version of this tool worth shipping without it — and because both
+# halves of §10a's "tooling is one feature, not one crate" must be off together
+# for the wasm player.
+editor = ["reflect"]
 
 [dependencies]
 runt-mesh = { workspace = true, features = ["serde"] }
