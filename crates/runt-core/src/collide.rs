@@ -587,6 +587,78 @@ struct RawContact {
     normal: Vec3,
     point: Vec3,
     depth: f32,
+    /// What part of the collider produced it — see [`ShapeContact::edge_face`].
+    edge_face: Option<Vec3>,
+}
+
+/// What one shape's contact routine found, before it is attributed to an entity.
+///
+/// The extra field over [`RawContact`] is the same one, named from the shape's
+/// side: it is the shape that knows whether the body was over a face or off the
+/// end of one, and [`suppress_cross_collider_seams`] is the only thing that
+/// reads it.
+#[derive(Clone, Copy, Debug)]
+struct ShapeContact {
+    normal: Vec3,
+    depth: f32,
+    point: Vec3,
+    /// `None` when the closest feature was a **face** — the body is over the
+    /// surface, `normal` is that face's normal and `point` lies on its plane, so
+    /// the pair is an exact plane the rest of the solve can trust.
+    ///
+    /// `Some(face)` when it was an **edge or a corner**, with `face` the normal
+    /// of the face meeting there that best explains the contact direction. The
+    /// contact is then a *rounded* one, and rounded contacts are the ones a
+    /// neighbouring collider can turn back into a flat surface.
+    edge_face: Option<Vec3>,
+}
+
+/// The moving shape a contact routine is asked about: a swept sphere along
+/// `lo`..`hi`, and the band outside it that still counts as touching.
+///
+/// `margin` is [`CONTACT_MARGIN`] for a query and [`WITNESS_MARGIN`] for the
+/// solver's own gather — the one knob that differs between "is this a contact"
+/// and "is there a surface here at all".
+#[derive(Clone, Copy, Debug)]
+struct Probe {
+    lo: Vec3,
+    hi: Vec3,
+    radius: f32,
+    margin: f32,
+}
+
+impl Probe {
+    /// The same probe expressed in a collider's own space.
+    #[inline]
+    fn about(self, center: Vec3) -> Probe {
+        Probe {
+            lo: self.lo - center,
+            hi: self.hi - center,
+            ..self
+        }
+    }
+}
+
+/// One triangle's collision data, as [`Trimesh`] stores it — the three
+/// positions, the face normal, and the two edge tables.
+#[derive(Clone, Copy, Debug)]
+struct TriData {
+    tri: [Vec3; 3],
+    normal: Vec3,
+    edge_flags: u8,
+    ridges: [Vec3; 3],
+}
+
+impl ShapeContact {
+    #[inline]
+    fn face(normal: Vec3, depth: f32, point: Vec3) -> ShapeContact {
+        ShapeContact {
+            normal,
+            depth,
+            point,
+            edge_face: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -688,7 +760,12 @@ impl BvhNode {
 ///    reports on the face interior, so the surface a body stands on is the
 ///    surface the level author authored — not an average of whatever the
 ///    tessellator did nearby.
-/// 4. **BVH**, top-down: split at the *median index* of the triangles sorted by
+/// 4. **Edge tables** (`mark_exposed_edges`): which of each triangle's edges
+///    are seams and which are ridges the surface genuinely turns at, and — for
+///    the ridges — the neighbour that says how far it turns. The first is what
+///    keeps a tessellated floor from reading as a field of tiny walls; the
+///    second is what keeps the lip of a cliff from reading as one.
+/// 5. **BVH**, top-down: split at the *median index* of the triangles sorted by
 ///    centroid along the longest axis of the node's centroid bounds, keyed
 ///    `(axis value, original triangle index)` so equal centroids still have one
 ///    order. Median-index (rather than median-value) split means the halves are
@@ -710,6 +787,13 @@ pub struct Trimesh {
     /// concave, so touching it is touching the face. See
     /// [`build_from_soup`](Trimesh::build_from_soup).
     edge_flags: Vec<u8>,
+    /// For each triangle, per edge, the **far side of the ridge**: the unit
+    /// normal of the neighbour that bounds the cone of directions a contact
+    /// against that edge may legitimately point in. [`Vec3::ZERO`] where there
+    /// is no such bound — a seam (the face normal already wins) or an open
+    /// boundary of the soup (nothing folds away, so nothing bounds the cone).
+    /// See [`ridge_cone_normal`].
+    edge_ridges: Vec<[Vec3; 3]>,
     nodes: Vec<BvhNode>,
 }
 
@@ -722,6 +806,7 @@ struct BuildTri {
     tri: [u32; 3],
     normal: Vec3,
     edge_flags: u8,
+    edge_ridges: [Vec3; 3],
     /// Index in the *welded* triangle list, before any reordering: the
     /// tie-break key, and the one thing about a triangle that a sort cannot
     /// change.
@@ -786,6 +871,7 @@ impl Trimesh {
                 tri,
                 normal: cross.normalize(),
                 edge_flags: 0b111,
+                edge_ridges: [Vec3::ZERO; 3],
                 original,
             });
         }
@@ -802,11 +888,13 @@ impl Trimesh {
         let tris = items.iter().map(|i| i.tri).collect();
         let face_normals = items.iter().map(|i| i.normal).collect();
         let edge_flags = items.iter().map(|i| i.edge_flags).collect();
+        let edge_ridges = items.iter().map(|i| i.edge_ridges).collect();
         Arc::new(Trimesh {
             verts,
             tris,
             face_normals,
             edge_flags,
+            edge_ridges,
             nodes,
         })
     }
@@ -839,6 +927,15 @@ impl Trimesh {
     /// [`trimesh_contact`].
     pub fn edge_flags(&self) -> &[u8] {
         &self.edge_flags
+    }
+
+    /// One neighbour normal per triangle edge — the far wall of the ridge cone,
+    /// or [`Vec3::ZERO`] where the edge has no such bound. A contact against an
+    /// exposed edge is clamped into the cone those two normals span, which is
+    /// what stops a body standing on one face of a ridge from picking up a
+    /// normal tilted past the other.
+    pub fn edge_ridges(&self) -> &[[Vec3; 3]] {
+        &self.edge_ridges
     }
 
     /// The flat node array. `nodes[0]` is the root; empty for an empty mesh.
@@ -918,8 +1015,32 @@ fn weld_key(p: Vec3) -> [i64; 3] {
 /// a ridge of six thousandths of a degree is a flat surface.
 const EDGE_RIDGE_TOLERANCE: f32 = 1.0e-4;
 
-/// Work out which of each triangle's edges are **exposed** — the rule
-/// [`trimesh_contact`] leans on.
+/// The in-plane direction that leaves triangle `tri` across edge `k` — the
+/// "outward edge normal", perpendicular to both the face normal and the edge.
+///
+/// Together with the face normal it is the 2-D frame the ridge cone is measured
+/// in: the cone at a convex edge sweeps from the face's own normal round towards
+/// this direction until it reaches the neighbour's normal. The sign is fixed by
+/// the winding for a consistently wound soup and corrected against the opposite
+/// vertex regardless, so a soup an exporter wound inconsistently still gets a
+/// direction that points *away* from the triangle.
+#[inline]
+fn edge_outward(tri: [Vec3; 3], normal: Vec3, k: usize) -> Vec3 {
+    let (v0, v1, opposite) = (tri[k], tri[(k + 1) % 3], tri[(k + 2) % 3]);
+    let out = (v1 - v0).cross(normal);
+    let Some(out) = out.try_normalize() else {
+        return Vec3::ZERO;
+    };
+    if out.dot(v0 - opposite) < 0.0 {
+        -out
+    } else {
+        out
+    }
+}
+
+/// Work out which of each triangle's edges are **exposed**, and how far the
+/// surface folds away at the ones that are — the two rules [`trimesh_contact`]
+/// leans on.
 ///
 /// An edge is a *seam* when some triangle sharing it continues this one's
 /// surface: the neighbour's opposite vertex lies on or in front of this
@@ -929,9 +1050,27 @@ const EDGE_RIDGE_TOLERANCE: f32 = 1.0e-4;
 /// sheet) or every neighbour folds away behind the plane (a convex ridge, where
 /// the direction to the edge really is the surface direction).
 ///
+/// ## The ridge cone
+///
+/// "Exposed" alone says the direction to the edge *can* be a surface direction,
+/// not that it always is. At a convex ridge the honest normals are exactly the
+/// ones between the two faces that meet there — the same cone a rounded corner
+/// would sweep. A body standing on the neighbour, a hair back from the edge, is
+/// past the far wall of that cone, and a normal that leaves the cone is a normal
+/// tilted *backwards over a surface the body is standing on*: it brakes and it
+/// kicks. (A capsule of PORT_SPEC's 0.35 m radius walking off a cliff lip reads
+/// +0.58 m/s of upward kick at roll speed; against a near-vertical face it reads
+/// a 0.36 m ejection, because the raw direction crosses behind the face plane
+/// and the old code took that for penetration.)
+///
+/// So each exposed edge records the neighbour whose normal makes the **tightest**
+/// cone, and the contact routine clamps to it. `Vec3::ZERO` means there is no
+/// bound: a seam (the face normal already wins) or an open boundary (nothing
+/// folds away there, so a body really can be anywhere around it).
+///
 /// The lookup is a `HashMap` keyed on the welded vertex pair, filled and read in
-/// triangle order. Nothing iterates it, so the flags are a pure function of the
-/// soup (DESIGN §9a).
+/// triangle order. Nothing iterates it, so both outputs are a pure function of
+/// the soup (DESIGN §9a).
 fn mark_exposed_edges(verts: &[Vec3], items: &mut [BuildTri]) {
     // Edge (low, high) → the triangles on it, as (triangle, opposite vertex).
     let mut shared: HashMap<(u32, u32), Vec<(u32, u32)>> = HashMap::with_capacity(items.len() * 2);
@@ -946,9 +1085,19 @@ fn mark_exposed_edges(verts: &[Vec3], items: &mut [BuildTri]) {
         }
     }
 
+    // The neighbours' normals are read while `items` is being written, so take
+    // the one copy the ridge pass needs up front.
+    let normals: Vec<Vec3> = items.iter().map(|i| i.normal).collect();
+
     for (index, item) in items.iter_mut().enumerate() {
         let (tri, normal) = (item.tri, item.normal);
+        let points = [
+            verts[tri[0] as usize],
+            verts[tri[1] as usize],
+            verts[tri[2] as usize],
+        ];
         let mut flags = 0u8;
+        let mut ridges = [Vec3::ZERO; 3];
         for k in 0..3usize {
             let (v0, v1) = (tri[k], tri[(k + 1) % 3]);
             let key = (v0.min(v1), v0.max(v1));
@@ -967,11 +1116,42 @@ fn mark_exposed_edges(verts: &[Vec3], items: &mut [BuildTri]) {
                     break;
                 }
             }
-            if exposed {
-                flags |= 1 << k;
+            if !exposed {
+                continue;
+            }
+            flags |= 1 << k;
+
+            // The cone's far wall: of the neighbours that fold away here, the
+            // one whose normal is *least* turned from this face's. Two
+            // candidates are compared by the sign of their 2-D cross product in
+            // the (normal, outward) frame, which is exact and needs no `atan2`.
+            let outward = edge_outward(points, normal, k);
+            if outward == Vec3::ZERO {
+                continue;
+            }
+            let mut best: Option<(f32, f32, Vec3)> = None;
+            for &(other, _) in on_edge {
+                if other == index as u32 {
+                    continue;
+                }
+                let n = normals[other as usize];
+                let (c, s) = (n.dot(normal), n.dot(outward));
+                // A neighbour leaning back *over* this face bounds nothing the
+                // cone can use; the exposure test above already refused the
+                // coplanar case, so this is a fold sharper than a knife edge.
+                if s < 0.0 {
+                    continue;
+                }
+                if best.is_none_or(|(bc, bs, _)| bc * s - bs * c > 0.0) {
+                    best = Some((c, s, n));
+                }
+            }
+            if let Some((_, _, n)) = best {
+                ridges[k] = n;
             }
         }
         item.edge_flags = flags;
+        item.edge_ridges = ridges;
     }
 }
 
@@ -1223,12 +1403,70 @@ fn closest_segment_triangle(
     best
 }
 
+/// The **ridge cone** test: is `direction` outside the wedge the surface leaves
+/// open at edge `k`, and if so, which way should it be turned?
+///
+/// At a convex ridge the honest contact normals are the ones between the two
+/// faces that meet there, and no others — a body wedged into the corner picks
+/// one out of that arc, a body over either face gets that face's normal. The arc
+/// is measured in the 2-D frame `(face_normal, outward)` (see
+/// [`edge_outward`]), where the face's own normal is at zero and the neighbour's
+/// normal — [`Trimesh::edge_ridges`]'s entry for this edge — is the far wall.
+/// `direction` is past that wall exactly when the 2-D cross product from it to
+/// the neighbour turns the wrong way, which is one multiply-subtract and no
+/// trigonometry.
+///
+/// The cone has a near wall as well as a far one, and it is the face's own
+/// normal. A direction with a *negative* `outward` component points back across
+/// the edge into the triangle's own side — which a body outside the surface
+/// cannot produce, and a body that has got behind the plane routinely does. It
+/// is the same reading as "behind the face, so push it back to the front", and
+/// the same answer: the face normal.
+#[inline]
+fn ridge_cone_normal(
+    tri: [Vec3; 3],
+    face_normal: Vec3,
+    ridge: Vec3,
+    k: usize,
+    direction: Vec3,
+) -> RidgeVerdict {
+    if ridge == Vec3::ZERO {
+        return RidgeVerdict::Unbounded;
+    }
+    let outward = edge_outward(tri, face_normal, k);
+    if outward == Vec3::ZERO {
+        return RidgeVerdict::Unbounded;
+    }
+    let (c, s) = (ridge.dot(face_normal), ridge.dot(outward));
+    let (dc, ds) = (direction.dot(face_normal), direction.dot(outward));
+    if ds < 0.0 {
+        RidgeVerdict::Outside(face_normal)
+    } else if dc * s - ds * c < 0.0 {
+        RidgeVerdict::Outside(ridge)
+    } else {
+        RidgeVerdict::Inside
+    }
+}
+
+/// What [`ridge_cone_normal`] made of a contact direction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RidgeVerdict {
+    /// No neighbour folds away at this edge — an open boundary of the soup. A
+    /// body really can be anywhere around it, so nothing is clamped.
+    Unbounded,
+    /// Inside the wedge the ridge leaves open: the rounded direction stands.
+    Inside,
+    /// Past the far wall, which is this normal — the body is over the
+    /// neighbouring face and that face is what it is touching.
+    Outside(Vec3),
+}
+
 /// Contact between a swept sphere (`seg_lo`..`seg_hi`, `radius`) and one
 /// triangle, in the triangle's own space.
 ///
-/// Returns `(normal, depth, point)` in the same convention every other contact
-/// routine here uses: the normal points **out of** the surface towards the body,
-/// the depth is penetration along it, the point is on the surface.
+/// The normal points **out of** the surface towards the body, the depth is
+/// penetration along it, the point is on the surface — the convention every
+/// other contact routine here uses.
 ///
 /// ## The normal, and why it is not always the direction to the closest point
 ///
@@ -1241,7 +1479,7 @@ fn closest_segment_triangle(
 /// past `max_floor_angle` is a *wall*, and a wall in the middle of flat ground
 /// eats the speed of everything that runs over it.
 ///
-/// Four rules, all of them geometry rather than tuning:
+/// Five rules, all of them geometry rather than tuning:
 ///
 /// - **Interior closest point ⇒ the face normal.** The body is over the face;
 ///   the face's own normal is the surface it is on, exactly as the OBB path
@@ -1253,8 +1491,19 @@ fn closest_segment_triangle(
 ///   a contact must not be able to tell they were ever separate triangles.
 /// - **`dist` below 1e-6 ⇒ the face normal.** There is no direction to
 ///   normalise, and dividing by it would be a NaN.
-/// - **A direction pointing behind the face ⇒ the face normal.** The body got
-///   through and wants pushing back to the front, not further in.
+/// - **A direction outside the ridge cone ⇒ the neighbour's normal.**
+///   [`ridge_cone_normal`]. The body is round; the *surface* is not. Beyond the
+///   far wall of the cone the body is over the neighbouring face, and the
+///   neighbouring face is what it is standing on — which is the whole of the
+///   cliff-lip snag: a capsule a centimetre back from a lip used to read the
+///   cliff triangle's edge as a surface tilted backwards over the ground it was
+///   walking on, and got braked and kicked upwards by it.
+/// - **A direction pointing behind the face, on an edge with no cone ⇒ the face
+///   normal.** The body got through an open sheet and wants pushing back to the
+///   front, not further in. Where a cone *is* recorded the rule above already
+///   covers this — and covers it better, because "behind the plane" at a ridge
+///   edge is the ordinary state of a body standing on the neighbour, not
+///   evidence that anything was tunnelled.
 ///
 /// What is left keeps the true direction: a body against a real exposed edge —
 /// the lip of a triangulated ledge, the corner of a baked box, the boundary of
@@ -1269,33 +1518,77 @@ fn closest_segment_triangle(
 /// instead of reading a small unsigned distance and staying stuck. The candidate
 /// is rejected on unsigned distance first, so the depth this can produce is
 /// bounded by `2·radius + CONTACT_MARGIN` — a body far behind a face is out of
-/// range of it, not catapulted by it.
-fn trimesh_contact(
-    seg_lo: Vec3,
-    seg_hi: Vec3,
-    radius: f32,
-    tri: [Vec3; 3],
-    face_normal: Vec3,
-    edge_flags: u8,
-) -> Option<(Vec3, f32, Vec3)> {
-    let [a, b, c] = tri;
-    let (on_seg, on_tri, feature) = closest_segment_triangle(seg_lo, seg_hi, a, b, c);
+/// range of it, not catapulted by it. A cone-clamped contact measures its
+/// separation the same way, against the plane it was clamped to.
+fn trimesh_contact(probe: Probe, data: TriData) -> Option<ShapeContact> {
+    let TriData {
+        tri,
+        normal: face_normal,
+        edge_flags,
+        ridges: edge_ridges,
+    } = data;
+    let (on_seg, on_tri, feature) =
+        closest_segment_triangle(probe.lo, probe.hi, tri[0], tri[1], tri[2]);
     let delta = on_seg - on_tri;
     let dist = delta.length();
-    if dist > radius + CONTACT_MARGIN {
+    if dist > probe.radius + probe.margin {
         return None;
     }
     let front = delta.dot(face_normal);
-    let (normal, separation) = if dist < 1e-6 || front < 0.0 || !feature.is_exposed(edge_flags) {
-        (face_normal, front)
+
+    let (normal, separation, edge_face) = if dist < 1e-6 || !feature.is_exposed(edge_flags) {
+        (face_normal, front, None)
     } else {
-        (delta / dist, dist)
+        let direction = delta / dist;
+        let cone = |k: usize| ridge_cone_normal(tri, face_normal, edge_ridges[k], k, direction);
+        let clamped = match feature {
+            TriFeature::Edge(k) => match cone(k as usize) {
+                RidgeVerdict::Outside(n) => Some(n),
+                _ => None,
+            },
+            // A corner sits on two edges, and the wedge it leaves open is
+            // bounded by both. One unbounded edge leaves the corner unbounded;
+            // otherwise a direction past *either* wall is over a neighbouring
+            // face, and the clamp that turns the direction least is the one that
+            // face's normal deserves.
+            TriFeature::Vertex(i) => {
+                let (k0, k1) = (i as usize, (i as usize + 2) % 3);
+                match (cone(k0), cone(k1)) {
+                    (RidgeVerdict::Unbounded, _) | (_, RidgeVerdict::Unbounded) => None,
+                    (RidgeVerdict::Outside(one), RidgeVerdict::Outside(two)) => {
+                        Some(if one.dot(direction) >= two.dot(direction) {
+                            one
+                        } else {
+                            two
+                        })
+                    }
+                    (RidgeVerdict::Outside(n), _) | (_, RidgeVerdict::Outside(n)) => Some(n),
+                    (RidgeVerdict::Inside, RidgeVerdict::Inside) => None,
+                }
+            }
+            TriFeature::Interior => None,
+        };
+        match clamped {
+            // A clamped contact is not a rounded one any more: it reports a
+            // face's normal, and `on_tri` lies in that face's plane, so it is a
+            // plane the seam rule can quote as evidence rather than one it has
+            // to second-guess.
+            Some(n) => (n, delta.dot(n), None),
+            None if front < 0.0 => (face_normal, front, None),
+            None => (direction, dist, Some(face_normal)),
+        }
     };
-    let depth = radius - separation;
-    if depth <= -CONTACT_MARGIN {
+
+    let depth = probe.radius - separation;
+    if depth <= -probe.margin {
         return None;
     }
-    Some((normal, depth, on_tri))
+    Some(ShapeContact {
+        normal,
+        depth,
+        point: on_tri,
+        edge_face,
+    })
 }
 
 /// Every contact a swept sphere has with a trimesh placed at `center`, emitted
@@ -1310,29 +1603,32 @@ fn trimesh_contact(
 fn segment_trimesh_contacts(
     mesh: &Trimesh,
     center: Vec3,
-    seg_lo: Vec3,
-    seg_hi: Vec3,
-    radius: f32,
+    probe: Probe,
     scratch: &mut Vec<u32>,
-    mut emit: impl FnMut(Vec3, f32, Vec3),
+    mut emit: impl FnMut(ShapeContact),
 ) {
     if mesh.nodes.is_empty() {
         return;
     }
-    let lo = seg_lo - center;
-    let hi = seg_hi - center;
-    let reach = Vec3::splat(radius + CONTACT_MARGIN);
-    mesh.query_aabb(lo.min(hi) - reach, lo.max(hi) + reach, scratch);
+    let local = probe.about(center);
+    let reach = Vec3::splat(local.radius + local.margin);
+    mesh.query_aabb(
+        local.lo.min(local.hi) - reach,
+        local.lo.max(local.hi) + reach,
+        scratch,
+    );
     for &index in scratch.iter() {
-        if let Some((normal, depth, point)) = trimesh_contact(
-            lo,
-            hi,
-            radius,
-            mesh.triangle(index),
-            mesh.face_normals[index as usize],
-            mesh.edge_flags[index as usize],
-        ) {
-            emit(normal, depth, point + center);
+        let data = TriData {
+            tri: mesh.triangle(index),
+            normal: mesh.face_normals[index as usize],
+            edge_flags: mesh.edge_flags[index as usize],
+            ridges: mesh.edge_ridges[index as usize],
+        };
+        if let Some(hit) = trimesh_contact(local, data) {
+            emit(ShapeContact {
+                point: hit.point + center,
+                ..hit
+            });
         }
     }
 }
@@ -1767,8 +2063,18 @@ fn box_sdf(p: Vec3, half: Vec3) -> f32 {
 }
 
 /// [`box_sdf`] plus the surface data a contact needs: the outward unit normal at
-/// `p` and the nearest point on the box.
-fn box_surface(p: Vec3, half: Vec3) -> (f32, Vec3, Vec3) {
+/// `p`, the nearest point on the box, and — for a point outside it — which of
+/// the box's faces meet at the feature that answered.
+///
+/// A point outside a box is beyond one, two or three of its slabs. Beyond
+/// exactly one, the nearest point is on that **face** and the normal is the
+/// face's own; beyond two or three it is on an **edge** or a **corner**, and the
+/// normal is a rounded direction that no single face owns. The fourth return
+/// says which: `None` for a face, `Some(n)` for an edge or a corner, with `n`
+/// the face normal the rounded direction leans on hardest — the one a
+/// neighbouring collider's surface has to agree with before
+/// [`suppress_cross_collider_seams`] will flatten the contact onto it.
+fn box_surface(p: Vec3, half: Vec3) -> (f32, Vec3, Vec3, Option<Vec3>) {
     let q = p.abs() - half;
     if q.max_element() > 0.0 {
         // Outside: the nearest point is the clamp, and the normal points at `p`.
@@ -1776,7 +2082,23 @@ fn box_surface(p: Vec3, half: Vec3) -> (f32, Vec3, Vec3) {
         let delta = p - closest;
         let dist = delta.length();
         let normal = delta.try_normalize().unwrap_or(Vec3::Y);
-        (dist, normal, closest)
+        // The slabs `p` is beyond are exactly the axes `delta` is non-zero on.
+        let mut beyond = 0u32;
+        let mut dominant = 0usize;
+        for i in 0..3 {
+            if delta[i] != 0.0 {
+                beyond += 1;
+                if delta[i].abs() > delta[dominant].abs() {
+                    dominant = i;
+                }
+            }
+        }
+        let edge_face = (beyond > 1).then(|| {
+            let mut face = Vec3::ZERO;
+            face[dominant] = delta[dominant].signum();
+            face
+        });
+        (dist, normal, closest, edge_face)
     } else {
         // Inside (or exactly on the surface): leave by the nearest face, i.e.
         // the axis of least penetration. Ties take the lowest axis index, which
@@ -1794,7 +2116,7 @@ fn box_surface(p: Vec3, half: Vec3) -> (f32, Vec3, Vec3) {
         normal[axis] = sign;
         let mut closest = p;
         closest[axis] = sign * half[axis];
-        (-gap[axis], normal, closest)
+        (-gap[axis], normal, closest, None)
     }
 }
 
@@ -1833,22 +2155,21 @@ fn deepest_on_segment(a: Vec3, b: Vec3, half: Vec3) -> f32 {
 /// `rotation` is the box's orientation; [`Quat::IDENTITY`] takes the closed-form
 /// path. Returns `None` when the separation exceeds [`CONTACT_MARGIN`].
 fn segment_box_contact(
-    seg_lo: Vec3,
-    seg_hi: Vec3,
-    radius: f32,
+    probe: Probe,
     center: Vec3,
     rotation: Quat,
     half: Vec3,
-) -> Option<(Vec3, f32, Vec3)> {
+) -> Option<ShapeContact> {
     let axis_aligned = rotation == Quat::IDENTITY;
+    let local = probe.about(center);
     let (a, b) = if axis_aligned {
-        (seg_lo - center, seg_hi - center)
+        (local.lo, local.hi)
     } else {
         let inv = rotation.inverse();
-        (inv * (seg_lo - center), inv * (seg_hi - center))
+        (inv * local.lo, inv * local.hi)
     };
 
-    let local = if axis_aligned {
+    let deepest = if axis_aligned {
         // The segment is vertical and the box is axis-aligned, so the signed
         // distance depends on `y` only through `|y| - half.y` — and it is
         // non-decreasing in that. Minimising it is therefore just clamping the
@@ -1859,45 +2180,56 @@ fn segment_box_contact(
         a.lerp(b, deepest_on_segment(a, b, half))
     };
 
-    let (sdf, normal_local, closest_local) = box_surface(local, half);
-    let depth = radius - sdf;
-    if depth <= -CONTACT_MARGIN {
+    let (sdf, normal_local, closest_local, edge_face_local) = box_surface(deepest, half);
+    let depth = probe.radius - sdf;
+    if depth <= -probe.margin {
         return None;
     }
-    let (normal, point) = if axis_aligned {
-        (normal_local, closest_local + center)
+    let (normal, point, edge_face) = if axis_aligned {
+        (normal_local, closest_local + center, edge_face_local)
     } else {
-        (rotation * normal_local, rotation * closest_local + center)
+        (
+            rotation * normal_local,
+            rotation * closest_local + center,
+            edge_face_local.map(|n| rotation * n),
+        )
     };
-    Some((normal, depth, point))
+    Some(ShapeContact {
+        normal,
+        depth,
+        point,
+        edge_face,
+    })
 }
 
 /// Contact between a vertical swept sphere and a sphere.
-fn segment_sphere_contact(
-    seg_lo: Vec3,
-    seg_hi: Vec3,
-    radius: f32,
-    center: Vec3,
-    other_radius: f32,
-) -> Option<(Vec3, f32, Vec3)> {
+fn segment_sphere_contact(probe: Probe, center: Vec3, other_radius: f32) -> Option<ShapeContact> {
     // Closest point on a segment to a point: the usual projection, and the
     // segment is vertical so the clamp is on `y` alone.
     let closest = Vec3::new(
-        seg_lo.x,
-        center.y.clamp(seg_lo.y.min(seg_hi.y), seg_lo.y.max(seg_hi.y)),
-        seg_lo.z,
+        probe.lo.x,
+        center
+            .y
+            .clamp(probe.lo.y.min(probe.hi.y), probe.lo.y.max(probe.hi.y)),
+        probe.lo.z,
     );
-    let reach = radius + other_radius;
+    let reach = probe.radius + other_radius;
     let delta = closest - center;
     let dist = delta.length();
     let depth = reach - dist;
-    if depth <= -CONTACT_MARGIN {
+    if depth <= -probe.margin {
         return None;
     }
     // Concentric: no direction is more right than another, so pick the one that
     // will not push a body into the floor. Same rule `physics::overlap` uses.
+    // A sphere has no edges: every point of it is a face, in the sense the
+    // seam suppression cares about — `normal` is the tangent plane's own.
     let normal = delta.try_normalize().unwrap_or(Vec3::Y);
-    Some((normal, depth, center + normal * other_radius))
+    Some(ShapeContact::face(
+        normal,
+        depth,
+        center + normal * other_radius,
+    ))
 }
 
 /// Contact between a vertical swept sphere and an analytic height field.
@@ -1917,12 +2249,8 @@ fn segment_sphere_contact(
 /// axis, so on a strongly curved field the contact point is approximate (the
 /// solve re-samples each iteration, which converges). A height field has no
 /// overhangs, so the head cap can never be the only thing touching.
-fn segment_field_contact(
-    entry: &TerrainEntry,
-    seg_lo: Vec3,
-    seg_hi: Vec3,
-    radius: f32,
-) -> Option<(Vec3, f32, Vec3)> {
+fn segment_field_contact(entry: &TerrainEntry, probe: Probe) -> Option<ShapeContact> {
+    let (seg_lo, seg_hi) = (probe.lo, probe.hi);
     let (x, z) = (seg_lo.x, seg_lo.z);
     if !entry.surface.contains_world(entry.origin, x, z) {
         return None;
@@ -1938,11 +2266,15 @@ fn segment_field_contact(
     } else {
         (d_hi, seg_hi)
     };
-    let depth = radius - dist;
-    if depth <= -CONTACT_MARGIN {
+    let depth = probe.radius - dist;
+    if depth <= -probe.margin {
         return None;
     }
-    Some((normal, depth, deepest - normal * radius))
+    Some(ShapeContact::face(
+        normal,
+        depth,
+        deepest - normal * probe.radius,
+    ))
 }
 
 /// Every contact a body at `position` has, in `Entity` order.
@@ -1956,6 +2288,9 @@ fn segment_field_contact(
 /// its velocity projected against both planes, exactly as a body between two
 /// boxes does. The set is folded down to one contact per entity later
 /// ([`merge_contacts`]), so what a caller reads back is unchanged.
+///
+/// The last thing this does is [`suppress_cross_collider_seams`] — the one rule
+/// that cannot be decided by any single collider on its own.
 fn collect_contacts(
     world: &CollisionWorld,
     shape: CharacterShape,
@@ -1968,6 +2303,12 @@ fn collect_contacts(
     out.clear();
     let (lo, hi) = shape.segment(position, up);
     let radius = shape.radius();
+    let probe = Probe {
+        lo,
+        hi,
+        radius,
+        margin: WITNESS_MARGIN,
+    };
     let mut candidates: Vec<u32> = Vec::new();
 
     world.for_each(mask, |entry| {
@@ -1975,61 +2316,202 @@ fn collect_contacts(
             return;
         }
         let hit = match &entry.shape {
-            ColliderShape::Sphere { radius: r } => {
-                segment_sphere_contact(lo, hi, radius, entry.center, *r)
+            ColliderShape::Sphere { radius: r } => segment_sphere_contact(probe, entry.center, *r),
+            ColliderShape::Aabb { half_extents } => {
+                segment_box_contact(probe, entry.center, Quat::IDENTITY, *half_extents)
             }
-            ColliderShape::Aabb { half_extents } => segment_box_contact(
-                lo,
-                hi,
-                radius,
-                entry.center,
-                Quat::IDENTITY,
-                *half_extents,
-            ),
             ColliderShape::Obb {
                 half_extents,
                 rotation,
-            } => segment_box_contact(lo, hi, radius, entry.center, *rotation, *half_extents),
+            } => segment_box_contact(probe, entry.center, *rotation, *half_extents),
             ColliderShape::Trimesh(mesh) => {
                 segment_trimesh_contacts(
                     mesh,
                     entry.center,
-                    lo,
-                    hi,
-                    radius,
+                    probe,
                     &mut candidates,
-                    |normal, depth, point| {
+                    |hit| {
                         out.push(RawContact {
                             entity: entry.entity,
-                            normal,
-                            point,
-                            depth,
+                            normal: hit.normal,
+                            point: hit.point,
+                            depth: hit.depth,
+                            edge_face: hit.edge_face,
                         });
                     },
                 );
                 None
             }
         };
-        if let Some((normal, depth, point)) = hit {
+        if let Some(hit) = hit {
             out.push(RawContact {
                 entity: entry.entity,
-                normal,
-                point,
-                depth,
+                normal: hit.normal,
+                point: hit.point,
+                depth: hit.depth,
+                edge_face: hit.edge_face,
             });
         }
     });
 
     world.for_each_terrain(mask, |entry| {
-        if let Some((normal, depth, point)) = segment_field_contact(entry, lo, hi, radius) {
+        if let Some(hit) = segment_field_contact(entry, probe) {
             out.push(RawContact {
                 entity: entry.entity,
-                normal,
-                point,
-                depth,
+                normal: hit.normal,
+                point: hit.point,
+                depth: hit.depth,
+                edge_face: hit.edge_face,
             });
         }
     });
+
+    suppress_cross_collider_seams(out);
+    // The witnesses go: only the touching band is a contact.
+    out.retain(|c| c.depth > -CONTACT_MARGIN);
+}
+
+/// How far off another collider's surface plane an edge may sit and still count
+/// as lying *in* it, in metres.
+///
+/// A centimetre. Two pieces of level geometry a level author meant to join are
+/// millimetres apart at worst — the bake's own welder works at
+/// [`WELD_GRID`]-scale, and a Godot artist placing a bridge against a cliff is
+/// eyeballing to the centimetre. Anything a player is meant to *notice* as a
+/// step is thirty times this: PORT_SPEC's smallest authored rise is a stair
+/// tread, and the capsule's own radius is 0.35 m. So the band is wide enough to
+/// swallow every joint that was meant to be flush and far too narrow to swallow
+/// a feature.
+pub const SEAM_PLANE_TOLERANCE: f32 = 1.0e-2;
+
+/// How far two surfaces' normals may differ and still count as one surface
+/// crossing a joint — `cos 20°`.
+///
+/// The angle has to be at least as wide as the tilt an edge contact can reach
+/// before it stops being reported at all, or the rule would only fire on the
+/// contacts that were already harmless. For PORT_SPEC's 0.35 m capsule that tilt
+/// is `atan(√(2·r·CONTACT_MARGIN) / r)` ≈ 4.3° on a flush joint and ≈ 14.4° on
+/// one a centimetre out of true — so 20° covers the whole band the tolerance
+/// above admits, with nothing left over for a surface that genuinely turns.
+const SEAM_NORMAL_COS: f32 = 0.939_692_6;
+
+/// The band [`collect_contacts`] gathers in, as against the band it *reports*.
+///
+/// The seam rule needs to see the surface that continues past an edge, and a
+/// contact is only reported out to [`CONTACT_MARGIN`] — a millimetre. That is
+/// the right band for "am I standing on this", and much too tight for "does
+/// something else carry on here": a joint half a centimetre out of true lifts
+/// the body clear of the lower surface, the lower surface stops being reported,
+/// and the edge it was suppressing goes back to bumping the body on the way in.
+///
+/// So the gather runs to [`SEAM_PLANE_TOLERANCE`] instead and the extra entries
+/// are dropped again the moment [`suppress_cross_collider_seams`] has read them.
+/// Nothing downstream sees a contact it did not see before; what it sees is
+/// contacts whose normals had one more piece of evidence behind them. The cost
+/// is a broadphase box 9 mm larger per side and a `retain` over a handful of
+/// entries.
+const WITNESS_MARGIN: f32 = SEAM_PLANE_TOLERANCE;
+
+/// Turn edge contacts that another collider's surface runs straight through back
+/// into flat-surface contacts.
+///
+/// ## The problem
+///
+/// [`Trimesh::build_from_soup`]'s welder already solves the internal-edge
+/// problem *inside* one soup: a shared edge whose neighbour continues the
+/// surface is a seam, and a contact against a seam reports the face normal, so
+/// nothing can tell the two triangles were ever separate. The welder is built
+/// once per collider and cannot see past it — and a level is not one collider.
+/// A phase bridge is a box butted against a mountain ledge that is a baked soup;
+/// two baked roots meet along a ridge; the ledge's own lip edge is a genuine
+/// exposed boundary *of that soup* and a meaningless crease *of the level*.
+///
+/// A body crossing such a joint gets the far collider's edge-region normal,
+/// which tilts backwards over the surface it is walking on. It reads as a bump,
+/// and the bump is mostly vertical: at PORT_SPEC's walk speed a 0.35 m capsule
+/// takes +0.30 m/s of upward kick crossing a flush joint, and +0.85 m/s at roll
+/// speed — a visible hop over a surface that is, geometrically, flat.
+///
+/// ## The rule
+///
+/// The welder's doctrine, restated across colliders: **an edge is a seam when a
+/// neighbour continues the surface there.** A contact qualifies when
+///
+/// 1. its closest feature was an edge or a corner ([`ShapeContact::edge_face`]),
+///    and
+/// 2. some *other* collider's contact this tick stands on a surface whose plane
+///    passes within [`SEAM_PLANE_TOLERANCE`] of the edge — a face contact's
+///    `(point, normal)` is that plane exactly, and an edge contact's
+///    `(point, edge_face)` is it too, since an edge lies in the face it bounds,
+///    and
+/// 3. that surface's normal is within [`SEAM_NORMAL_COS`] of the direction the
+///    rounded contact points in.
+///
+/// Rule 3 is what keeps a wall a wall, and it is stated against the *rounded
+/// direction* rather than against the edge's own face because either surface at
+/// the joint can be the one that answers with an edge — a bridge butted into a
+/// ledge buries the ledge's side face, and the contact against that side face's
+/// top edge points almost straight up even though the face it belongs to is
+/// vertical. What has to agree is the answer, not the paperwork.
+///
+/// A wall rising off a floor never satisfies it: a body against a wall is
+/// against the *face*, not its bottom edge (the face spans the body's whole
+/// height, so the closest feature is interior), and a body that does catch a
+/// vertical edge gets a horizontal direction, which no floor normal is within
+/// twenty degrees of. Nor does a step: a bridge 0.3 m proud of a ledge has its
+/// top edge 0.3 m off the ledge's plane, thirty times the tolerance, and the
+/// ledge's side face — whose plane the edge *does* lie in — points sideways,
+/// which the rounded direction does not.
+///
+/// Rule 2's "other collider" is what leaves the intra-soup case entirely to the
+/// welder, where it belongs — and its admitting edge contacts as well as faces
+/// is what closes a joint with a gap in it, where the body is momentarily over
+/// neither surface and both colliders answer with an edge.
+///
+/// The contact is not dropped and it is not deepened: it keeps its entity, its
+/// point and its depth, and takes the continuing surface's normal. Re-aiming is
+/// the whole of the fix — the bump was a direction, not an amount — and leaving
+/// the depth alone is what stops a flattened corner from acting as a plane that
+/// reaches out to the body's whole radius past the collider that owns it. How
+/// deep the body is in the surface is the *continuing* surface's business, and
+/// that surface is in the same contact set.
+///
+/// It therefore reports as the flat surface it is, and a body standing on the
+/// joint still reads `on_floor` from both colliders. The evidence a contact
+/// offers — its `point` and its `edge_face` — is never written, so no
+/// substitution can change what any other contact reads and the pass is
+/// order-independent.
+///
+/// ## Cost
+///
+/// `O(E · F)` for `E` edge-feature contacts and `F` face contacts in the same
+/// set, on a set that is a handful of entries — a capsule touching more than
+/// four things at once is wedged in a corner. It is guarded by a single pass
+/// that returns immediately when no contact has an edge feature, which is the
+/// common case: a body over the interior of a face produces none. No broadphase
+/// query, no allocation, and nothing read that this tick's contact generation
+/// had not already computed.
+fn suppress_cross_collider_seams(out: &mut [RawContact]) {
+    if !out.iter().any(|c| c.edge_face.is_some()) {
+        return;
+    }
+    for i in 0..out.len() {
+        if out[i].edge_face.is_none() {
+            continue;
+        }
+        let (entity, point, normal) = (out[i].entity, out[i].point, out[i].normal);
+        let continued = out.iter().find_map(|other| {
+            let surface = other.edge_face.unwrap_or(other.normal);
+            (other.entity != entity
+                && normal.dot(surface) >= SEAM_NORMAL_COS
+                && (point - other.point).dot(surface).abs() <= SEAM_PLANE_TOLERANCE)
+                .then_some(surface)
+        });
+        let Some(surface) = continued else {
+            continue;
+        };
+        out[i].normal = surface;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2567,56 +3049,55 @@ impl CollisionWorld {
         let mut hits = Vec::new();
         let push = |entity: Entity,
                         trigger: bool,
-                        hit: Option<(Vec3, f32, Vec3)>,
+                        hit: Option<ShapeContact>,
                         hits: &mut Vec<OverlapHit>| {
             // Overlap means *overlap*: unlike the solver, a query does not want
             // the touching-tolerance band reported as a hit.
-            if let Some((normal, depth, point)) = hit {
-                if depth > 0.0 {
+            if let Some(hit) = hit {
+                if hit.depth > 0.0 {
                     hits.push(OverlapHit {
                         entity,
-                        depth,
-                        normal,
-                        point,
+                        depth: hit.depth,
+                        normal: hit.normal,
+                        point: hit.point,
                         trigger,
                     });
                 }
             }
         };
 
+        let probe = Probe {
+            lo,
+            hi,
+            radius,
+            margin: CONTACT_MARGIN,
+        };
         let mut candidates: Vec<u32> = Vec::new();
         self.for_each(mask, |entry| {
             let hit = match &entry.shape {
                 ColliderShape::Sphere { radius: r } => {
-                    segment_sphere_contact(lo, hi, radius, entry.center, *r)
+                    segment_sphere_contact(probe, entry.center, *r)
                 }
-                ColliderShape::Aabb { half_extents } => segment_box_contact(
-                    lo,
-                    hi,
-                    radius,
-                    entry.center,
-                    Quat::IDENTITY,
-                    *half_extents,
-                ),
+                ColliderShape::Aabb { half_extents } => {
+                    segment_box_contact(probe, entry.center, Quat::IDENTITY, *half_extents)
+                }
                 ColliderShape::Obb {
                     half_extents,
                     rotation,
-                } => segment_box_contact(lo, hi, radius, entry.center, *rotation, *half_extents),
+                } => segment_box_contact(probe, entry.center, *rotation, *half_extents),
                 // One hit per *collider*, as every other shape reports: the
                 // deepest triangle is what the overlap is. Ties go to the lowest
                 // triangle index, which is the order they arrive in.
                 ColliderShape::Trimesh(mesh) => {
-                    let mut best: Option<(Vec3, f32, Vec3)> = None;
+                    let mut best: Option<ShapeContact> = None;
                     segment_trimesh_contacts(
                         mesh,
                         entry.center,
-                        lo,
-                        hi,
-                        radius,
+                        probe,
                         &mut candidates,
-                        |normal, depth, point| {
-                            if best.is_none_or(|(_, d, _)| depth > d) {
-                                best = Some((normal, depth, point));
+                        |hit| {
+                            if best.is_none_or(|b| hit.depth > b.depth) {
+                                best = Some(hit);
                             }
                         },
                     );
@@ -2626,7 +3107,7 @@ impl CollisionWorld {
             push(entry.entity, entry.trigger, hit, &mut hits);
         });
         self.for_each_terrain(mask, |entry| {
-            let hit = segment_field_contact(entry, lo, hi, radius);
+            let hit = segment_field_contact(entry, probe);
             push(entry.entity, false, hit, &mut hits);
         });
         hits

@@ -2533,8 +2533,18 @@ fn the_bumpy_trimesh_run_ticks_to_its_pinned_fingerprint() {
          not a roll across bumps"
     );
 
+    // Re-pinned 2026-08-06 with the ridge cone (`ridge_cone_normal`) and the
+    // cross-collider seam rule. The bumpy soup is nothing but convex ridges, and
+    // on every one of them the capsule used to be able to pick up a normal
+    // tilted past the neighbouring face — the same defect that made a cliff lip
+    // snag and a bridge joint hop. The run's *shape* is unchanged: the five
+    // assertions above were written against the old number and all still hold,
+    // which is what says the geometry of the run did not move. What moved are
+    // the normals on the ticks where the body crossed a crest, and the
+    // widened gather band (`WITNESS_MARGIN`) that lets the seam rule see the
+    // surface next door.
     assert_eq!(
-        hash, 0xc959_12ed_9d98_0d91,
+        hash, 0x1ce6_195a_6e72_40fe,
         "the 240-tick run across the bumpy soup changed"
     );
 }
@@ -2567,4 +2577,588 @@ fn a_trimesh_snapshot_is_a_value_that_shares_its_geometry() {
         .raycast(Vec3::new(0.0, 5.0, 0.0), Vec3::NEG_Y, 20.0, ALL_LAYERS)
         .expect("both sheets are under the ray");
     assert_eq!(hit.entity, a);
+}
+
+// ---------------------------------------------------------------------------
+// Joints between colliders, and the lip of a cliff
+// ---------------------------------------------------------------------------
+//
+// Two feel bugs from playtesting the port, and the geometry they came from.
+//
+// 1. A phase bridge butted against a mountain ledge always bumped. The bridge is
+//    a box collider, the ledge is a baked soup, and `Trimesh`'s welder — which
+//    already solves this *inside* one soup — is built per collider and cannot
+//    see across the joint. The far collider's edge-region normal tilts backwards
+//    over the surface the body is on, and the tilt goes almost entirely into
+//    *vertical* velocity: a hop over flat ground.
+// 2. Walking or rolling off a steep cliff always snagged. The lip is a genuine
+//    convex ridge, so the soup's own flags call it exposed and the contact takes
+//    the direction to it — but a body standing a centimetre *back* from the lip
+//    is over the ledge top, not against the ridge, and the direction to the
+//    ridge is then tilted past the ground it is walking on. Against a
+//    near-vertical face it crosses behind the face's plane entirely and the old
+//    code read that as penetration: a 0.36 m ejection at the lip.
+//
+// Both are measured the same way — sweep the sub-tick phase at which the body
+// arrives at the feature, because a body that steps exactly onto a joint never
+// samples the band the defect lives in.
+
+/// PORT_SPEC's walking body at the port's own numbers: `moves.rs`
+/// `CAPSULE_RADIUS` 0.35 / `CAPSULE_HEIGHT` 1.4, `FLOOR_ANGLE_STANDING_DEG` 45,
+/// `SNAP_GROUNDED` 0.5.
+fn walker() -> CharacterBody {
+    CharacterBody::default()
+        .with_shape(CharacterShape::Capsule {
+            radius: 0.35,
+            height: 1.4,
+        })
+        .with_max_floor_degrees(45.0)
+        .with_snap_length(0.5)
+}
+
+/// The same body rolling: `ROLL_RADIUS` 0.35 as a sphere,
+/// `FLOOR_ANGLE_ROLLING_DEG` 180 — every contact is floor — and the same snap.
+fn roller() -> CharacterBody {
+    CharacterBody::default()
+        .with_shape(CharacterShape::Sphere { radius: 0.35 })
+        .with_max_floor_degrees(180.0)
+        .with_snap_length(0.5)
+}
+
+/// Half the body's height: where its centre sits when its feet rest on `y = 0`.
+fn resting_offset(body: &CharacterBody) -> f32 {
+    match body.shape {
+        CharacterShape::Capsule { height, .. } => height * 0.5,
+        CharacterShape::Sphere { radius } => radius,
+    }
+}
+
+/// A flat rectangle over `x ∈ [x0, x1]`, `z ∈ [-30, 30]`, at height `y`, cut
+/// into `cells` columns of two triangles — the shape a baked surface has.
+fn strip(x0: f32, x1: f32, y: f32, cells: usize) -> (Vec<Vec3>, Vec<u32>) {
+    let n = cells + 1;
+    let mut verts = Vec::with_capacity(2 * n);
+    for j in 0..2 {
+        let z = -30.0 + 60.0 * j as f32;
+        for i in 0..n {
+            verts.push(Vec3::new(x0 + (x1 - x0) * i as f32 / cells as f32, y, z));
+        }
+    }
+    let mut indices = Vec::with_capacity(cells * 6);
+    for i in 0..cells {
+        let (a, b) = (i as u32, i as u32 + 1);
+        let d = a + n as u32;
+        let c = d + 1;
+        indices.extend([a, d, c, a, c, b]);
+    }
+    (verts, indices)
+}
+
+/// A **solid** block over `x ∈ [x0, x1]`, `z ∈ [-30, 30]`, its top at `top` and
+/// two metres deep — a closed soup, with the top cut into `cells` columns so it
+/// carries the internal edges a bake leaves.
+///
+/// Solid rather than a bare sheet because the difference is not cosmetic: a
+/// snap probe drops half a metre, and under a sheet it meets the *boundary* of
+/// the surface it was standing on, which reads as a wall. A baked root is a
+/// volume, and its lip is the ridge between a top face and a side face.
+fn slab(x0: f32, x1: f32, top: f32, cells: usize) -> (Vec<Vec3>, Vec<u32>) {
+    let (bot, z0, z1) = (top - 2.0, -30.0f32, 30.0f32);
+    let mut verts: Vec<Vec3> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let mut quad = |p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3| {
+        let base = verts.len() as u32;
+        verts.extend([p0, p1, p2, p3]);
+        indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+    for i in 0..cells {
+        let xa = x0 + (x1 - x0) * i as f32 / cells as f32;
+        let xb = x0 + (x1 - x0) * (i + 1) as f32 / cells as f32;
+        quad(
+            Vec3::new(xa, top, z1),
+            Vec3::new(xb, top, z1),
+            Vec3::new(xb, top, z0),
+            Vec3::new(xa, top, z0),
+        );
+    }
+    quad(
+        Vec3::new(x0, bot, z0),
+        Vec3::new(x1, bot, z0),
+        Vec3::new(x1, bot, z1),
+        Vec3::new(x0, bot, z1),
+    );
+    quad(
+        Vec3::new(x1, bot, z1),
+        Vec3::new(x1, bot, z0),
+        Vec3::new(x1, top, z0),
+        Vec3::new(x1, top, z1),
+    );
+    quad(
+        Vec3::new(x0, bot, z0),
+        Vec3::new(x0, bot, z1),
+        Vec3::new(x0, top, z1),
+        Vec3::new(x0, top, z0),
+    );
+    quad(
+        Vec3::new(x0, bot, z1),
+        Vec3::new(x1, bot, z1),
+        Vec3::new(x1, top, z1),
+        Vec3::new(x0, top, z1),
+    );
+    quad(
+        Vec3::new(x1, bot, z0),
+        Vec3::new(x0, bot, z0),
+        Vec3::new(x0, top, z0),
+        Vec3::new(x1, top, z0),
+    );
+    (verts, indices)
+}
+
+/// What one run over a feature did to the body, in the terms the bug reports
+/// were written in.
+///
+/// The three velocity/teleport figures are gathered only while the body is
+/// within [`DEPARTURE`] of the height it started at — the window in which it is
+/// crossing the feature. Past that it is falling, and a body that *lands* on the
+/// face below a cliff is meant to lose speed and be pushed out; that is the
+/// landing, not the lip.
+#[derive(Debug, Default, Clone, Copy)]
+struct Run {
+    /// Worst drop below the driven horizontal speed, m/s.
+    speed_loss: f32,
+    /// Worst upward velocity the solver handed back, m/s. The bump.
+    kick: f32,
+    /// Worst rise above the resting height, m.
+    rise: f32,
+    /// Ticks on which `on_floor` went false.
+    airborne: u32,
+    /// Largest single-tick horizontal step, m — a teleport shows up here.
+    jump: f32,
+    end: Vec3,
+}
+
+impl Run {
+    fn worst(self, other: Run) -> Run {
+        Run {
+            speed_loss: self.speed_loss.max(other.speed_loss),
+            kick: self.kick.max(other.kick),
+            rise: self.rise.max(other.rise),
+            airborne: self.airborne.max(other.airborne),
+            jump: self.jump.max(other.jump),
+            end: other.end,
+        }
+    }
+}
+
+/// Drive `body` along `+dir` at `speed`, re-asserting the drive every grounded
+/// tick — the port's own loop, with gravity while airborne and the state
+/// machine's input replaced by a constant.
+fn drive(
+    geometry: &CollisionWorld,
+    body: &mut CharacterBody,
+    start: Vec3,
+    dir: Vec3,
+    speed: f32,
+    ticks: u32,
+) -> Run {
+    let rest = start.y;
+    let mut p = start;
+    let mut v = dir * speed;
+    let mut run = Run::default();
+    for _ in 0..ticks {
+        if body.on_floor {
+            v = dir * speed;
+        } else {
+            v.y -= GRAVITY * DT;
+        }
+        let before = p;
+        let result = move_and_slide(geometry, body, p, v, DT);
+        p = result.position;
+        v = result.velocity;
+        run.rise = run.rise.max(p.y - rest);
+        run.airborne += u32::from(!result.on_floor);
+        if p.y >= rest - DEPARTURE {
+            run.speed_loss = run.speed_loss.max(speed - v.dot(dir));
+            run.kick = run.kick.max(v.y);
+            run.jump = run.jump.max((p - before).dot(dir).abs());
+        }
+    }
+    run.end = p;
+    run
+}
+
+/// The same drive, repeated at 32 sub-tick arrival phases, worst case kept.
+///
+/// A body walking at 4 m/s covers 6.7 cm a tick and the defect's band is 2.6 cm
+/// wide, so a single run has about a one-in-three chance of stepping straight
+/// over it — which is exactly why the joint "sometimes" bumped.
+fn sweep_phases(
+    geometry: &CollisionWorld,
+    body: &CharacterBody,
+    start: Vec3,
+    dir: Vec3,
+    speed: f32,
+    distance: f32,
+) -> Run {
+    let ticks = (distance / (speed * DT)).ceil() as u32;
+    let mut worst = Run::default();
+    for phase in 0..32u32 {
+        let mut b = *body;
+        b.on_floor = true;
+        let offset = dir * (speed * DT * phase as f32 / 32.0);
+        worst = worst.worst(drive(geometry, &mut b, start - offset, dir, speed, ticks));
+    }
+    worst
+}
+
+/// How far a body may drop below the surface it left and still be *crossing*
+/// the feature rather than falling away from it — see [`Run`]. A third of the
+/// capsule's radius: far enough that the whole lip is inside the window, near
+/// enough that nothing the body lands on later is.
+const DEPARTURE: f32 = 0.12;
+
+/// How much of a bump the tests will tolerate. A tenth of a millimetre per
+/// second is float noise on a 12 m/s run; the defect measured 0.30 m/s of
+/// upward kick at walking speed and 0.85 m/s rolling.
+const NO_BUMP: f32 = 1.0e-4;
+
+/// The two joints the port actually has, plus the two the level author's hand
+/// produces: surfaces that overlap in plan, and surfaces a few millimetres out
+/// of true. Every one of them is one flat surface as far as the player is
+/// concerned.
+fn joint(kind: &str) -> CollisionWorld {
+    let mut level = Level::new();
+    let mut geometry;
+    match kind {
+        // A baked ledge to x = 0, a box bridge from x = 0 — the phase bridge.
+        // `lift` is the bridge out of true vertically, `gap` horizontally.
+        "box|soup" | "box|soup 8mm high" | "box|soup 8mm low" | "box|soup 8mm gap"
+        | "box|soup step 0.3" => {
+            let (lift, gap) = match kind {
+                "box|soup 8mm high" => (0.008, 0.0),
+                "box|soup 8mm low" => (-0.008, 0.0),
+                "box|soup 8mm gap" => (0.0, 0.008),
+                "box|soup step 0.3" => (0.3, 0.0),
+                _ => (0.0, 0.0),
+            };
+            let ledge = level.bare();
+            level.aabb(
+                Vec3::new(6.0 + gap, -2.0 + lift, 0.0),
+                Vec3::new(6.0, 2.0, 30.0),
+            );
+            geometry = level.snapshot();
+            let (verts, indices) = slab(-12.0, 0.0, 0.0, 12);
+            let mesh = Trimesh::build_from_soup(&verts, &indices);
+            push_trimesh(&mut geometry, ledge, Vec3::ZERO, &mesh, 1);
+        }
+        // Two boxes, which is what two placed props are.
+        "box|box" => {
+            level.aabb(Vec3::new(-6.0, -2.0, 0.0), Vec3::new(6.0, 2.0, 30.0));
+            level.aabb(Vec3::new(6.0, -2.0, 0.0), Vec3::new(6.0, 2.0, 30.0));
+            geometry = level.snapshot();
+        }
+        // Two baked roots, which is what two CSG roots are.
+        "soup|soup" => {
+            let (a, b) = (level.bare(), level.bare());
+            geometry = level.snapshot();
+            let (va, ia) = slab(-12.0, 0.0, 0.0, 12);
+            let (vb, ib) = slab(0.0, 12.0, 0.0, 12);
+            push_trimesh(&mut geometry, a, Vec3::ZERO, &Trimesh::build_from_soup(&va, &ia), 1);
+            push_trimesh(&mut geometry, b, Vec3::ZERO, &Trimesh::build_from_soup(&vb, &ib), 1);
+        }
+        // The bridge pushed 0.4 m into the cliff, so the ledge's lip edge is
+        // buried inside the box and the box's edge is under the ledge.
+        "box|soup overlapped" => {
+            let ledge = level.bare();
+            level.aabb(Vec3::new(5.6, -2.0, 0.0), Vec3::new(6.0, 2.0, 30.0));
+            geometry = level.snapshot();
+            let (verts, indices) = slab(-12.0, 0.4, 0.0, 12);
+            let mesh = Trimesh::build_from_soup(&verts, &indices);
+            push_trimesh(&mut geometry, ledge, Vec3::ZERO, &mesh, 1);
+        }
+        other => panic!("no such joint: {other}"),
+    }
+    geometry
+}
+
+#[test]
+fn crossing_a_joint_between_two_colliders_costs_no_speed_and_no_hop() {
+    // `out_of_true` is the vertical mismatch the joint carries, which the body
+    // is allowed to rise by. `float` is how many ticks it may spend off the
+    // floor: zero everywhere the two surfaces are level, and one for a joint
+    // that steps *down* by less than the tolerance — where the snap probe, a
+    // static drop rather than Godot's swept cast, can find itself a few
+    // centimetres inside the lower box and leave by its side face rather than
+    // its top. That is the probe's own approximation (`snap_to_floor`), it
+    // predates this rule, and it costs one tick of `on_floor` on an eight
+    // millimetre drop.
+    for (kind, out_of_true, float) in [
+        ("box|soup", 0.0f32, 0u32),
+        ("box|box", 0.0, 0),
+        ("soup|soup", 0.0, 0),
+        ("box|soup overlapped", 0.0, 0),
+        ("box|soup 8mm gap", 0.0, 0),
+        ("box|soup 8mm high", 0.008, 1),
+        ("box|soup 8mm low", 0.008, 1),
+    ] {
+        let geometry = joint(kind);
+        for (name, body, speed) in [
+            ("walk", walker(), 4.0f32),
+            ("run", walker(), 8.0),
+            ("roll", roller(), 12.0),
+        ] {
+            for dir in [Vec3::X, Vec3::NEG_X] {
+                let start = Vec3::new(-3.0 * dir.x, resting_offset(&body), 0.0);
+                let run = sweep_phases(&geometry, &body, start, dir, speed, 6.0);
+                assert!(
+                    run.speed_loss < NO_BUMP,
+                    "{kind} {name} {dir}: the joint took {} m/s of horizontal speed",
+                    run.speed_loss
+                );
+                assert!(
+                    run.kick < NO_BUMP,
+                    "{kind} {name} {dir}: the joint kicked the body up at {} m/s",
+                    run.kick
+                );
+                assert!(
+                    run.rise < out_of_true + NO_BUMP,
+                    "{kind} {name} {dir}: the joint lifted the body {} m",
+                    run.rise
+                );
+                assert!(
+                    run.airborne <= float,
+                    "{kind} {name} {dir}: on_floor flickered off {} times \
+                     crossing the joint, more than the {float} allowed",
+                    run.airborne
+                );
+                assert!(
+                    (run.end.x * dir.x) > 2.5,
+                    "{kind} {name} {dir}: the run ended at x = {}, still short \
+                     of the far side",
+                    run.end.x
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_wall_butted_onto_a_floor_still_stops_the_body() {
+    // The false positive the seam rule has to refuse. The wall's bottom edge
+    // lies exactly in the floor's plane and touches it, which is rule 2 of
+    // `suppress_cross_collider_seams` satisfied — and rule 3, orientation,
+    // is the only thing between "one smooth surface" and walking through a wall.
+    for wall_is_soup in [false, true] {
+        let mut level = Level::new();
+        level.aabb(Vec3::new(0.0, -2.0, 0.0), Vec3::new(12.0, 2.0, 6.0));
+        let soup_wall = level.bare();
+        if !wall_is_soup {
+            level.aabb(Vec3::new(5.0, 1.5, 0.0), Vec3::new(1.0, 1.5, 6.0));
+        }
+        let mut geometry = level.snapshot();
+        if wall_is_soup {
+            // A vertical face at x = 4, rising off the floor it is butted onto.
+            let verts = vec![
+                Vec3::new(4.0, 0.0, -6.0),
+                Vec3::new(4.0, 0.0, 6.0),
+                Vec3::new(4.0, 3.0, 6.0),
+                Vec3::new(4.0, 3.0, -6.0),
+            ];
+            // Wound so the face looks back down `-x`, at the body walking into
+            // it: a soup is single-sided and its winding is the level's, not
+            // the test's choice.
+            let indices = vec![0, 1, 2, 0, 2, 3];
+            let mesh = Trimesh::build_from_soup(&verts, &indices);
+            push_trimesh(&mut geometry, soup_wall, Vec3::ZERO, &mesh, 1);
+        }
+
+        let mut body = walker();
+        body.on_floor = true;
+        let feet = Vec3::new(0.0, resting_offset(&body), 0.0);
+        let run = drive(&geometry, &mut body, feet, Vec3::X, 8.0, 120);
+        assert!(
+            run.end.x < 4.0,
+            "the body reached x = {} — it went through the wall",
+            run.end.x
+        );
+        assert!(
+            run.speed_loss > 7.9,
+            "the wall only took {} m/s: it did not stop the body",
+            run.speed_loss
+        );
+        assert!(
+            body.on_floor,
+            "the body left the floor while being stopped by a wall"
+        );
+    }
+}
+
+#[test]
+fn a_three_hundred_millimetre_rise_is_still_a_step_and_not_a_seam() {
+    // The other false positive: a joint the level author *meant*. 0.3 m is
+    // thirty times `SEAM_PLANE_TOLERANCE`, so the two surfaces never read as
+    // one — the capsule's round bottom rides up it, as it does over any step
+    // inside its radius, and the ride is what the assertions look for.
+    let geometry = joint("box|soup step 0.3");
+    let body = walker();
+    let start = Vec3::new(-3.0, resting_offset(&body), 0.0);
+    let run = sweep_phases(&geometry, &body, start, Vec3::X, 4.0, 6.0);
+
+    // 0.3 m against a 0.35 m radius puts the contact 5.7° above horizontal:
+    // a wall, and the capsule stops at it. What matters is that it is *some*
+    // feature — a seam would have let the body sail across at constant height,
+    // which is what the 8 mm joint above is allowed to do and this is not.
+    assert!(
+        run.speed_loss > 3.9,
+        "the step only took {} m/s: it was flattened into a seam",
+        run.speed_loss
+    );
+    assert!(
+        run.end.x < 0.0,
+        "the body reached x = {} — it walked over a 0.3 m rise",
+        run.end.x
+    );
+    assert!(
+        run.rise < 0.05,
+        "the body climbed {} m of a 0.3 m step it cannot climb",
+        run.rise
+    );
+}
+
+/// A ledge top at `y = 0` out to `x = 0`, and a face falling away from that lip
+/// at `steep` degrees from horizontal — one soup, as a baked mountain is.
+fn cliff(steep: f32) -> CollisionWorld {
+    let (mut verts, mut indices) = strip(-12.0, 0.0, 0.0, 12);
+    let run = 12.0 / steep.to_radians().tan();
+    let base = verts.len() as u32;
+    for j in 0..2 {
+        let z = -30.0 + 60.0 * j as f32;
+        verts.push(Vec3::new(0.0, 0.0, z));
+        verts.push(Vec3::new(run, -12.0, z));
+    }
+    indices.extend([base, base + 2, base + 3, base, base + 3, base + 1]);
+
+    let mut level = Level::new();
+    let mountain = level.bare();
+    let mut geometry = level.snapshot();
+    let mesh = Trimesh::build_from_soup(&verts, &indices);
+    push_trimesh(&mut geometry, mountain, Vec3::ZERO, &mesh, 1);
+    geometry
+}
+
+#[test]
+fn walking_or_rolling_off_a_steep_cliff_detaches_cleanly() {
+    for steep in [55.0f32, 70.0, 80.0, 89.0] {
+        let geometry = cliff(steep);
+        for (name, body, speed) in [
+            ("walk", walker(), 4.0f32),
+            ("run", walker(), 8.0),
+            ("roll", roller(), 12.0),
+        ] {
+            let start = Vec3::new(-3.0, resting_offset(&body), 0.0);
+            let run = sweep_phases(&geometry, &body, start, Vec3::X, speed, 3.0 + speed * 0.5);
+            // No tick of lost horizontal speed: the lip must not brake.
+            assert!(
+                run.speed_loss < NO_BUMP,
+                "{steep}° {name}: the lip took {} m/s of horizontal speed \
+                 before the fall",
+                run.speed_loss
+            );
+            // No upward kick, and no snap-back or ejection: one tick's travel is
+            // `speed · dt`, and nothing may move the body further than that.
+            assert!(
+                run.kick < NO_BUMP,
+                "{steep}° {name}: the lip kicked the body up at {} m/s",
+                run.kick
+            );
+            assert!(
+                run.rise < NO_BUMP,
+                "{steep}° {name}: the lip lifted the body {} m",
+                run.rise
+            );
+            assert!(
+                run.jump < speed * DT + 1e-4,
+                "{steep}° {name}: a tick moved the body {} m, more than the \
+                 {} m it was travelling — the lip ejected it",
+                run.jump,
+                speed * DT
+            );
+            assert!(
+                run.end.y < -1.0,
+                "{steep}° {name}: the body ended at y = {} — it never fell",
+                run.end.y
+            );
+        }
+    }
+}
+
+#[test]
+fn walking_along_the_top_edge_of_a_cliff_neither_falls_nor_snags() {
+    // The other half of the lip: a body running *parallel* to it, one
+    // centimetre inside, is on the ledge and must stay there at full speed.
+    for steep in [55.0f32, 80.0, 89.0] {
+        let geometry = cliff(steep);
+        for (name, body, speed) in [("run", walker(), 8.0f32), ("roll", roller(), 12.0)] {
+            for lane in [-0.01f32, -0.05, -0.2] {
+                let mut b = body;
+                b.on_floor = true;
+                let start = Vec3::new(lane, resting_offset(&body), -5.0);
+                let run = drive(&geometry, &mut b, start, Vec3::Z, speed, 60);
+                assert!(
+                    run.speed_loss < NO_BUMP && run.kick < NO_BUMP && run.rise < NO_BUMP,
+                    "{steep}° {name} lane {lane}: running along the lip cost \
+                     {} m/s, {} m/s of lift, {} m of rise",
+                    run.speed_loss,
+                    run.kick,
+                    run.rise
+                );
+                assert_eq!(
+                    run.airborne, 0,
+                    "{steep}° {name} lane {lane}: the body left the ledge \
+                     running along it"
+                );
+                assert!(
+                    (run.end.x - lane).abs() < 1e-4,
+                    "{steep}° {name} lane {lane}: the lip pushed the body to \
+                     x = {}",
+                    run.end.x
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn floor_snap_still_holds_a_body_to_every_slope_it_may_stand_on() {
+    // The fix must not have bought the cliff by disarming the snap. A
+    // triangulated ramp at each angle inside `max_floor_angle`, walked
+    // downhill: grounded every tick, which is the whole point of `snap_length`.
+    for degrees in [5.0f32, 15.0, 25.0, 35.0, 44.0] {
+        let pitch = Quat::from_rotation_x(degrees.to_radians());
+        let (verts, indices) = grid_soup(12.0, 12, |_, _| 0.0);
+        let pitched: Vec<Vec3> = verts.iter().map(|v| pitch * *v).collect();
+        let mut level = Level::new();
+        let ramp = level.bare();
+        let mut geometry = level.snapshot();
+        let mesh = Trimesh::build_from_soup(&pitched, &indices);
+        push_trimesh(&mut geometry, ramp, Vec3::ZERO, &mesh, 1);
+
+        // Positive pitch drops the +Z edge, so +Z is downhill.
+        let mut body = walker();
+        body.on_floor = true;
+        let lift = Vec3::Y * resting_offset(&body);
+        let start = pitch * Vec3::new(0.0, 0.0, -6.0) + lift;
+        let run = drive(&geometry, &mut body, start, Vec3::Z, 6.0, 60);
+        assert_eq!(
+            run.airborne, 0,
+            "{degrees}°: the body launched off the ramp on {} of 60 ticks \
+             despite the snap",
+            run.airborne
+        );
+        assert!(
+            run.end.z - start.z > 5.5,
+            "{degrees}°: the run only covered {} m of the 6 m it was driven",
+            run.end.z - start.z
+        );
+    }
 }
