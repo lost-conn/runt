@@ -45,6 +45,20 @@ serde = { version = "1", features = ["derive"] }
 ron = "0.12"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 
+# Every test, example, and bench target links the whole workspace, and by
+# default (`split-debuginfo = "packed"` on Linux) each one gets its own copy of
+# every dependency's DWARF baked into the executable. With enough targets that
+# is tens of gigabytes of byte-identical debuginfo. "unpacked" splits the DWARF
+# out into `deps/*.dwo` and has the binaries reference it instead, so one copy
+# is shared by every target that links that crate. Measured on this workspace:
+# the linked artifacts drop ~60% (runt_ball 249M -> 93M, render 222M -> 73M).
+#
+# The tradeoff: `target/debug/deps` becomes load-bearing for debugging — a
+# binary copied out of the tree, or whose `.dwo` files are gone, has no symbols
+# — which only matters for a build tree you were going to rebuild anyway.
+[profile.dev]
+split-debuginfo = "unpacked"
+
 [profile.release]
 opt-level = "s"
 lto = true
