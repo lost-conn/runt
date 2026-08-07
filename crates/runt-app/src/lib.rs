@@ -340,6 +340,9 @@ struct Host {
     /// The last [`StatusLine`](runt_core::StatusLine) painted, so an unchanged
     /// line costs nothing per frame.
     shown_status: String,
+    /// The last `WindowMode` handed to the platform, so an unchanged want costs
+    /// nothing and a user who left fullscreen themselves is not overruled.
+    window_mode: runt_core::WindowMode,
     /// Where sound goes (DESIGN §8). [`SilentBackend`](runt_core::SilentBackend)
     /// for a program that asked for none — the engine cannot tell the
     /// difference, and neither can a determinism test.
@@ -463,6 +466,7 @@ impl Host {
             on_frame: run.on_frame,
             title: run.title,
             shown_status: String::new(),
+            window_mode: runt_core::WindowMode::default(),
             audio,
             cache,
         };
@@ -507,6 +511,45 @@ impl Host {
                 }
             }
         }
+    }
+
+    /// The window the world is asking for (`runt_core::ecs::WindowMode`),
+    /// applied when it differs from what was last asked for.
+    ///
+    /// Tracks *what it asked the platform for*, not what the window is: a user
+    /// who leaves fullscreen with F11 or Escape has not changed the game's mind,
+    /// and re-forcing it every frame would make the window unclosable. The game
+    /// asks again — by toggling the setting — or it stays out.
+    ///
+    /// # Why this is called from two places
+    ///
+    /// Natively, the frame path is enough. On the web `requestFullscreen` is
+    /// only honoured inside a user-gesture handler, and a frame callback is not
+    /// one, so the same call is made from [`handle_input`](Host::handle_input)
+    /// while the browser's event is still on the stack. In practice the tap that
+    /// ticks the menu into asking is followed immediately by its own
+    /// `touchend` — a gesture — so the change lands on the release of the very
+    /// tap that made it. A change nobody follows with any input at all waits,
+    /// which on a touchscreen cannot happen and on a desktop browser means one
+    /// more click.
+    fn apply_window_mode(&mut self) {
+        let wanted = self.engine.sim().window_mode();
+        if wanted == self.window_mode {
+            return;
+        }
+        self.window_mode = wanted;
+        self.window.set_fullscreen(if wanted.fullscreen {
+            // The window's current monitor, and borderless: `Exclusive` needs a
+            // video mode picked from a list and changes the *display*, which is
+            // a heavier promise than a game settings toggle makes.
+            Some(winit::window::Fullscreen::Borderless(None))
+        } else {
+            None
+        });
+        log::info!(
+            "window: fullscreen {}",
+            if wanted.fullscreen { "on" } else { "off" }
+        );
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -589,6 +632,10 @@ impl Host {
 
         self.engine.queue().present(frame);
         self.sync_status();
+        // Natively this is where a fullscreen toggle lands. On web it is the
+        // *fallback* — a frame callback is not a user gesture, so the browser
+        // refuses here and `handle_input` catches it on the next event.
+        self.apply_window_mode();
 
         // Anything the frame generated goes to storage *after* it was
         // presented, never before: the first frame is the slow one (it is the
@@ -620,6 +667,12 @@ impl Host {
     /// was an input event (handled here and nowhere else) — translation is the
     /// host's entire job, the engine never sees a winit type (DESIGN §2).
     fn handle_input(&mut self, event: &WindowEvent) -> bool {
+        // A pending window change, applied while a browser event is still on
+        // the stack — the only place on the web where `requestFullscreen` is
+        // allowed to work. Before the translation below rather than after, so
+        // *this* event's own gesture is the one spent, and a no-op (the common
+        // case, every event of every frame) is one comparison.
+        self.apply_window_mode();
         match event {
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else {

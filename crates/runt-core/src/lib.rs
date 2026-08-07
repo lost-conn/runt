@@ -100,7 +100,7 @@ pub use draw::{Aabb, DrawItem, DrawStats, FrameParams, Frustum, InstanceRun};
 pub use ecs::{
     default_horizon, project_phase_fx, DemoScene, FixedSim, GeneratorRef, GlobalTransform,
     Interpolated, Lighting, MeshRef, PhaseFx, PostSim, QualityTier, RenderScale, Spin, Startup,
-    StatusLine, TerrainSurface, TickCount, Transform, Viewport, Visibility,
+    StatusLine, TerrainSurface, TickCount, Transform, Viewport, Visibility, WindowMode,
 };
 #[cfg(feature = "editor")]
 pub use editor::{

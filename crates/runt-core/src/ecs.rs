@@ -96,6 +96,34 @@ impl StatusLine {
     }
 }
 
+/// What the game is asking the host's **window** to be.
+///
+/// [`StatusLine`]'s sibling and exactly its shape: a game system writes it, the
+/// host reads it after the tick and touches its platform only when the value
+/// actually changed, and nothing in the engine reads it back. A host that
+/// ignores it entirely still runs the same simulation — which is what makes it
+/// safe to write from `FixedSim` (DESIGN §2: the host translates, the engine
+/// decides nothing about windows).
+///
+/// It carries the *want*, not the state. Nothing here reports whether the window
+/// is fullscreen — the compositor, the browser and the user can all change that
+/// behind the game's back, and a resource that tried to mirror it would be a
+/// second source of truth for something the host already knows. A game asks; the
+/// host answers by doing it or not.
+///
+/// # The web needs a gesture
+///
+/// `requestFullscreen` is only honoured inside a user-gesture handler, and a
+/// tick is not one — it runs from an animation frame. So a host on the web
+/// applies a pending change on the next **input event** instead, which is
+/// usually the release of the very tap that asked for it. See
+/// `runt_app`'s `apply_window_mode`.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
+pub struct WindowMode {
+    pub fullscreen: bool,
+}
+
 /// The size, in logical pixels, of the view the host last handed
 /// [`Engine::render`](crate::Engine::render) — i.e. the coordinate space
 /// [`UiBatch`](crate::ui::UiBatch) quads are measured in.

@@ -18,7 +18,7 @@ use crate::camera::Camera;
 use crate::draw::{self, DrawItem, DrawQuery, FrameParams};
 use crate::ecs::{
     self, DemoEntity, FixedTick, Interpolated, Lighting, QualityTier, StatusLine, TickCount,
-    Transform,
+    Transform, WindowMode,
 };
 use crate::input::{Input, InputEvent};
 use crate::registry::MeshLibrary;
@@ -425,6 +425,16 @@ impl Sim {
             .get_resource::<StatusLine>()
             .map(|s| s.as_str())
             .unwrap_or("")
+    }
+
+    /// The window the game is asking for (DESIGN §2's host seam, the same shape
+    /// [`status_line`](Sim::status_line) has). Default until something writes
+    /// [`WindowMode`], and default is "whatever the host opened with".
+    pub fn window_mode(&self) -> WindowMode {
+        self.world
+            .get_resource::<WindowMode>()
+            .copied()
+            .unwrap_or_default()
     }
 
     // -- audio (DESIGN §8) ---------------------------------------------------
