@@ -17,6 +17,13 @@ reflect = ["dep:bevy_reflect"]
 # halves of §10a's "tooling is one feature, not one crate" must be off together
 # for the wasm player.
 editor = ["reflect"]
+# The 8 × 8 fallback typeface (`font::micro`). Off by default because a game is
+# expected to bake its own face with `tools/font-bake`, and two fonts in one wasm
+# module is the thing that split exists to avoid — but 816 bytes of table is what
+# a game has *before* it has picked one, and it is what the baker substitutes for
+# a codepoint a real typeface turns out not to contain. Pure data and code: it
+# adds no dependency, and `font` itself is compiled unconditionally.
+default-font = []
 
 [dependencies]
 runt-mesh = { workspace = true, features = ["serde"] }

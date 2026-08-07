@@ -534,9 +534,43 @@ Three things pushed it over:
 **Where it landed:** `runt_core::tweak` is the registry (opt-in roots →
 `Reflect`-walked dotted paths → clamped edits → a serializable overrides map),
 `runt_core::tweak_panel` is the debug overlay that drives it, and both are
-behind `reflect` so a wasm build compiles them away entirely. The one thing the
-engine cannot supply is a font — `UiBatch` is quads and an atlas is game
-content — so the panel takes a `PanelFont` from the host.
+behind `reflect` so a wasm build compiles them away entirely. The panel takes a
+`PanelFont` from the host, because `UiBatch` is quads and glyph pixels are game
+content.
+
+**Amended 2026-08-07 (§10a-font):** this section used to say "the one thing the
+engine cannot supply is a font". That was two claims wearing one coat, and only
+the second survives:
+
+- The engine **can** supply text *layout*, and now does. `runt_core::font` is a
+  `BitmapFont` — glyph rects, bearings, advances, a sorted codepoint map,
+  optional kerning — plus `width` / `ink_width` / `line_height` / `text` /
+  `text_centered` / `text_right` / `wrap` / `shape` over it, and a blanket
+  `impl PanelFont for BitmapFont`. `PanelFont` stays a trait so a game with some
+  other idea of text can still be one, but no game has to write the impl any
+  more; 3dimenshift's eight-line `AtlasFont` shim is deleted.
+- The engine **must not** supply a *typeface*, and still does not. Letterforms
+  are game content the way an albedo texture is. The one exception is
+  `font::micro`, 102 glyphs of 8 × 8 behind the off-by-default `default-font`
+  feature — 816 bytes so a new game has *some* text before it picks a face, and
+  so the baker has something to substitute for a codepoint a real face lacks.
+
+The decoder and the rasterizer live in **`tools/font-bake`**, a workspace member
+that is deliberately not a *default* member (the convention 3dimenshift's
+manifest already documents for its `tools/*`). It takes a TTF/OTF, a charset and
+a list of `SCALE:PX` sizes and writes a postcard `FontAsset`: one atlas of 8-bit
+coverage, one glyph table per size. It is deterministic — same bytes in, same
+bytes out — because headless screenshot tests depend on stable pixels. `ab_glyph`
+is a dependency of that binary and of nothing else in the tree, which is the
+whole point: `cargo tree --target wasm32-unknown-unknown` for a player finds no
+rasterizer and no font file, only rectangles.
+
+Three constraints shaped it. Sizes are baked **per size**, never scaled, because
+the UI sampler is `Nearest` with `filterable: false` (§11's downlevel WebGL2
+floor) and a resampled glyph looks like it. All sizes share **one atlas image**,
+because `TextureRegistry::insert_image` is idempotent by handle. And
+`tweak_panel::row_pitch()` stays `font::UNIT · SCALE + 2` — the same 18 pixels it
+always was — because a game switching typefaces must not move anybody's finger.
 
 What §10 still holds for: **panels are generated from `Reflect`, with bounds
 declared at the param** (`FieldRange`). That was the load-bearing claim and it
@@ -698,7 +732,16 @@ seeded deterministic runs) in browser + native.
   needs no isolation); if generation-on-a-worker later wants SAB it must
   justify coi-serviceworker's costs (first-load reload, COEP embed breakage)
   on its own. Default assumption: message passing suffices.
-- **Text/HUD rendering** in the player (not editor): none designed. Cheapest
-  candidate: DOM overlay on web, nothing native, until a real need appears.
+- ~~**Text/HUD rendering** in the player (not editor): none designed. Cheapest
+  candidate: DOM overlay on web, nothing native, until a real need appears.~~
+  **Closed 2026-08-07.** Not a DOM overlay: it is in the same `UiBatch` as
+  everything else, so it works native, headless and in a screenshot test, which
+  a DOM overlay does not. `runt_core::font` is the layout, `tools/font-bake` is
+  the build-time rasterizer, and the pixels belong to the game — see §10a's
+  amendment. What is still *not* designed, and is deliberately out of scope:
+  runtime rasterization, growable atlases, an R8 atlas format
+  (`bake::BAKE_FORMAT` stays `Rgba8Unorm`), a linear-sampled pipeline variant,
+  and any of shaping, bidi or ligatures. Greedy whitespace `wrap()` is the whole
+  paragraph engine.
 - **rinch wgpu convergence:** revisit the GPU bridge when rinch leaves the
   wgpu-27 fork.

@@ -1,0 +1,24 @@
+[package]
+name = "font-bake"
+version.workspace = true
+edition.workspace = true
+description = "TTF/OTF → a runt `FontAsset`: one atlas, one glyph table per pixel size. Dev-only."
+publish = false
+
+[dependencies]
+# The types this tool exists to write. `default-font` because the baker
+# substitutes the 8 × 8 micro-font for any codepoint the real typeface turns out
+# not to contain (`--fallback-micro`) — a hand-authored `▸` beats a hole.
+runt-core = { workspace = true, features = ["default-font"] }
+# The rasterizer. Pure Rust, no C, no system font machinery, and already in this
+# workspace's lock file (sctk-adwaita pulls it for winit's client-side
+# decorations), so adding it here is a feature on a crate the tree contains
+# rather than a new crate.
+#
+# It lives *here* and nowhere else. This binary is a workspace member but not a
+# default member, exactly like the converters in 3dimenshift-runt/tools: it runs
+# by hand when the typeface or the size list changes, and its output is a file
+# somebody commits. Nothing that ships links it — `cargo tree --target
+# wasm32-unknown-unknown -p runt-app` and the same for a game's wasm crate must
+# stay free of `ab_glyph`.
+ab_glyph = "0.2"

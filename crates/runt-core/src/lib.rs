@@ -35,6 +35,10 @@ pub mod editor;
 #[cfg(feature = "editor")]
 pub mod editor_gizmo;
 pub mod engine;
+/// Bitmap-font layout over a baked glyph table (DESIGN §10a): the engine owns
+/// the code, a game owns the pixels. No typeface here except the optional
+/// `default-font` fallback.
+pub mod font;
 pub mod gen;
 pub mod input;
 pub mod material;
@@ -106,6 +110,7 @@ pub use editor::{
 #[cfg(feature = "editor")]
 pub use editor_gizmo::{Gizmo, GizmoMesh, GizmoPart};
 pub use engine::Engine;
+pub use font::{BitmapFont, FontAsset, FontError, Glyph, Kern};
 pub use gen::{GeneratorSpec, Shading};
 pub use input::{Input, InputEvent, Key, PadButton, PadStick, PadTrigger, Touch, TouchPhase};
 pub use material::{Material, MaterialVariant};

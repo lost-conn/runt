@@ -7,6 +7,17 @@ members = [
     "crates/runt-audio-worklet",
     "crates/runt-app",
     "demo/*",
+    # Offline machinery. `font-bake` turns a .ttf into the `FontAsset` a game
+    # `include_bytes!`s. A workspace *member* so it shares the lock file and the
+    # engine's exact `runt-core`, and deliberately **not** a *default* member —
+    # `cargo build` and `cargo test` at the root are about the player, and a
+    # converter only runs by hand when its input changes
+    # (`cargo run -p font-bake -- --help`). The same convention
+    # 3dimenshift-runt's root manifest documents for its `tools/*`.
+    #
+    # This is also what keeps `ab_glyph` out of every shipped wasm module: it is
+    # a dependency of this binary and of nothing else in the tree.
+    "tools/font-bake",
 ]
 # `cargo run` / `cargo build` from the root act on the player host.
 default-members = ["crates/runt-app"]

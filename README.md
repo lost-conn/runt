@@ -23,6 +23,10 @@ crates/runt-app/    player host: winit loop, surface + present, wasm entry.
                     `RunConfig` + `run_with` is the seam every program uses.
 demo/ball/          the v0 game. All rules in src/game.rs, all content in
                     assets/level1.ron. Zero engine changes.
+tools/font-bake/    offline: a .ttf and a list of sizes in, the `FontAsset` a
+                    game include_bytes!s out. A workspace member but not a
+                    default one — nothing that ships links it, which is what
+                    keeps `ab_glyph` out of every player's wasm.
 ```
 
 `cargo run` from the root builds `runt-app` (the workspace's default member).

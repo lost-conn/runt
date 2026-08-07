@@ -22,13 +22,19 @@
 //! # It is engine-side, and it draws with the game's font
 //!
 //! The panel logic lives here so every runt game gets it for the price of one
-//! system, but the engine **has no font**: [`UiBatch`] is quads, and a bitmap
+//! system, but the engine has **no typeface**: [`UiBatch`] is quads and a glyph
 //! atlas is game-authored content ([`UiAtlasImage`](crate::ui::UiAtlasImage)'s
 //! whole reason to exist). So the glyphs come in through [`PanelFont`], a
-//! two-method trait a game implements over the atlas it already ships. Baking a
-//! second micro-font into the engine to avoid a trait would put two fonts in
-//! every wasm module that has one, which is a worse trade than an eight-line
-//! impl.
+//! two-method trait.
+//!
+//! Since [`crate::font`] landed there is nothing left for a game to implement:
+//! every [`BitmapFont`](crate::font::BitmapFont) *is* a `PanelFont`, so a game
+//! hands the panel the same font it draws its HUD with and the trait is only
+//! still a trait so that a game with some other idea of text can still be one.
+//!
+//! [`row_pitch`] is where that lands geometrically: `SCALE` is in
+//! [`font::UNIT`](crate::font::UNIT) cells, so a font baked *for* that scale
+//! draws texel-for-pixel and the pitch is the same number it has always been.
 //!
 //! # The seam
 //!
@@ -76,9 +82,12 @@ use crate::ui::UiBatch;
 /// How the panel draws text: the game's own atlas, behind two methods.
 ///
 /// Both are in the same coordinate space [`UiQuad`](crate::ui::UiQuad) is —
-/// logical pixels, top-left origin, +Y down — and both take a `scale` in the
-/// game's own units so the panel matches whatever the rest of its HUD looks
-/// like.
+/// logical pixels, top-left origin, +Y down — and both take a `scale` in
+/// [`font::UNIT`](crate::font::UNIT) cells, so the panel matches whatever the
+/// rest of the game's HUD looks like.
+///
+/// [`crate::font::BitmapFont`] implements this, which is normally all a game
+/// needs to know: `draw(…, &font, …)`.
 ///
 /// Two methods, not three: the panel deliberately does **not** ask the font for
 /// a line height. The row pitch is [`row_pitch`], a constant, because the touch
@@ -112,8 +121,9 @@ pub const OVERRIDDEN: [f32; 4] = [1.0, 0.78, 0.32, 1.0];
 pub const BAR: [f32; 4] = [0.46, 0.4, 0.85, 0.9];
 pub const BAR_TRACK: [f32; 4] = [1.0, 1.0, 1.0, 0.12];
 
-/// Text scale. 2 × an 8-px cell is 16 logical pixels, which is the smallest
-/// thing still readable on a Deck at arm's length.
+/// Text scale, in [`font::UNIT`](crate::font::UNIT) cells. 2 × an 8-px cell is
+/// 16 logical pixels, which is the smallest thing still readable on a Deck at
+/// arm's length — and the size a game is therefore expected to have baked.
 pub const SCALE: f32 = 2.0;
 /// Panel width, in logical pixels — wide enough for `nested.something: 0.001`
 /// and narrow enough to leave the game visible, which is the entire point of
@@ -534,9 +544,15 @@ fn row_at(scroll: usize, count: usize, y: f32) -> Option<usize> {
 /// [`touch`] has no font in hand and a hit test that disagrees with the layout
 /// by a pixel is worse than one that owns the number. The draw uses this too, so
 /// there is exactly one.
+///
+/// It is [`font::UNIT`](crate::font::UNIT) rather than a bare `8.0` so the tie
+/// to the font's nominal cell is written down: a `PanelFont` drawn at [`SCALE`]
+/// occupies `UNIT · SCALE` pixels of line box by definition, and the extra two
+/// are the air between rows. The number is unchanged — 18 — which is the point:
+/// switching a game from a hand-authored bitmap to a real typeface must not move
+/// anybody's finger.
 pub fn row_pitch() -> f32 {
-    // 8-pixel cell at `SCALE`, plus two pixels of air.
-    8.0 * SCALE + 2.0
+    crate::font::UNIT * SCALE + 2.0
 }
 
 // ---------------------------------------------------------------------------
