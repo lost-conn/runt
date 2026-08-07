@@ -511,6 +511,39 @@ rinch's `RenderSurface`; the engine renders offscreen and submits frames.
 - Web editor: explicitly out. Browser is the *player*. (rinch's DOM backend
   can't host `RenderSurface`, and a web editor serves no pillar.)
 
+### 10a. Tooling is in-game, not in rinch (2026-08-06)
+
+**Decision:** the tooling direction above is superseded. There is no
+`runt-editor` rinch application; tools live **inside the running game**, drawn
+with the engine's own `UiBatch` and driven by the engine's own `Input`.
+
+Three things pushed it over:
+
+- **The CPU bridge was the whole cost of rinch.** A readback per frame to
+  serve a viewport is a price paid forever for a version skew that may never
+  close, and everything §10 wanted out of rinch — panels over `Reflect` params,
+  a viewport, input routed back — the game already has natively. The game *is*
+  the viewport.
+- **The tuning loop is the point.** A slider is worth having because you drag
+  it while standing under the sky it changes. An editor in another window that
+  re-renders the same scene through a bridge is a worse version of the thing
+  the game does for free at 60 fps, and it cannot be opened on a Steam Deck.
+- **It costs one feature, not one crate.** The player must not carry any of
+  it, and `reflect` is already the flag that says so.
+
+**Where it landed:** `runt_core::tweak` is the registry (opt-in roots →
+`Reflect`-walked dotted paths → clamped edits → a serializable overrides map),
+`runt_core::tweak_panel` is the debug overlay that drives it, and both are
+behind `reflect` so a wasm build compiles them away entirely. The one thing the
+engine cannot supply is a font — `UiBatch` is quads and an atlas is game
+content — so the panel takes a `PanelFont` from the host.
+
+What §10 still holds for: **panels are generated from `Reflect`, with bounds
+declared at the param** (`FieldRange`). That was the load-bearing claim and it
+survives the venue change intact. What is dropped is rinch, the CPU bridge, and
+`runt-editor`. Scene arrangement — place/transform/pick, save scene RON — is
+still wanted and is still unbuilt; it lands in-game too when it lands.
+
 ## 11. Capability gates
 
 Two **independent** axes, probed once at startup, stored as a resource,

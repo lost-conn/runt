@@ -204,7 +204,15 @@ impl QualityTier {
 /// happens to be reachable from input.
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
-pub struct RenderScale(f32);
+pub struct RenderScale(
+    /// Ranged at the param so the tweak panel's slider spans exactly what
+    /// [`RenderScale::new`] would accept. A reflected write goes straight into
+    /// the field and cannot call the constructor, so this attribute *is* the
+    /// clamp on that path — `tweak` clamps to the declared range on the way in
+    /// (unlike the generator panel, where a `FieldRange` is only advisory).
+    #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(RenderScale::MIN, RenderScale::MAX)))]
+    f32,
+);
 
 impl Default for RenderScale {
     fn default() -> RenderScale {
@@ -320,12 +328,16 @@ impl RenderScale {
 /// [`Renderer::set_phase_fx`]: crate::Renderer::set_phase_fx
 /// [`Engine::render`]: crate::Engine::render
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct PhaseFx {
     /// The world point the disc is centred on.
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def))]
     pub center: Vec3,
     /// How big, in the units [`cover`](PhaseFx::cover) selects. Zero is off.
+    #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.0, 2.0)))]
     pub radius: f32,
     /// The edge fringe's strength, `0..1`.
+    #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.0, 1.0)))]
     pub strength: f32,
     /// What [`radius`](PhaseFx::radius) is measured in.
     ///
@@ -572,19 +584,35 @@ impl TerrainSurface {
 /// A resource, not a component, because v1 has exactly one rig; when a scene
 /// wants more it becomes a component on a light entity and this stays as the
 /// fallback.
+/// # Reflected
+///
+/// This is the engine's canonical "sky and weather" tunable (`tweak`), so every
+/// field carries the range a slider should offer. The colours are `0..1` because
+/// they are colours; `key_dir` is `-1..1` because it is a direction the shader
+/// normalizes, so the ends of the slider are the ends of the sphere.
+/// [`horizon`](Lighting::horizon) is an `Option` and so is invisible to the tweak
+/// panel by design (see that module on why data-carrying enums are out) — a rig
+/// that wants to tune it sets it in the scene file and tunes the colours it is
+/// derived from.
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct Lighting {
     /// Direction *towards* the key light. Normalized in the shader.
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def, @crate::reflect::FieldRange::new(-1.0, 1.0)))]
     pub key_dir: Vec3,
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def, @crate::reflect::FieldRange::new(0.0, 1.0)))]
     pub key_color: Vec3,
     /// Ambient seen by upward-facing normals, and the background at the zenith.
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def, @crate::reflect::FieldRange::new(0.0, 1.0)))]
     pub sky_color: Vec3,
     /// Ambient seen by downward-facing normals, and the background at the nadir.
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::Vec3Def, @crate::reflect::FieldRange::new(0.0, 1.0)))]
     pub ground_color: Vec3,
     /// The background color where the view ray is horizontal. `None` — the
     /// default, and what every scene file written before the sky existed parses
     /// to — is the midpoint of sky and ground, so an old rig gains a background
     /// without gaining a decision. See [`Lighting::horizon`].
+    #[cfg_attr(feature = "reflect", reflect(remote = crate::reflect::OptVec3Def))]
     pub horizon: Option<Vec3>,
     /// How much of the sky the drifting cloud layer covers, `0..1`. **`0` — the
     /// default — is no cloud pass at all**, which is what keeps the three-stop
@@ -596,6 +624,7 @@ pub struct Lighting {
     /// different one wants a different shader, not seven more RON fields. The
     /// look is `sky.wgsl`'s constants, which are `simple_sky.gdshader`'s
     /// defaults.
+    #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.0, 1.0)))]
     pub clouds: f32,
     /// The angular radius of the sun disk, as `1 − cos θ` — the original's
     /// `sun_disk_size`, in its units. **`0` is no disk.**
@@ -603,6 +632,11 @@ pub struct Lighting {
     /// Drawn in [`key_color`](Lighting::key_color) at
     /// [`key_dir`](Lighting::key_dir), so a scene cannot end up with a sun in
     /// one place and its shadows coming from another.
+    ///
+    /// Ranged to 0.2 rather than 1: `1 − cos θ` of 0.2 is already a sun
+    /// filling 37° of sky, and the top nine-tenths of the slider would all be
+    /// "the whole sky is the sun".
+    #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.0, 0.2)))]
     pub sun: f32,
 }
 

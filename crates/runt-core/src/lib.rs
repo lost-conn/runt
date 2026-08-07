@@ -45,6 +45,13 @@ pub mod sky;
 /// Procedural texture specs and their CPU evaluator (DESIGN §7).
 pub mod texture;
 pub mod trace;
+/// Live-tunable params — runt's `@export` (DESIGN §3, §10). Off by default with
+/// the rest of reflection; a wasm player compiles it away entirely.
+#[cfg(feature = "reflect")]
+pub mod tweak;
+/// The debug overlay that drives [`tweak`]. Feature-gated with it.
+#[cfg(feature = "reflect")]
+pub mod tweak_panel;
 /// Screen-space UI: one instanced quad batch drawn after the frame is finished.
 pub mod ui;
 

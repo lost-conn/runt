@@ -266,6 +266,13 @@ pub fn register(registry: &mut TypeRegistry) {
 
     registry.register::<crate::ecs::QualityTier>();
 
+    // The live-tunable resources (`crate::tweak`). Registered here as well as
+    // reachable through `Typed` because an editor that wants to *name* a type
+    // ("what can I tune?") looks it up by path, and this is the one list.
+    registry.register::<crate::ecs::Lighting>();
+    registry.register::<crate::ecs::RenderScale>();
+    registry.register::<crate::ecs::PhaseFx>();
+
     registry.register::<crate::scene::SceneDesc>();
     registry.register::<crate::scene::GeneratorEntry>();
     registry.register::<crate::scene::QualityPolicy>();

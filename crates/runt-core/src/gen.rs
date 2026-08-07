@@ -189,7 +189,10 @@ pub enum GeneratorSpec {
         )]
         dims: Vec3,
         /// Radians of twist per world unit along Y.
-        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(-6.2832, 6.2832)))]
+        // `TAU` by name rather than as 6.2832: clippy's `approx_constant` is
+        // deny-by-default and fires on the literal, which made
+        // `cargo clippy --features reflect` fail outright.
+        #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(-std::f32::consts::TAU, std::f32::consts::TAU)))]
         twist: f32,
         /// Cross-section scale at the top; `1.0` is no taper.
         #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.0, 4.0)))]
