@@ -23,6 +23,11 @@ pub struct Engine {
     /// in a `FixedSim` can reach it, which is the property that lets render-side
     /// animation exist at all without putting a replay at risk (DESIGN §4).
     render_seconds: f64,
+    /// The host's display scale factor — physical pixels per logical pixel.
+    ///
+    /// 1.0 until a host says otherwise, which is what a headless engine and
+    /// every test have. See [`set_scale_factor`](Engine::set_scale_factor).
+    scale_factor: f32,
 }
 
 impl Engine {
@@ -94,6 +99,7 @@ impl Engine {
             renderer,
             warned_no_camera: false,
             render_seconds: 0.0,
+            scale_factor: 1.0,
         };
         engine.bake_scene_textures();
         engine
@@ -173,6 +179,46 @@ impl Engine {
     /// system instead; this is the host-side door to the same value.
     pub fn set_render_scale(&mut self, scale: f32) {
         self.sim.set_render_scale(scale);
+    }
+
+    /// The host's display scale factor: physical pixels per logical pixel.
+    /// 1.0 unless a host set one.
+    pub fn scale_factor(&self) -> f32 {
+        self.scale_factor
+    }
+
+    /// Tell the engine how dense the host's pixels are — winit's
+    /// `Window::scale_factor`, the browser's `devicePixelRatio`, 2.0 on a
+    /// Retina panel, 1.25 on a 125%-scaled desktop.
+    ///
+    /// This is the **only** thing that separates the two pixel spaces, and both
+    /// halves of the UI seam are on the logical side of it: the
+    /// [`Viewport`](crate::ecs::Viewport) a game lays out against is the
+    /// surface size divided by this, and the [`UiBatch`](crate::ui::UiBatch)
+    /// quads it produces are multiplied back up when they are drawn. So a HUD
+    /// written in logical pixels comes out the same apparent size on every
+    /// display, and — the reason it matters more than looks — a rect it
+    /// hit-tests a touch against is in the space touches arrive in.
+    ///
+    /// A host that never calls this gets 1.0, where the two spaces coincide and
+    /// nothing changes. A non-finite or non-positive value is ignored rather
+    /// than stored, because there is no sensible frame to draw from one and the
+    /// last good value is a better guess than a NaN.
+    ///
+    /// Cheap enough to call every frame — it stores an `f32` — which is the
+    /// intended use, since a window can be dragged between displays of
+    /// different densities at any time.
+    ///
+    /// Invisible to the sim in the way
+    /// [`set_render_scale`](Engine::set_render_scale) is: it changes what a
+    /// frame looks like and what a *layout* is measured in, never what a tick
+    /// computes.
+    pub fn set_scale_factor(&mut self, scale_factor: f32) {
+        if !scale_factor.is_finite() || scale_factor <= 0.0 {
+            return;
+        }
+        self.scale_factor = scale_factor;
+        self.renderer.set_scale_factor(scale_factor);
     }
 
     /// The pixel size the scene is actually drawn at, for a host view of
@@ -283,7 +329,12 @@ impl Engine {
         // how big the screen its HUD is being laid out on is. Written here, and
         // therefore read by the *next* tick — one frame stale, which is what a
         // resize costs and what a HUD cannot see.
-        let seen = crate::ecs::Viewport::new(width, height);
+        //
+        // In **logical** pixels: the host hands `render` its surface, which is
+        // physical, and a layout is written in the same units a pointer arrives
+        // in. `Renderer` divides by the same factor when it draws the batch, so
+        // the two halves of the seam agree by construction.
+        let seen = crate::ecs::Viewport::from_physical(width, height, self.scale_factor);
         if self.sim.world().get_resource::<crate::ecs::Viewport>() != Some(&seen) {
             self.sim.world_mut().insert_resource(seen);
         }

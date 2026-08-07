@@ -116,6 +116,22 @@ impl StatusLine {
 /// [`ZERO`](Viewport::ZERO) is the value before any frame has been drawn (and
 /// in every headless sim). A HUD system should treat it as "no screen yet" and
 /// draw nothing rather than divide by it.
+///
+/// # Logical, not physical
+///
+/// **Logical** pixels: the host's surface size divided by its scale factor
+/// ([`Engine::set_scale_factor`](crate::Engine::set_scale_factor)), via
+/// [`from_physical`](Viewport::from_physical). This is the same space a host
+/// reports touches in and the space [`Input::mouse_delta`](crate::Input::mouse_delta)
+/// is measured in, and it is the one a layout can be *written* in: a 44-pixel
+/// button is a fingertip on every device, where 44 physical pixels is a
+/// fingertip on none of them.
+///
+/// It has to be one space, because a game hit-tests a pointer against a
+/// rectangle it laid out from this number. When the two disagreed by the scale
+/// factor, a touch UI drew its buttons where no finger could reach them — the
+/// screen was reported 2× too big, so every rect was placed off the bottom-right
+/// of the glass while the fingers stayed inside the real one.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub struct Viewport {
@@ -132,6 +148,34 @@ impl Viewport {
 
     pub const fn new(width: u32, height: u32) -> Viewport {
         Viewport { width, height }
+    }
+
+    /// A host surface of `width` × `height` **physical** pixels at
+    /// `scale_factor`, as the logical size everything else is measured in.
+    ///
+    /// Rounded rather than truncated, and floored at 1 on each axis for a
+    /// non-degenerate surface: a 1-pixel error here is invisible in a layout,
+    /// but a zero would make [`is_known`](Viewport::is_known) false and blank
+    /// the HUD on a very small window.
+    ///
+    /// A scale factor that is not finite and positive is treated as 1.0 —
+    /// the same "a broken number means no scaling" stance
+    /// [`RenderScale`] takes on a NaN. A degenerate *surface* (either axis
+    /// zero) stays [`ZERO`](Viewport::ZERO), because that is a window with
+    /// nothing on it rather than a window scaled oddly.
+    pub fn from_physical(width: u32, height: u32, scale_factor: f32) -> Viewport {
+        if width == 0 || height == 0 {
+            return Viewport::ZERO;
+        }
+        let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+            scale_factor
+        } else {
+            1.0
+        };
+        Viewport {
+            width: ((width as f32 / scale).round() as u32).max(1),
+            height: ((height as f32 / scale).round() as u32).max(1),
+        }
     }
 
     /// Has a frame been drawn? False for [`ZERO`](Viewport::ZERO) and for any
@@ -1123,5 +1167,63 @@ mod phase_fx_tests {
         // A minimised window is not a screen either.
         assert!(!Viewport::new(1920, 0).is_known());
         assert!(!Viewport::new(0, 1080).is_known());
+    }
+
+    #[test]
+    fn a_surface_is_reported_in_logical_pixels() {
+        // The identity case, and the one every desktop at 100% has: the two
+        // spaces coincide and nothing moves.
+        assert_eq!(
+            Viewport::from_physical(1920, 1080, 1.0),
+            Viewport::new(1920, 1080)
+        );
+
+        // A 2× phone panel. This is the regression: reported physical, the
+        // screen looked twice as wide as the one fingers arrive on, so a layout
+        // anchored to the right edge was placed off the glass entirely.
+        assert_eq!(
+            Viewport::from_physical(780, 1688, 2.0),
+            Viewport::new(390, 844)
+        );
+        assert_eq!(
+            Viewport::from_physical(1170, 2532, 3.0),
+            Viewport::new(390, 844)
+        );
+
+        // A 125%-scaled desktop — a fractional factor, and the rounding that
+        // makes it land on a whole pixel rather than one short.
+        assert_eq!(
+            Viewport::from_physical(2048, 1280, 1.25),
+            Viewport::new(1638, 1024)
+        );
+
+        // Aspect is what a camera reads, and it must survive the divide: the
+        // frame is projected from the surface, and a HUD laid out on a screen of
+        // a different shape than the one being drawn is a different bug.
+        let physical = Viewport::new(2048, 1280);
+        let logical = Viewport::from_physical(2048, 1280, 1.25);
+        assert!((logical.aspect() - physical.aspect()).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_broken_scale_factor_reports_the_surface_rather_than_nothing() {
+        // No sensible frame comes out of a NaN, and a HUD that vanished would be
+        // a worse answer than one drawn at the wrong density.
+        for bad in [f32::NAN, 0.0, -2.0, f32::INFINITY] {
+            assert_eq!(
+                Viewport::from_physical(1920, 1080, bad),
+                Viewport::new(1920, 1080),
+                "scale factor {bad}",
+            );
+        }
+
+        // A degenerate surface stays degenerate — a minimised window is not a
+        // window with an odd density, and `is_known` has to keep saying so.
+        assert_eq!(Viewport::from_physical(0, 1080, 2.0), Viewport::ZERO);
+        assert_eq!(Viewport::from_physical(1920, 0, 2.0), Viewport::ZERO);
+
+        // …but a real surface never rounds *down* to one, which would blank the
+        // HUD on a small window at a high density for no reason.
+        assert!(Viewport::from_physical(3, 3, 8.0).is_known());
     }
 }

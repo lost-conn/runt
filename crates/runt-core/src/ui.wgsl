@@ -13,9 +13,12 @@
 // rather than smeared (DESIGN §11).
 
 struct UiFrame {
-    // xy — the *surface* size in pixels (the view the host handed `render`, not
-    // the render-scale target: the UI is drawn after the blit). zw — its
-    // reciprocal, so the vertex shader multiplies rather than divides.
+    // xy — the surface size in *logical* pixels: the view the host handed
+    // `render`, divided by its display scale factor. Not the render-scale
+    // target (the UI is drawn after the blit) and not the surface's own pixel
+    // count (a quad is authored in logical pixels, so a 2× panel draws the same
+    // layout twice as large rather than half as big). zw — its reciprocal, so
+    // the vertex shader multiplies rather than divides.
     viewport: vec4<f32>,
 };
 

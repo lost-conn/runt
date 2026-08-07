@@ -543,6 +543,16 @@ impl Host {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // How dense this window's pixels are, every frame rather than on
+        // `ScaleFactorChanged`: dragging a window between a 2× laptop panel and
+        // a 1× monitor changes it mid-run, and re-reading a cached `f64` is
+        // cheaper than being wrong for the frame the event arrives on. It is
+        // what splits the surface size below into the logical one the world
+        // lays its HUD out against (`runt_core::ecs::Viewport`), and it must be
+        // set *before* `render` writes that resource.
+        self.engine
+            .set_scale_factor(self.window.scale_factor() as f32);
+
         // The pad has no event stream to sit in `handle_input` with the keyboard,
         // so it is read here — *before* `update`, so whatever the player is
         // holding right now lands in the buffer this frame's ticks will consume
@@ -631,10 +641,12 @@ impl Host {
             WindowEvent::CursorMoved { position, .. } => {
                 let now = (position.x, position.y);
                 if let Some(prev) = self.last_cursor {
-                    self.engine.push_input(InputEvent::MouseMove {
-                        dx: (now.0 - prev.0) as f32,
-                        dy: (now.1 - prev.1) as f32,
-                    });
+                    // Physical in, logical out — `position` is physical and
+                    // every reader of `mouse_delta` measures in the same
+                    // logical pixels a touch and a `Viewport` do.
+                    let (dx, dy) =
+                        input::cursor_delta(prev, now, self.window.scale_factor());
+                    self.engine.push_input(InputEvent::MouseMove { dx, dy });
                 }
                 self.last_cursor = Some(now);
                 true

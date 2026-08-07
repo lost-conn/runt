@@ -445,6 +445,13 @@ pub struct Renderer {
     /// `ui_quads` exactly; a batch that never switched texture is one run.
     ui_runs: Vec<ui::UiRun>,
     ui_atlas: Option<texture::TextureHandle>,
+    /// Physical pixels per logical pixel, from the host
+    /// ([`Engine::set_scale_factor`](crate::Engine::set_scale_factor)).
+    ///
+    /// Read by the UI pass and by nothing else: the scene is drawn in NDC and
+    /// does not care how dense the glass is, while a HUD is laid out in pixels
+    /// and cares about very little else.
+    scale_factor: f32,
 }
 
 /// A caller-named offscreen scene target: somewhere to draw a **second camera**
@@ -624,6 +631,7 @@ impl Renderer {
             ui_quads: Vec::new(),
             ui_runs: Vec::new(),
             ui_atlas: None,
+            scale_factor: 1.0,
         }
     }
 
@@ -782,6 +790,19 @@ impl Renderer {
         self.ui_runs.clear();
         self.ui_runs.extend(batch.runs());
         self.ui_atlas = batch.atlas;
+    }
+
+    /// Physical pixels per logical pixel, for the UI pass.
+    ///
+    /// The host-side door is [`Engine::set_scale_factor`](crate::Engine::set_scale_factor),
+    /// which sets this and the [`Viewport`](crate::ecs::Viewport) the same batch
+    /// was laid out against; a caller driving a bare `Renderer` sets it here.
+    /// Guarded rather than clamped for that door's reason: a NaN has no frame to
+    /// draw, and the last good density beats one.
+    pub fn set_scale_factor(&mut self, scale_factor: f32) {
+        if scale_factor.is_finite() && scale_factor > 0.0 {
+            self.scale_factor = scale_factor;
+        }
     }
 
     /// [`set_ui_batch`](Renderer::set_ui_batch) for a caller that has quads
@@ -1098,6 +1119,14 @@ impl Renderer {
         // this pass existed.
         if !self.ui_quads.is_empty() {
             self.ensure_ui();
+            // The batch is in **logical** pixels, so the pass is told the
+            // logical size of the surface and the shader's px→NDC divide scales
+            // it back out over the physical one. That is what makes a 16-pixel
+            // margin a 16-pixel margin on a 2× panel instead of an 8-pixel one,
+            // and — the half that is not cosmetic — what keeps a rect the game
+            // hit-tests a touch against in the space touches arrive in
+            // (`ecs::Viewport`, which is divided by the same factor).
+            let ui_size = crate::ecs::Viewport::from_physical(width, height, self.scale_factor);
             // Split the borrow: the pass owns its own buffers and needs the
             // device, the queue and the texture registry, all of which are
             // sibling fields.
@@ -1119,8 +1148,8 @@ impl Renderer {
                 queue,
                 &mut encoder,
                 view,
-                width,
-                height,
+                ui_size.width,
+                ui_size.height,
                 ui_quads,
                 ui_runs,
                 *ui_atlas,

@@ -384,16 +384,25 @@ impl UiAtlasImage {
 // The GPU side
 // ---------------------------------------------------------------------------
 
-/// `@group(0)` of the UI pipeline: the surface size, and nothing else.
+/// `@group(0)` of the UI pipeline: the screen size in **logical** pixels, and
+/// nothing else.
 ///
 /// Deliberately not [`FrameUniform`](crate::FrameUniform): that block is the
 /// *render* target's size (see its `viewport` field), and the UI is drawn after
 /// the blit at the host's own resolution. Sharing it would have made the HUD
 /// shrink into the corner at any scale below 1.0.
+///
+/// Logical rather than the surface's own physical size — the *other* scale in
+/// play here, and an independent one. A quad is authored in logical pixels
+/// ([`UiQuad`]), so dividing by the logical screen size is what stretches the
+/// batch over the whole surface, and therefore what draws a 44-pixel button 88
+/// physical pixels wide on a 2× panel. Dividing by the physical size drew it 44
+/// wide — half the size it asked for, and, for anything hit-tested against the
+/// same layout, in the wrong place.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct UiUniform {
-    /// `xy` — the surface size in pixels; `zw` — its reciprocal.
+    /// `xy` — the screen size in logical pixels; `zw` — its reciprocal.
     viewport: [f32; 4],
 }
 
@@ -610,7 +619,11 @@ impl UiPass {
     }
 
     /// Upload `quads` and encode the pass over `view`, which must be the
-    /// **surface** view (post-blit) at `width` × `height`.
+    /// **surface** view (post-blit).
+    ///
+    /// `width` × `height` is that surface in **logical** pixels — the space
+    /// `quads` are authored in, not the pixel count of the view. The two are the
+    /// same number only at scale factor 1; see [`UiUniform`].
     ///
     /// One `write_buffer` for the whole batch and one `draw` **per texture
     /// run**: there is no per-quad state, so a 200-quad HUD on one atlas is

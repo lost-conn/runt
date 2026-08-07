@@ -640,6 +640,63 @@ fn ui_stays_surface_crisp_at_half_render_scale() {
 }
 
 // ---------------------------------------------------------------------------
+// Display density — a quad is authored in logical pixels
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_quad_is_laid_out_in_logical_pixels_not_surface_pixels() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    let device = renderer.device().clone();
+    // A 2× panel: 64×48 physical pixels of glass showing a 32×24 logical screen.
+    let target = Target::new(&device, 64, 48);
+    renderer.set_scale_factor(2.0);
+
+    // A quad in the top-left *logical* quadrant: 16×12 of a 32×24 screen.
+    let rect = [0.0, 0.0, 16.0, 12.0];
+    let color = [1.0, 0.0, 1.0, 1.0];
+
+    let bare = frame(&mut renderer, &target, 1.0, &[], None);
+    let painted = frame(&mut renderer, &target, 1.0, &[UiQuad::solid(rect, color)], None);
+
+    // It covers a quarter of the surface: 32×24 physical pixels, not 16×12.
+    // This is the whole claim — the same layout is *bigger* on a denser display
+    // rather than smaller, which is what "logical pixels" has to mean for a
+    // 44-pixel button to stay a fingertip.
+    assert_rgba(painted.at(31, 23), color, "the quad's last physical pixel");
+    assert_eq!(painted.at(32, 23), bare.at(32, 23), "column 32 is past it");
+    assert_eq!(painted.at(31, 24), bare.at(31, 24), "row 24 is past it");
+
+    // …and at scale factor 1 the same quad covers the 16×12 it names, which is
+    // the case every existing test above is written in.
+    renderer.set_scale_factor(1.0);
+    let unscaled = frame(&mut renderer, &target, 1.0, &[UiQuad::solid(rect, color)], None);
+    assert_rgba(unscaled.at(15, 11), color, "the quad's last pixel at 1×");
+    assert_eq!(unscaled.at(16, 11), bare.at(16, 11), "column 16 is past it");
+}
+
+#[test]
+fn a_broken_scale_factor_leaves_the_last_good_density_standing() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    let device = renderer.device().clone();
+    let target = Target::new(&device, 64, 48);
+    let rect = [0.0, 0.0, 16.0, 12.0];
+    let color = [1.0, 0.0, 1.0, 1.0];
+
+    renderer.set_scale_factor(2.0);
+    for bad in [f32::NAN, 0.0, -2.0] {
+        renderer.set_scale_factor(bad);
+    }
+    // Still 2×: a frame drawn at a NaN density has no pixels at all, so the
+    // guard keeps the density rather than the number.
+    let painted = frame(&mut renderer, &target, 1.0, &[UiQuad::solid(rect, color)], None);
+    assert_rgba(painted.at(31, 23), color, "still the 2× layout");
+}
+
+// ---------------------------------------------------------------------------
 // Batch size — a HUD is one draw whatever is in it
 // ---------------------------------------------------------------------------
 

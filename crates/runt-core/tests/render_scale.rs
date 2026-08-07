@@ -548,3 +548,69 @@ fn the_blit_shader_translates_to_glsl_es_for_webgl2() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 6. Display density is the *other* scale, and the world is told the logical one
+// ---------------------------------------------------------------------------
+
+/// `Engine::render` reports the surface it was handed as the **logical** screen
+/// the world lays its HUD out on — surface ÷ scale factor.
+///
+/// The two scales in this file are independent and it is worth being blunt
+/// about which is which: render scale shrinks *the picture the scene is drawn
+/// into* and never moves the HUD (that is the test above), while the scale
+/// factor is how dense the host's pixels are and moves nothing except what a
+/// pixel **means**. A frame can be at 0.5 render scale on a 2× display, and the
+/// viewport the world sees answers only to the second.
+#[test]
+fn the_world_is_told_the_screen_in_logical_pixels() {
+    use runt_core::ecs::Viewport;
+
+    let Some(mut h) = Harness::new(WIDTH, HEIGHT) else {
+        return;
+    };
+
+    let seen = |h: &Harness| {
+        h.engine
+            .sim()
+            .world()
+            .get_resource::<Viewport>()
+            .copied()
+            .expect("render writes the viewport")
+    };
+
+    // No host has said anything about density, so the two spaces coincide.
+    h.engine.render(&h.view, h.width, h.height);
+    assert_eq!(seen(&h), Viewport::new(WIDTH, HEIGHT));
+
+    // A 2× panel showing the same window: half the logical screen, and the
+    // regression this exists to catch — reported physical, a HUD anchored to
+    // the right edge was laid out at x=256 on a screen 128 logical pixels wide,
+    // which on a touch build is a button no finger can reach.
+    h.engine.set_scale_factor(2.0);
+    h.engine.render(&h.view, h.width, h.height);
+    assert_eq!(seen(&h), Viewport::new(WIDTH / 2, HEIGHT / 2));
+
+    // Render scale is orthogonal: the scene is drawn into a quarter of the
+    // pixels and the screen the HUD is measured against does not move.
+    let scaled = h.frame(0.5);
+    assert_eq!(seen(&h), Viewport::new(WIDTH / 2, HEIGHT / 2));
+    assert_eq!(
+        h.engine.renderer().scaled_target_size(),
+        Some((WIDTH / 2, HEIGHT / 2)),
+        "the internal target follows the *surface*, not the logical screen",
+    );
+    assert_eq!(scaled.len(), (WIDTH * HEIGHT * 4) as usize);
+
+    // A window dragged onto a 1× monitor mid-run reports the full screen again.
+    h.engine.set_render_scale(1.0);
+    h.engine.set_scale_factor(1.0);
+    h.engine.render(&h.view, h.width, h.height);
+    assert_eq!(seen(&h), Viewport::new(WIDTH, HEIGHT));
+
+    // A fractional factor — a 125%-scaled desktop, the common Linux case.
+    h.engine.set_scale_factor(1.25);
+    h.engine.render(&h.view, h.width, h.height);
+    assert_eq!(seen(&h), Viewport::new(205, 154));
+    assert_eq!(h.engine.scale_factor(), 1.25);
+}

@@ -107,6 +107,36 @@ pub fn translate_touch_phase(phase: TouchPhase) -> runt_core::TouchPhase {
     }
 }
 
+/// Two consecutive `CursorMoved` positions as the delta the engine is pushed,
+/// in **logical** pixels.
+///
+/// winit reports the cursor in *physical* pixels; everything downstream of
+/// [`Input::mouse_delta`](runt_core::Input::mouse_delta) is logical — the
+/// editor's own crosshair walks the same
+/// [`Viewport`](runt_core::ecs::Viewport) a HUD is laid out in, and a camera
+/// look is a feel that should not change when a window moves to a denser
+/// display. Dividing here rather than at each reader is the same choice
+/// [`touch_events`]'s caller makes one screen away: one conversion, at the seam
+/// where the host's units stop.
+///
+/// A scale factor that is not finite and positive is treated as 1.0 — the raw
+/// delta is a far better answer than a NaN that would strand the crosshair for
+/// the rest of the session.
+///
+/// A free function for [`touch_events`]'s reason: the host owns a GPU device and
+/// cannot be built in a unit test, and the arithmetic is the part worth pinning.
+pub fn cursor_delta(prev: (f64, f64), now: (f64, f64), scale_factor: f64) -> (f32, f32) {
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    (
+        ((now.0 - prev.0) / scale) as f32,
+        ((now.1 - prev.1) / scale) as f32,
+    )
+}
+
 /// Everything one host touch becomes, engine-side.
 ///
 /// The first return is the raw [`InputEvent::Touch`] and it is **always**
@@ -302,6 +332,35 @@ mod tests {
     fn unmapped_keys_are_other() {
         assert_eq!(translate_key(KeyCode::F13), Key::Other);
         assert_eq!(translate_key(KeyCode::ScrollLock), Key::Other);
+    }
+
+    #[test]
+    fn a_cursor_delta_arrives_in_logical_pixels() {
+        // Scale 1: the two spaces coincide, and the delta is the difference.
+        assert_eq!(cursor_delta((10.0, 10.0), (30.0, 25.0), 1.0), (20.0, 15.0));
+
+        // A 2× panel reports twice the pixels for the same hand movement. The
+        // editor's crosshair walks on this number, so undivided it outran the
+        // desktop arrow it is drawn beside — by exactly the scale factor.
+        assert_eq!(cursor_delta((0.0, 0.0), (40.0, 30.0), 2.0), (20.0, 15.0));
+        assert_eq!(cursor_delta((0.0, 0.0), (25.0, 25.0), 1.25), (20.0, 20.0));
+
+        // Motion the other way keeps its sign — this is a delta, not a distance.
+        assert_eq!(cursor_delta((40.0, 30.0), (0.0, 0.0), 2.0), (-20.0, -15.0));
+    }
+
+    #[test]
+    fn a_broken_scale_factor_leaves_the_delta_alone() {
+        // Better a pointer that moves too fast for one frame than one that goes
+        // NaN and never comes back — the cursor it drives is clamped, not
+        // wrapped, so a single bad value would park it in a corner for good.
+        for bad in [f64::NAN, 0.0, -1.0, f64::INFINITY] {
+            assert_eq!(
+                cursor_delta((0.0, 0.0), (20.0, 15.0), bad),
+                (20.0, 15.0),
+                "scale factor {bad}",
+            );
+        }
     }
 
     #[test]
