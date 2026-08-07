@@ -1,0 +1,13 @@
+# See `../3dimenshift-runt/.cargo/config.toml` — same reasoning, same numbers.
+# The engine's own test binaries are smaller than the game's, but a workspace
+# build here is what the game builds against, and a developer runs both.
+
+[build]
+jobs = 12
+
+# Host only: `wasm32-unknown-unknown` links with rust-lld and must not see this.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[env]
+RUST_TEST_THREADS = "8"

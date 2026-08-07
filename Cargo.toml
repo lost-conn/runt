@@ -67,7 +67,14 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 # The tradeoff: `target/debug/deps` becomes load-bearing for debugging — a
 # binary copied out of the tree, or whose `.dwo` files are gone, has no symbols
 # — which only matters for a build tree you were going to rebuild anyway.
+#
+# `line-tables-only` goes a step further on the same axis: a backtrace needs
+# file, line and function, and the type/variable DWARF beyond that is what still
+# made the *game*'s test binaries 264–287 MB each with this split already on.
+# Step-debugging asks for it back per-invocation:
+# `CARGO_PROFILE_DEV_DEBUG=true cargo test …`.
 [profile.dev]
+debug = "line-tables-only"
 split-debuginfo = "unpacked"
 
 [profile.release]
