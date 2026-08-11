@@ -30,7 +30,7 @@ struct Frame {
     // World → the key light's clip space (the shadow map's matrix). The sky
     // neither casts nor receives; restated for the one-buffer reason above.
     light_view_proj: mat4x4<f32>,
-    // x: shadow map bound. y: constant bias. z: slope bias. w: reserved.
+    // x: shadow map bound. y: constant bias. z: slope bias. w: rim fade width.
     shadow_params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> frame: Frame;

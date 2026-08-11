@@ -56,7 +56,7 @@ struct Frame {
     // World → the key light's clip space (the shadow map's matrix). A copy
     // pass reads no light; restated for the one-buffer reason above.
     light_view_proj: mat4x4<f32>,
-    // x: shadow map bound. y: constant bias. z: slope bias. w: reserved.
+    // x: shadow map bound. y: constant bias. z: slope bias. w: rim fade width.
     shadow_params: vec4<f32>,
 };
 

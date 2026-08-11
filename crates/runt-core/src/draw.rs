@@ -410,6 +410,19 @@ impl Frustum {
         }
     }
 
+    /// The same frustum with its near plane struck out — the shadow pass's
+    /// cull. A caster between the light and its box is behind the light's
+    /// near plane and in front of everything the map covers: `shadow.wgsl`
+    /// pancakes its geometry onto the plane rather than clipping it, so a
+    /// cull that rejected on that plane would throw away exactly the casters
+    /// the pancake exists to keep. The slot is refilled with `0·x + 0·y +
+    /// 0·z + 1 ≥ 0` — true everywhere — so [`intersects`](Frustum::intersects)
+    /// stays six identical tests rather than growing a special case.
+    pub fn without_near(mut self) -> Frustum {
+        self.planes[4] = Vec4::W;
+        self
+    }
+
     /// Whether a **world-space** box might be visible.
     ///
     /// The centre/extent form of the plane test: a box is rejected only when it

@@ -41,7 +41,8 @@ struct Frame {
     // while shadows are off, and never read then: shadow_params.x gates it.
     light_view_proj: mat4x4<f32>,
     // x: 1.0 while a shadow map is bound, 0.0 otherwise. y: constant depth
-    // bias. z: slope-scaled depth bias. w: reserved.
+    // bias. z: slope-scaled depth bias. w: the rim fade band's width in map-uv
+    // units (floored above zero at upload; see `shadow_factor`).
     shadow_params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -510,7 +511,8 @@ fn phase_distance(frag_pos: vec2<f32>) -> f32 {
 // ---------------------------------------------------------------------------
 //
 // How lit by the key light this fragment is: 1 in the open, 0 hard in shadow,
-// fractional on the PCF-softened edge. The term scales the **key term only**
+// fractional on the PCF-softened edge and across the light box's rim band
+// (below). The term scales the **key term only**
 // — hemisphere ambient is skylight, not sunlight, and leaving it untouched is
 // what keeps a shadowed floor a dimmer version of itself (the two-colour
 // ambient still separating its silhouettes) rather than a black hole.
@@ -524,12 +526,20 @@ fn shadow_factor(world_pos: vec3<f32>, n: vec3<f32>) -> f32 {
     // Orthographic, so w is 1 and this is not a divide in disguise.
     let ndc = pos.xyz;
     let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    // Outside the light's box — beyond the map's edge or its depth range — is
-    // *lit*, not shadowed: the box tracks the camera, so the world past its
-    // rim must fade to daylight rather than to a wall of shadow.
-    if (ndc.z <= 0.0 || ndc.z >= 1.0
-        || uv.x <= 0.0 || uv.x >= 1.0
-        || uv.y <= 0.0 || uv.y >= 1.0) {
+    // Above the light's near plane is *lit*: casters up there are pancaked
+    // into the map (`shadow.wgsl`), receivers up there are above the light.
+    if (ndc.z <= 0.0) {
+        return 1.0;
+    }
+    // The rim: the box tracks the camera, so the world past its edge must
+    // fade to daylight rather than to a wall of shadow — and "fade" is
+    // literal, because a hard rim is a cutoff that crawls across long shadows
+    // as the camera moves. `rim` is the distance to the nearest way out of
+    // the map (uv edges and far depth; the near wall is handled above), and
+    // the shadow dissolves over the outermost `shadow_params.w` of it.
+    let rim = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    let fade = smoothstep(0.0, frame.shadow_params.w, min(rim, 1.0 - ndc.z));
+    if (fade <= 0.0) {
         return 1.0;
     }
     // Constant + slope bias, in light-depth units (see `ShadowSettings` for
@@ -537,7 +547,12 @@ fn shadow_factor(world_pos: vec3<f32>, n: vec3<f32>) -> f32 {
     // than baked into the map, so the knobs work without a pipeline rebuild.
     let ndotl = max(dot(n, normalize(frame.light_dir.xyz)), 0.0);
     let bias = frame.shadow_params.y + frame.shadow_params.z * (1.0 - ndotl);
-    return textureSampleCompareLevel(t_shadow, s_shadow, uv, ndc.z - bias);
+    let shadow = textureSampleCompareLevel(t_shadow, s_shadow, uv, ndc.z - bias);
+    // `1 − fade·(1 − shadow)` rather than `mix(1.0, shadow, fade)`:
+    // algebraically the same, but this form is *exactly* 1.0 whenever the tap
+    // is — an unoccluded receiver inside the band stays byte-identical to
+    // shadows-off, which the no-acne test pins.
+    return 1.0 - fade * (1.0 - shadow);
 }
 
 // ---------------------------------------------------------------------------

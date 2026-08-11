@@ -73,8 +73,9 @@ impl ShadowQuality {
     }
 }
 
-/// The shadow's tuning: how big the box is and how hard the acne is pushed
-/// back. Reflected, so a game can hang it in its tweak panel beside
+/// The shadow's tuning: how big the box is, how hard the acne is pushed
+/// back, and how wide a band the rim dissolves over. Reflected, so a game can
+/// hang it in its tweak panel beside
 /// [`Lighting`](crate::Lighting) — it is lighting tuning in every sense but
 /// one, and that one is why it is not *in* `Lighting`: the rig is scene data
 /// with a RON twin ([`scene::LightingDesc`](crate::scene)), while these are
@@ -107,6 +108,15 @@ pub struct ShadowSettings {
     /// light spans many depth values per texel and needs more room.
     #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.0, 0.05)))]
     pub slope_bias: f32,
+    /// Width of the rim fade band, as a fraction of the box (`0..1` map
+    /// units). The box tracks the camera, so a long shadow crossing its edge
+    /// would otherwise snap off at a moving line; over the outermost `fade`
+    /// of the map — uv edges and far depth alike — the shadow term dissolves
+    /// to daylight instead (`shader.wgsl::shadow_factor`). Only the *shadow*
+    /// fades: a receiver the map does not darken stays exactly lit, in the
+    /// band or out of it.
+    #[cfg_attr(feature = "reflect", reflect(@crate::reflect::FieldRange::new(0.0, 0.5)))]
+    pub fade: f32,
 }
 
 impl Default for ShadowSettings {
@@ -115,6 +125,7 @@ impl Default for ShadowSettings {
             extent: 20.0,
             bias: 0.0015,
             slope_bias: 0.004,
+            fade: 0.1,
         }
     }
 }
@@ -135,10 +146,14 @@ impl Default for ShadowSettings {
 ///
 /// 2. **Aim the light.** `look_at` from `center + dir·2·extent` back at the
 ///    center, so the depth range `[0, 4·extent]` holds casters up to a whole
-///    box-length above the box as well as everything in it. The up vector
-///    ducks to `+Z` when the light is near-vertical — which the port's key
-///    light almost is — because a `look_at` whose up parallels its view has no
-///    basis at all.
+///    box-length above the box as well as everything in it. Casters taller
+///    still are not lost: the depth pass pancakes anything past the near
+///    plane onto it (`shadow.wgsl`), and its cull ignores that plane for the
+///    same reason ([`Frustum::without_near`](crate::draw::Frustum::without_near))
+///    — the range is where depth *resolution* lives, not a ceiling on who may
+///    cast. The up vector ducks to `+Z` when the light is near-vertical —
+///    which the port's key light almost is — because a `look_at` whose up
+///    parallels its view has no basis at all.
 ///
 /// 3. **Snap.** The view's light-space XY translation is rounded to whole
 ///    texels (`2·extent ÷ resolution`). The rotation never changes (the light

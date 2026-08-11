@@ -291,8 +291,10 @@ pub struct FrameUniform {
     /// The shadow lookup's gate and biases: `x` — 1.0 while a shadow map is
     /// bound, 0.0 otherwise (and the shader takes the exact pre-shadow path at
     /// 0, so "off" is byte-identity, not a multiply by one that happens to be
-    /// exact); `y` — constant depth bias; `z` — slope-scaled depth bias
-    /// (both [`ShadowSettings`]'); `w` — reserved.
+    /// exact); `y` — constant depth bias; `z` — slope-scaled depth bias;
+    /// `w` — the rim fade band's width in map-uv units (all three
+    /// [`ShadowSettings`]', `w` floored away from zero at upload so the
+    /// shader's `smoothstep` never divides by it).
     pub shadow_params: [f32; 4],
 }
 
@@ -1878,7 +1880,12 @@ impl Renderer {
                     1.0,
                     self.shadow_settings.bias,
                     self.shadow_settings.slope_bias,
-                    0.0,
+                    // Floored away from zero (`f32::max` also swallows a NaN
+                    // from a reflected write): the shader smoothsteps over
+                    // this width, and `smoothstep(0, 0, x)` divides by zero.
+                    // 1e-4 of the map is well under a texel — a hard rim, as
+                    // a fade of zero asks.
+                    self.shadow_settings.fade.max(1.0e-4),
                 ],
             ),
             None => (glam::Mat4::IDENTITY.to_cols_array_2d(), [0.0; 4]),
@@ -2346,7 +2353,9 @@ impl Renderer {
     /// `draws` is the **whole** extracted list, not the camera-visible half:
     /// a caster behind the camera still throws its shadow into frame. The
     /// light's own frustum ([`Frustum`](draw::Frustum) works unchanged on an
-    /// orthographic matrix) is what keeps the pass from drawing the world.
+    /// orthographic matrix) is what keeps the pass from drawing the world —
+    /// minus its near plane, which pancaked casters are allowed to cross
+    /// ([`Frustum::without_near`](draw::Frustum::without_near)).
     ///
     /// Casters are the opaque lit population only. Blended items do not cast —
     /// a ghost with a solid shadow reads as a bug, and the original's
@@ -2374,7 +2383,11 @@ impl Renderer {
                 })
                 .copied(),
         );
-        let frustum = draw::Frustum::from_view_proj(&light_view_proj);
+        // The near plane is struck from the cull on purpose: a caster between
+        // the light and the box still casts — the vertex stage pancakes it
+        // onto the plane (`shadow.wgsl`) — so the cull must not reject the
+        // very casters the pancake keeps (`Frustum::without_near`).
+        let frustum = draw::Frustum::from_view_proj(&light_view_proj).without_near();
         draw::cull_draw_list(&mut pass_data.casters, &frustum, |handle| {
             self.meshes.bounds(handle)
         });

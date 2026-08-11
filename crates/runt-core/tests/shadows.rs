@@ -52,7 +52,10 @@ fn the_gate_is_off_by_default_and_maps_tiers_to_resolutions() {
     // The settings' defaults are the tuned ones the GPU half of this file
     // validates; a drive-by "improvement" here should have to re-earn them.
     let s = ShadowSettings::default();
-    assert_eq!((s.extent, s.bias, s.slope_bias), (20.0, 0.0015, 0.004));
+    assert_eq!(
+        (s.extent, s.bias, s.slope_bias, s.fade),
+        (20.0, 0.0015, 0.004, 0.1)
+    );
 }
 
 #[test]
@@ -415,20 +418,52 @@ fn shadows_off_draws_the_same_pixels_and_allocates_nothing() {
 const WIDTH: u32 = 128;
 const HEIGHT: u32 = 128;
 
-/// A `2·half` × `2·half` horizontal quad, normal +Y, wound counter-clockwise
-/// seen from above.
-fn slab(half: f32) -> Mesh {
+/// A `2·hx` × `2·hz` horizontal rectangle at y = 0, normal +Y, wound
+/// counter-clockwise seen from above.
+fn rect(hx: f32, hz: f32) -> Mesh {
     Mesh {
         positions: vec![
-            Vec3::new(-half, 0.0, -half),
-            Vec3::new(-half, 0.0, half),
-            Vec3::new(half, 0.0, half),
-            Vec3::new(half, 0.0, -half),
+            Vec3::new(-hx, 0.0, -hz),
+            Vec3::new(-hx, 0.0, hz),
+            Vec3::new(hx, 0.0, hz),
+            Vec3::new(hx, 0.0, -hz),
         ],
         normals: vec![Vec3::Y; 4],
         uvs: vec![glam::Vec2::ZERO; 4],
         colors: vec![Vec3::ONE; 4],
         indices: vec![0, 1, 2, 0, 2, 3],
+    }
+}
+
+/// A `2·half` × `2·half` horizontal quad, normal +Y, wound counter-clockwise
+/// seen from above.
+fn slab(half: f32) -> Mesh {
+    rect(half, half)
+}
+
+/// A caster whose only light-facing geometry floats high over its base: an
+/// up-facing cap at `y = height` above a down-facing plate at `y = 0`. Under a
+/// vertical key light the cap is the entire silhouette (the plate back-faces
+/// the light and writes no depth); the plate's whole job is to stretch the
+/// mesh's measured box downward, so the caster *straddles* the light's near
+/// plane instead of sitting wholly above it — which keeps even the pre-fix
+/// caster cull from being the thing under test.
+fn capped_column(half: f32, height: f32) -> Mesh {
+    Mesh {
+        positions: vec![
+            Vec3::new(-half, height, -half),
+            Vec3::new(-half, height, half),
+            Vec3::new(half, height, half),
+            Vec3::new(half, height, -half),
+            Vec3::new(-half, 0.0, -half),
+            Vec3::new(-half, 0.0, half),
+            Vec3::new(half, 0.0, half),
+            Vec3::new(half, 0.0, -half),
+        ],
+        normals: [[Vec3::Y; 4], [Vec3::NEG_Y; 4]].concat(),
+        uvs: vec![glam::Vec2::ZERO; 8],
+        colors: vec![Vec3::ONE; 8],
+        indices: vec![0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6],
     }
 }
 
@@ -530,10 +565,58 @@ impl Rig {
         read_back(&self.renderer, &self.target, WIDTH, HEIGHT)
     }
 
+    /// One frame of an arbitrary spawn list under its own camera — the rig's
+    /// lighting and flat white material throughout, like [`Rig::frame`].
+    fn frame_scene(
+        &mut self,
+        quality: ShadowQuality,
+        spawns: &[(MeshHandle, Transform)],
+        view_proj: Mat4,
+    ) -> Vec<u8> {
+        self.renderer.set_shadow_quality(quality);
+        let mut world = World::new();
+        let white = Material {
+            base_color: Vec4::ONE,
+            params: Vec4::ZERO,
+            texture: None,
+            variant: MaterialVariant::NONE,
+        };
+        for &(mesh, transform) in spawns {
+            world.spawn((MeshRef(mesh), white, transform));
+        }
+        let draws = build_draw_list(&mut world, 0.0);
+        let frame = runt_core::FrameParams {
+            view_proj,
+            lighting: rig_lighting(),
+        };
+        self.renderer.set_render_clock(0.0, 0.0);
+        self.renderer.render(
+            &self.view,
+            WIDTH,
+            HEIGHT,
+            &frame,
+            &draws,
+            &MeshLibrary::new(),
+            &TextureLibrary::new(),
+        );
+        read_back(&self.renderer, &self.target, WIDTH, HEIGHT)
+    }
+
     /// The frame pixel a world point lands on.
     fn pixel_of(&self, p: Vec3) -> (u32, u32) {
-        let clip = self.view_proj * p.extend(1.0);
+        Rig::pixel_at(self.view_proj, p)
+    }
+
+    /// [`Rig::pixel_of`] under an arbitrary camera. Asserts the point is
+    /// actually on frame — a float→u32 cast saturates, so an off-screen point
+    /// would otherwise sample the frame's edge and lie.
+    fn pixel_at(view_proj: Mat4, p: Vec3) -> (u32, u32) {
+        let clip = view_proj * p.extend(1.0);
         let ndc = clip.truncate() / clip.w;
+        assert!(
+            clip.w > 0.0 && ndc.x.abs() < 1.0 && ndc.y.abs() < 1.0,
+            "sample point {p} projects off-frame (ndc {ndc})"
+        );
         (
             ((ndc.x * 0.5 + 0.5) * WIDTH as f32) as u32,
             ((0.5 - ndc.y * 0.5) * HEIGHT as f32) as u32,
@@ -647,4 +730,159 @@ fn a_second_camera_viewport_skips_the_shadow_pass() {
     );
     assert_eq!(stats.items, 1);
     assert_eq!(stats.draws, 1);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Tall casters and the box rim — the failure modes the port actually hit
+// ---------------------------------------------------------------------------
+//
+// Geometry note, shared by the next two tests: the rig's camera sits at
+// (0, 10, 7) looking at the origin, so the light box (extent 20) centres near
+// (0, −6.5, −4.5) and the vertical key light's eye — the map's near plane —
+// sits at y ≈ 33.5. "Tall" below means *taller than that*.
+
+#[test]
+fn a_caster_reaching_above_the_lights_near_plane_still_casts() {
+    let Some(mut rig) = Rig::new() else { return };
+
+    // From y = 2 to y = 50 the column straddles the near plane: its measured
+    // box dips under the plane, so the caster cull keeps it either way, and
+    // what is under test is the *clip* — without pancaking, the cap at y = 50
+    // (the entire light-facing silhouette) is above the plane and rasterizes
+    // nothing. Both faces back-face the rig's camera, so the frame shows the
+    // ground and only the ground.
+    let column = rig.renderer.register_mesh(&capped_column(2.0, 48.0));
+    let spawns = [
+        (rig.ground, Transform::IDENTITY),
+        (column, Transform::from_translation(Vec3::new(0.0, 2.0, 0.0))),
+    ];
+    let vp = rig.view_proj;
+    let shaded_px = rig.pixel_of(Vec3::ZERO);
+
+    let off = rig.frame_scene(ShadowQuality::Off, &spawns, vp);
+    for quality in [ShadowQuality::Low, ShadowQuality::High] {
+        let on = rig.frame_scene(quality, &spawns, vp);
+        let shaded = rgb(&on, shaded_px);
+        let was = rgb(&off, shaded_px);
+        assert!(
+            shaded[0] < was[0] - 60,
+            "{quality:?}: a caster reaching above the light lost its shadow \
+             (shaded {shaded:?}, was {was:?})"
+        );
+    }
+}
+
+#[test]
+fn a_caster_wholly_between_the_light_and_the_box_still_casts() {
+    let Some(mut rig) = Rig::new() else { return };
+
+    // The occluder slab parked at y = 50: every point of it is above the
+    // light's near plane (≈ y = 33.5), which is exactly the caster the old
+    // light-frustum cull rejected — and, once kept, exactly the geometry
+    // pancaking exists to flatten onto the plane. Both fixes in one caster.
+    let spawns = [
+        (rig.ground, Transform::IDENTITY),
+        (
+            rig.occluder,
+            Transform::from_translation(Vec3::new(0.0, 50.0, 0.0)),
+        ),
+    ];
+    let vp = rig.view_proj;
+    let shaded_px = rig.pixel_of(Vec3::ZERO);
+
+    let off = rig.frame_scene(ShadowQuality::Off, &spawns, vp);
+    for quality in [ShadowQuality::Low, ShadowQuality::High] {
+        let on = rig.frame_scene(quality, &spawns, vp);
+        let shaded = rgb(&on, shaded_px);
+        let was = rgb(&off, shaded_px);
+        assert!(
+            shaded[0] < was[0] - 60,
+            "{quality:?}: a caster between the light and the box was culled away \
+             (shaded {shaded:?}, was {was:?})"
+        );
+    }
+}
+
+#[test]
+fn the_shadow_fades_over_the_rim_band_instead_of_stepping_off() {
+    let Some(mut rig) = Rig::new() else { return };
+
+    // A wide world: a big floor, and a long thin strip floating at y = 8 whose
+    // shadow runs — under the vertical key light — all the way across and past
+    // the light box's rim. The camera sits low and off to one side, so the
+    // ground around the rim is on screen and the strip hides none of it.
+    let floor = rig.renderer.register_mesh(&rect(45.0, 45.0));
+    let strip = rig.renderer.register_mesh(&rect(45.0, 2.0));
+    let vp = Camera::default().view_proj(
+        Transform::looking_at(Vec3::new(0.0, 12.0, 22.0), Vec3::new(16.0, 0.0, 0.0), Vec3::Y)
+            .matrix(),
+        1.0,
+    );
+    let spawns = [
+        (floor, Transform::IDENTITY),
+        (strip, Transform::from_translation(Vec3::new(0.0, 8.0, 0.0))),
+    ];
+
+    let extent = ShadowSettings::default().extent;
+    let band = 0.1; // `ShadowSettings::default().fade`, in map-uv units
+
+    let off = rig.frame_scene(ShadowQuality::Off, &spawns, vp);
+    for (quality, resolution) in [(ShadowQuality::Low, 512), (ShadowQuality::High, 2048)] {
+        // Where the rim is, *exactly*: the same pure matrix the renderer
+        // samples through, under which uv.x along the ground line z = 0 is
+        // affine in world x — two probes recover the map, and the map places
+        // three receivers by their fade coordinate.
+        let lvp = shadow::light_view_proj(&vp, Vec3::Y, extent, resolution);
+        let uv_x = |x: f32| (lvp * Vec4::new(x, 0.0, 0.0, 1.0)).x * 0.5 + 0.5;
+        let (u0, du) = (uv_x(0.0), uv_x(1.0) - uv_x(0.0));
+        // The rim ahead of the camera (positive world x — the light's uv axis
+        // may point either way along it), measured inward in band widths.
+        let rim_uv = |bands: f32| {
+            if du > 0.0 { 1.0 - bands * band } else { bands * band }
+        };
+        let x_at = |uv: f32| (uv - u0) / du;
+
+        // Inside the band's inner edge (full shadow), halfway through the
+        // fade, and past the rim entirely (open daylight).
+        let p_in = Vec3::new(x_at(rim_uv(1.5)), 0.0, 0.0);
+        let p_mid = Vec3::new(x_at(rim_uv(0.5)), 0.0, 0.0);
+        let p_out = Vec3::new(x_at(rim_uv(-0.5)), 0.0, 0.0);
+
+        // The uv.x rim must be the *only* fade coordinate in play: the other
+        // three (uv.y both ways, far depth) stay interior at all three points.
+        for p in [p_in, p_mid, p_out] {
+            let ndc = lvp * p.extend(1.0);
+            let uv_y = 0.5 - ndc.y * 0.5;
+            assert!(
+                (0.2..0.8).contains(&uv_y) && (0.2..0.8).contains(&ndc.z),
+                "test geometry drifted: {p} has uv.y {uv_y}, depth {}",
+                ndc.z
+            );
+        }
+
+        let on = rig.frame_scene(quality, &spawns, vp);
+        let dark = rgb(&on, Rig::pixel_at(vp, p_in));
+        let mid = rgb(&on, Rig::pixel_at(vp, p_mid));
+        let lit = rgb(&on, Rig::pixel_at(vp, p_out));
+
+        // Past the rim is not merely "bright": it is byte-identical to
+        // shadows-off, because the fade scales the shadow term toward lit and
+        // an out-of-box receiver never samples at all.
+        assert_eq!(
+            lit,
+            rgb(&off, Rig::pixel_at(vp, p_out)),
+            "{quality:?}: the world past the box rim is not exact daylight"
+        );
+        // The strip does shadow the inner point…
+        assert!(
+            dark[0] < lit[0] - 40,
+            "{quality:?}: no shadow inside the rim band (dark {dark:?}, lit {lit:?})"
+        );
+        // …and halfway through the band the shadow is *half gone* — strictly
+        // between the two, which a hard step at the rim can never produce.
+        assert!(
+            mid[0] > dark[0] + 12 && mid[0] < lit[0] - 12,
+            "{quality:?}: the rim is a step, not a fade (dark {dark:?}, mid {mid:?}, lit {lit:?})"
+        );
+    }
 }
