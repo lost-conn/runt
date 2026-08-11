@@ -527,7 +527,11 @@ fn touch(
 /// `scroll` is the index the top visible line stands for — the panel scrolls
 /// when the list is longer than the screen, and a hit test that ignored that
 /// would select the wrong field on every panel tall enough to matter.
-fn row_at(scroll: usize, count: usize, y: f32) -> Option<usize> {
+///
+/// `pub(crate)` because [`crate::inspect_panel`] lays its rows out on the same
+/// pitch below the same title line; two hit tests would be two chances to be a
+/// pixel apart.
+pub(crate) fn row_at(scroll: usize, count: usize, y: f32) -> Option<usize> {
     let pitch = row_pitch();
     let top = MARGIN + PAD + pitch; // the title occupies the first line
     let row = ((y - top) / pitch).floor();
@@ -666,10 +670,26 @@ fn bar(batch: &mut UiBatch, field: &TweakField, x: f32, y: f32, pitch: f32) {
         TweakValue::Int(v) => v as f32,
         _ => return,
     };
+    value_bar(batch, &field.range, value, x, y, pitch);
+}
+
+/// The bar itself, from a bare range and value.
+///
+/// Split out of [`bar`] because [`crate::inspect_panel`] draws the same fill
+/// for its numeric rows and has widgets rather than [`TweakField`]s in hand —
+/// one geometry, so the two panels cannot drift a pixel apart.
+pub(crate) fn value_bar(
+    batch: &mut UiBatch,
+    range: &crate::reflect::FieldRange,
+    value: f32,
+    x: f32,
+    y: f32,
+    pitch: f32,
+) {
     let h = (pitch - 6.0).max(2.0);
     let top = y + (pitch - h) * 0.5 - 1.0;
     batch.solid([x, top, BAR_WIDTH, h], BAR_TRACK);
-    let t = field.range.normalize(value);
+    let t = range.normalize(value);
     if t > 0.0 {
         batch.solid([x, top, BAR_WIDTH * t, h], BAR);
     }

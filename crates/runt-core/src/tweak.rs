@@ -683,7 +683,11 @@ fn split_root(path: &str) -> Option<(&str, &str)> {
 /// [`RenderScale`](crate::RenderScale) annotatable: its one field is `.0`, and
 /// without this it would fall back to [`DEFAULT_RANGE`] and give a panel a
 /// −100…100 slider on a value the renderer clamps to 0.1…1.
-fn declared_range(info: &TypeInfo, field: &str) -> Option<FieldRange> {
+///
+/// `pub(crate)` because [`crate::inspect`]'s walk reads ranges off the same
+/// attributes: bounds are declared once, at the param, and both panels must
+/// read the one declaration or they will eventually disagree about it.
+pub(crate) fn declared_range(info: &TypeInfo, field: &str) -> Option<FieldRange> {
     match info {
         TypeInfo::Struct(_) => FieldRange::lookup(info, field),
         TypeInfo::TupleStruct(s) => {

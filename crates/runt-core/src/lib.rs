@@ -41,6 +41,14 @@ pub mod engine;
 pub mod font;
 pub mod gen;
 pub mod input;
+/// The selection inspector's widget model (DESIGN §10a): any `Reflect` value →
+/// an editable widget tree, data-carrying enums included. Off by default with
+/// the rest of reflection; a wasm player compiles it away entirely.
+#[cfg(feature = "reflect")]
+pub mod inspect;
+/// The overlay that draws and drives [`inspect`] trees. Feature-gated with it.
+#[cfg(feature = "reflect")]
+pub mod inspect_panel;
 pub mod material;
 /// The procedural-noise library, CPU side (DESIGN §7).
 pub mod noise;
