@@ -254,6 +254,32 @@ impl MaterialVariant {
     /// [`DEPTH_GREATER`]: MaterialVariant::DEPTH_GREATER
     /// [`PipelineState::cull`]: crate::PipelineState::cull
     pub const TWO_SIDED: MaterialVariant = MaterialVariant(1 << 13);
+    /// Receive the key light's shadow map (DESIGN §5, §11; see
+    /// [`shadow`](crate::shadow)): the lit branch's key term is scaled by a
+    /// comparison-sampled visibility factor.
+    ///
+    /// # A renderer-resolved bit, never a material's
+    ///
+    /// No `Material` sets this and no scene file should spell it: the renderer
+    /// ORs it onto every lit draw while its shadow gate is open
+    /// ([`resolve_shadow_variant`](crate::resolve_shadow_variant)), exactly as
+    /// [`LIVE_TEX`] is §7's gate applied to [`TEXTURE`] — §11's "gates select
+    /// data and variants", third instance. It is a *variant* rather than a
+    /// runtime uniform branch for a reason bought with a moved golden hash:
+    /// a live branch around the key term perturbed the driver's instruction
+    /// scheduling enough to shift a handful of lit pixels by one LSB *with the
+    /// gate closed*. A `const` branch folds to the old straight-line code, so
+    /// shadows-off draws through the byte-identical pipeline it always had —
+    /// the same key, the same cached object.
+    ///
+    /// Unlit looks ([`UNLIT`]) never receive the bit — their fragment path
+    /// replaces the lighting term the shadow would scale — so the gate opening
+    /// compiles a shadowed twin per *lit* variant in use, and nothing else.
+    ///
+    /// [`LIVE_TEX`]: MaterialVariant::LIVE_TEX
+    /// [`TEXTURE`]: MaterialVariant::TEXTURE
+    /// [`UNLIT`]: MaterialVariant::UNLIT
+    pub const SHADOW: MaterialVariant = MaterialVariant(1 << 14);
 
     /// Every declared flag, with the WGSL `const` it maps to. The order here is
     /// the order the preprocessor emits, so generated sources are stable.
@@ -263,7 +289,7 @@ impl MaterialVariant {
     /// `F_TWO_SIDED`: this list is the *declaration* of the key space, and a bit
     /// missing from it would be a key the preprocessor silently could not
     /// describe.
-    pub const FLAGS: [(&'static str, MaterialVariant); 14] = [
+    pub const FLAGS: [(&'static str, MaterialVariant); 15] = [
         ("F_VERTEX_COLOR", MaterialVariant::VERTEX_COLOR),
         ("F_TEXTURE", MaterialVariant::TEXTURE),
         ("F_RAMP", MaterialVariant::RAMP),
@@ -278,6 +304,7 @@ impl MaterialVariant {
         ("F_EMISSIVE_SWEEP", MaterialVariant::EMISSIVE_SWEEP),
         ("F_VERTEX_WAVE", MaterialVariant::VERTEX_WAVE),
         ("F_TWO_SIDED", MaterialVariant::TWO_SIDED),
+        ("F_SHADOW", MaterialVariant::SHADOW),
     ];
 
     /// The two blend bits, as one mask: the draws that leave the opaque
@@ -300,7 +327,8 @@ impl MaterialVariant {
             | MaterialVariant::FRESNEL.0
             | MaterialVariant::EMISSIVE_SWEEP.0
             | MaterialVariant::VERTEX_WAVE.0
-            | MaterialVariant::TWO_SIDED.0,
+            | MaterialVariant::TWO_SIDED.0
+            | MaterialVariant::SHADOW.0,
     );
 
     /// The four bits that each *replace* the lighting term rather than feeding

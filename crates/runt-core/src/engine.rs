@@ -181,6 +181,35 @@ impl Engine {
         self.sim.set_render_scale(scale);
     }
 
+    /// The key light's shadow tier (DESIGN §5, §11): off (the default), 512²
+    /// or 2048². See [`shadow`](crate::shadow).
+    pub fn shadow_quality(&self) -> crate::shadow::ShadowQuality {
+        self.sim.shadow_quality()
+    }
+
+    /// Flip the shadow map between §11's tiers — the hand-flipped gate, in
+    /// [`set_live_textures`](Engine::set_live_textures)' style, until the perf
+    /// probe exists to set it at startup.
+    ///
+    /// Cheap to call every frame: the renderer compares before it rebuilds.
+    /// Invisible to the sim — no system reads it, so no replay fingerprint can
+    /// move — and at `Off` the frame is byte-identical to an engine that never
+    /// had shadows, with nothing allocated (`tests/shadows.rs`).
+    pub fn set_shadow_quality(&mut self, quality: crate::shadow::ShadowQuality) {
+        self.sim.set_shadow_quality(quality);
+    }
+
+    /// The shadow box and biases (see [`ShadowSettings`](crate::shadow::ShadowSettings)).
+    pub fn shadow_settings(&self) -> crate::shadow::ShadowSettings {
+        self.sim.shadow_settings()
+    }
+
+    /// Tune the shadow box and biases. The same resource a game's tweak panel
+    /// drags, so the two doors cannot disagree.
+    pub fn set_shadow_settings(&mut self, settings: crate::shadow::ShadowSettings) {
+        self.sim.set_shadow_settings(settings);
+    }
+
     /// The host's display scale factor: physical pixels per logical pixel.
     /// 1.0 unless a host set one.
     pub fn scale_factor(&self) -> f32 {
@@ -297,6 +326,14 @@ impl Engine {
         // wrap the seconds, not to hand the GPU an f64 it cannot take.
         self.renderer
             .set_render_clock(self.render_seconds as f32, self.sim.alpha());
+
+        // The shadow gate and its knobs, mirrored from the world exactly as
+        // the HUD batch is below: the resource is where a `FixedSim` system or
+        // a tweak panel writes, the renderer is where it takes effect, and
+        // this is that door once per frame. Both calls are trivially cheap
+        // when nothing changed.
+        self.renderer.set_shadow_quality(self.sim.shadow_quality());
+        self.renderer.set_shadow_settings(self.sim.shadow_settings());
 
         // The HUD the world holds right now (plan D11, `crate::ui`). Mirrored
         // into the renderer every frame — the batch is rebuilt each frame by

@@ -293,6 +293,11 @@ impl Sim {
         world.insert_resource(Lighting::default());
         world.insert_resource(StatusLine::default());
         world.insert_resource(crate::ecs::RenderScale::default());
+        // The shadow gate and its tuning (DESIGN §5, §11) — render values in
+        // the world for `RenderScale`'s reason. Off and the defaults, so a sim
+        // that never mentions shadows draws (and hashes) as it always did.
+        world.insert_resource(crate::shadow::ShadowQuality::default());
+        world.insert_resource(crate::shadow::ShadowSettings::default());
         world.insert_resource(SimSpeed::default());
         world.insert_resource(crate::audio::AudioOut::new());
         // The frame's HUD (plan D11). A standard output seam like `StatusLine`
@@ -749,6 +754,39 @@ impl Sim {
     pub fn set_render_scale(&mut self, scale: f32) {
         let scale = crate::ecs::RenderScale::new(scale);
         self.world.insert_resource(scale);
+    }
+
+    /// The key light's shadow tier (DESIGN §11: off / 512² / 2048²). See
+    /// [`ShadowQuality`](crate::shadow::ShadowQuality).
+    pub fn shadow_quality(&self) -> crate::shadow::ShadowQuality {
+        self.world
+            .get_resource::<crate::shadow::ShadowQuality>()
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Flip the shadow tier. Render-side only, exactly like
+    /// [`set_render_scale`](Sim::set_render_scale): the renderer mirrors it at
+    /// draw time and no system reads it, so no fingerprint can move. Game code
+    /// that wants it on a key writes `ResMut<ShadowQuality>` from a `FixedSim`
+    /// system instead.
+    pub fn set_shadow_quality(&mut self, quality: crate::shadow::ShadowQuality) {
+        self.world.insert_resource(quality);
+    }
+
+    /// The shadow box and biases. See [`ShadowSettings`](crate::shadow::ShadowSettings).
+    pub fn shadow_settings(&self) -> crate::shadow::ShadowSettings {
+        self.world
+            .get_resource::<crate::shadow::ShadowSettings>()
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Tune the shadow box and biases — a resource write, like the tier above,
+    /// so a tweak panel dragging the reflected fields and this door land in
+    /// the same place.
+    pub fn set_shadow_settings(&mut self, settings: crate::shadow::ShadowSettings) {
+        self.world.insert_resource(settings);
     }
 
     /// The persistent content store, so the bake can consult it (DESIGN §7).

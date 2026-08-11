@@ -148,6 +148,7 @@ fn variant_keys_behave_as_bitflags() {
     assert_eq!(MaterialVariant::EMISSIVE_SWEEP.bits(), 1 << 11);
     assert_eq!(MaterialVariant::VERTEX_WAVE.bits(), 1 << 12);
     assert_eq!(MaterialVariant::TWO_SIDED.bits(), 1 << 13);
+    assert_eq!(MaterialVariant::SHADOW.bits(), 1 << 14);
 
     // The flag list and the bits agree, so no key can be generated that the
     // preprocessor would not emit a const for.
@@ -156,7 +157,7 @@ fn variant_keys_behave_as_bitflags() {
         assert!(!union.contains(flag), "duplicate flag bit {:#06b}", flag.bits());
         union |= flag;
     }
-    assert_eq!(union.bits(), 0b11_1111_1111_1111);
+    assert_eq!(union.bits(), 0b111_1111_1111_1111);
 
     // The four looks that replace the lighting term rather than feeding it.
     // Exactly one wins per fragment; the mask is what says which four they are.

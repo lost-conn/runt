@@ -59,6 +59,9 @@ pub mod physics;
 pub mod reflect;
 pub mod registry;
 pub mod scene;
+/// The key light's shadow map, CPU half: the quality gate, the tuning knobs
+/// and the snapped light matrix (DESIGN §5, §11).
+pub mod shadow;
 pub mod sim;
 pub mod sky;
 /// Procedural texture specs and their CPU evaluator (DESIGN §7).
@@ -82,6 +85,10 @@ pub const SKY_SHADER: &str = include_str!("sky.wgsl");
 /// circle's screen effect (DESIGN §11, §5). Standalone like [`SKY_SHADER`]; see
 /// [`Renderer::render_scaled`].
 pub const BLIT_SHADER: &str = include_str!("blit.wgsl");
+
+/// The shadow map's depth-only pass (DESIGN §5, §11; see [`shadow`]).
+/// Standalone like [`SKY_SHADER`].
+pub const SHADOW_SHADER: &str = include_str!("shadow.wgsl");
 
 /// The screen-space UI pass's WGSL (see [`ui`]). Standalone like
 /// [`BLIT_SHADER`]; re-exported from [`ui::UI_SHADER`] so the three standalone
@@ -131,6 +138,7 @@ pub use runt_mesh::{HeightField, MeshData as Mesh, Quality, TerrainParams, Terra
 pub use scene::{
     load_scene, save_scene, SceneDesc, SceneError, TextureEntry, TEXTURED_SCENE_RON,
 };
+pub use shadow::{ShadowQuality, ShadowSettings};
 pub use sim::{Sim, SimConfig, SimSpeed, MAX_ACCUMULATED, TICK_DT};
 pub use texture::{
     NoiseSpec, NormalMode, NormalSpec, TextureHandle, TextureLibrary, TextureSpec,
@@ -275,6 +283,17 @@ pub struct FrameUniform {
     /// even though nothing there reads it — one buffer, one layout, three
     /// files (see the block's own note).
     pub sky_params: [f32; 4],
+    /// World space → the key light's clip space, for the shadow-map lookup
+    /// (DESIGN §5, §11; see [`shadow::light_view_proj`]). Identity while
+    /// shadows are off — written but never read, because
+    /// [`shadow_params`](FrameUniform::shadow_params)`.x` gates every sample.
+    pub light_view_proj: [[f32; 4]; 4],
+    /// The shadow lookup's gate and biases: `x` — 1.0 while a shadow map is
+    /// bound, 0.0 otherwise (and the shader takes the exact pre-shadow path at
+    /// 0, so "off" is byte-identity, not a multiply by one that happens to be
+    /// exact); `y` — constant depth bias; `z` — slope-scaled depth bias
+    /// (both [`ShadowSettings`]'); `w` — reserved.
+    pub shadow_params: [f32; 4],
 }
 
 /// Per-instance vertex data: one of these per drawn entity, in a vertex buffer
@@ -439,6 +458,32 @@ pub struct Renderer {
     /// never asks for a second camera.
     scene_targets: HashMap<RenderTarget, SceneTarget>,
 
+    /// The key light's shadow map and its depth-only pass — `None` at
+    /// [`ShadowQuality::Off`], which is the default, so a host that never
+    /// flips the gate allocates and encodes nothing (DESIGN §11). See
+    /// [`set_shadow_quality`](Renderer::set_shadow_quality).
+    shadow: Option<ShadowPass>,
+    /// The gate as last set. Render-side state like [`phase`](Renderer::phase):
+    /// through an [`Engine`] the [`shadow::ShadowQuality`] resource is mirrored
+    /// here once per frame, and a bare-`Renderer` host sets it directly.
+    shadow_quality: shadow::ShadowQuality,
+    /// The box size and biases, same arrangement as the gate above.
+    shadow_settings: shadow::ShadowSettings,
+    /// The comparison sampler every shadow lookup goes through — hardware PCF
+    /// via `Linear` filtering on a depth compare, which is in the WebGL2 floor.
+    /// One sampler serves the real map and the dummy alike, built eagerly in
+    /// [`new`](Renderer::new) because the frame bind group needs *something*
+    /// bound from frame one (a sampler is a descriptor, not memory).
+    shadow_sampler: wgpu::Sampler,
+    /// A 1×1 depth texel bound in the frame bind group's shadow slot whenever
+    /// there is no real map — while the gate is off, and in every offscreen
+    /// scene target's group (those skip shadows by design; see
+    /// [`render_to_texture`](Renderer::render_to_texture)). Never sampled:
+    /// `shadow_params.x` is 0 on those paths and the shader's guard is what
+    /// makes the binding inert. It exists because the *layout* carries the
+    /// shadow slots unconditionally — see [`new`](Renderer::new) on why.
+    shadow_dummy: wgpu::TextureView,
+
     /// The screen-space UI pipeline, compiled the first time a frame actually
     /// has a HUD in it (see [`ensure_ui`](Renderer::ensure_ui)).
     ui: Option<ui::UiPass>,
@@ -528,6 +573,49 @@ struct SceneTarget {
     frame_bind_group: wgpu::BindGroup,
 }
 
+/// The key light's shadow map and everything that writes it: the depth-only
+/// pipeline, the light matrix's little uniform, and a caster instance buffer
+/// of its own (DESIGN §5, §11; see [`shadow`]).
+///
+/// # Why the casters get their own instance buffer
+///
+/// The main pass's instance buffer holds the *camera's* visible list, written
+/// once per frame, and every draw indexes into it. The shadow pass draws a
+/// different set — blended items and unlit billboards do not cast, and the
+/// light's frustum culls differently from the camera's — so its instances are
+/// a different packing. Two buffers, each written once, beat one buffer
+/// written twice into disjoint halves: the cost is only paid while the gate is
+/// open, and neither pass can ever read the other's offsets.
+///
+/// # Why the runs are `(mesh, first, count)` and not [`InstanceRun`]s
+///
+/// One pipeline draws every caster, and no texture is bound, so the only state
+/// between draws is the mesh — variant and texture would be dead keys. The
+/// caster list arrives sorted by the main sort (mesh is the third key), so
+/// adjacent-same-mesh coalescing still lands the instancing win.
+///
+/// [`InstanceRun`]: draw::InstanceRun
+struct ShadowPass {
+    resolution: u32,
+    /// The map — `Depth32Float`, attachment here, sampled by the main pass
+    /// through the frame bind group.
+    view: wgpu::TextureView,
+    pipeline: wgpu::RenderPipeline,
+    /// One `mat4`: [`shadow::light_view_proj`], rewritten every frame.
+    light_buffer: wgpu::Buffer,
+    /// Binds `light_buffer` under the pass's own single-entry layout — not the
+    /// frame layout, which now carries the map itself and may not be bound
+    /// while the map is the attachment.
+    bind_group: wgpu::BindGroup,
+    instance_buffer: wgpu::Buffer,
+    instance_capacity: u32,
+    /// Staging and working sets, kept between frames like the renderer's own
+    /// (`visible`/`runs`): a steady scene allocates nothing per frame.
+    scratch: Vec<InstanceRaw>,
+    casters: Vec<DrawItem>,
+    runs: Vec<(MeshHandle, u32, u32)>,
+}
+
 /// The internal color target for a scaled frame, plus the bind group that
 /// samples it. Kept whole because the three parts are only ever valid together:
 /// the bind group names the view, and the view names the texture.
@@ -560,20 +648,52 @@ impl Renderer {
         queue: wgpu::Queue,
         target_format: wgpu::TextureFormat,
     ) -> Renderer {
+        // The frame group carries the shadow map beside the frame block —
+        // bindings 1 and 2, **unconditionally**. DESIGN's preference was to
+        // extend this group rather than claim a new one, and extending the
+        // *layout* permanently (rather than swapping layouts when the gate
+        // flips) is what keeps every pipeline in the engine compiled against
+        // one shape: a layout change would re-key the material cache, the sky
+        // and the blit for a toggle that is supposed to cost nothing. The
+        // price is a 1×1 dummy depth texel bound while shadows are off
+        // (`shadow_dummy`) — a descriptor and four bytes, never sampled,
+        // because `shadow_params.x` gates every lookup in the shader.
+        // `@group(1)` stays the documented hole it already is.
         let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame bind layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(
-                        std::mem::size_of::<FrameUniform>() as u64
-                    ),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<FrameUniform>() as u64
+                        ),
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        // `Depth` + a `Comparison` sampler: both are in
+                        // `downlevel_webgl2_defaults` — WebGL2 has depth
+                        // textures and `sampler2DShadow` in core (DESIGN §11).
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+            ],
         });
         // Two groups now: frame at 0 and texture at 2. Group 1 is a **hole** —
         // it held the per-entity uniform until instancing (D3) moved that data
@@ -596,14 +716,46 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let frame_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("frame bind group"),
-            layout: &frame_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: frame_buffer.as_entire_binding(),
-            }],
+
+        // The shadow slots' resting tenants: a 1×1 depth texel and the one
+        // comparison sampler (see the layout comment above). `Linear` filters
+        // on a comparison sampler are hardware PCF — a 2×2 tap the driver
+        // averages — and are core WebGL2 behaviour, not a capability.
+        let shadow_dummy = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("shadow dummy"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow compare"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
         });
+
+        let frame_bind_group = create_frame_bind_group(
+            &device,
+            &frame_layout,
+            &frame_buffer,
+            &shadow_dummy,
+            &shadow_sampler,
+        );
 
         let instance_buffer = create_instance_buffer(&device, INITIAL_INSTANCE_CAPACITY);
 
@@ -635,6 +787,11 @@ impl Renderer {
             offscreen: None,
             blit: None,
             scene_targets: HashMap::new(),
+            shadow: None,
+            shadow_quality: shadow::ShadowQuality::Off,
+            shadow_settings: shadow::ShadowSettings::default(),
+            shadow_sampler,
+            shadow_dummy,
             ui: None,
             ui_quads: Vec::new(),
             ui_runs: Vec::new(),
@@ -762,6 +919,59 @@ impl Renderer {
             self.phase[2],
             self.phase[3],
         )
+    }
+
+    /// Flip the key light's shadow map between §11's tiers: `Off` (the
+    /// default), `Low` (512²) and `High` (2048²). See [`shadow`].
+    ///
+    /// Cheap to call every frame with an unchanged value — one comparison —
+    /// which is how [`Engine::render`](crate::Engine::render) mirrors the
+    /// [`ShadowQuality`](shadow::ShadowQuality) resource here. An actual flip
+    /// (re)creates the map and rebinds the frame group; flipping to `Off`
+    /// frees the map entirely, so "off costs nothing" holds in both
+    /// directions, not just for a session that never opened the gate.
+    pub fn set_shadow_quality(&mut self, quality: shadow::ShadowQuality) {
+        if quality == self.shadow_quality {
+            return;
+        }
+        self.shadow_quality = quality;
+        match quality.resolution() {
+            Some(resolution) => self.ensure_shadow(resolution),
+            None => {
+                self.shadow = None;
+                self.frame_bind_group = create_frame_bind_group(
+                    &self.device,
+                    &self.frame_layout,
+                    &self.frame_buffer,
+                    &self.shadow_dummy,
+                    &self.shadow_sampler,
+                );
+                log::info!("shadow map: off");
+            }
+        }
+    }
+
+    /// The gate as the next frame will see it.
+    pub fn shadow_quality(&self) -> shadow::ShadowQuality {
+        self.shadow_quality
+    }
+
+    /// Tune the shadow box and biases (see [`ShadowSettings`](shadow::ShadowSettings)).
+    /// A copy of three floats — call it every frame; the engine does.
+    pub fn set_shadow_settings(&mut self, settings: shadow::ShadowSettings) {
+        self.shadow_settings = settings;
+    }
+
+    pub fn shadow_settings(&self) -> shadow::ShadowSettings {
+        self.shadow_settings
+    }
+
+    /// The allocated shadow map's edge in texels, or `None` while the gate is
+    /// off — the introspection [`scaled_target_size`](Renderer::scaled_target_size)
+    /// is for the render-scale target, and the "off allocates nothing" test
+    /// stands on it.
+    pub fn shadow_map_resolution(&self) -> Option<u32> {
+        self.shadow.as_ref().map(|s| s.resolution)
     }
 
     /// Set the render clock (see [`FrameUniform::time`]): host wall seconds and
@@ -1048,15 +1258,46 @@ impl Renderer {
         let mut runs = std::mem::take(&mut self.runs);
         self.stats = self.prepare_frame(frame, draws, &mut visible, &mut runs);
 
+        // The key light's frame, if the gate is open: one snapped box matrix
+        // (`shadow::light_view_proj`), computed here and shared by the two
+        // consumers — the depth pass renders through it and the frame block
+        // carries it for the lookup — so the map and the sample cannot drift.
+        let shadow_mat = match (self.shadow_quality.resolution(), &self.shadow) {
+            (Some(resolution), Some(_)) => Some(shadow::light_view_proj(
+                &frame.view_proj,
+                frame.lighting.key_dir,
+                self.shadow_settings.extent,
+                resolution,
+            )),
+            _ => None,
+        };
+
         self.bake_missing_textures(&visible, textures);
-        self.write_frame_uniform(frame, render_width, render_height);
+        self.write_frame_uniform(frame, render_width, render_height, shadow_mat);
         self.write_instances(&visible);
+        // With the gate open, lit draws bind their shadowed twin — the same
+        // key promotion `resolve_variant` does for §7's gate, applied at the
+        // pipeline seam so neither the extracted list nor the runs change.
+        let shadowed = shadow_mat.is_some();
         for run in &runs {
-            self.ensure_pipeline(run.variant);
+            self.ensure_pipeline(resolve_shadow_variant(run.variant, shadowed));
         }
         if fullscreen {
             self.ensure_blit();
             self.ensure_offscreen(render_width, render_height);
+        }
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        // The shadow map first, on the same encoder, so the scene pass below
+        // samples this frame's map rather than last frame's. It takes the
+        // *full* draw list — an off-screen caster still shadows the frame —
+        // and does its own light-frustum cull (see `encode_shadow`). While the
+        // gate is off this is not a cheap pass, it is no pass.
+        if let Some(light_view_proj) = shadow_mat {
+            self.encode_shadow(&mut encoder, draws, light_view_proj);
         }
 
         // The pass writes here; `view` is what the blit writes, if there is one.
@@ -1065,9 +1306,6 @@ impl Renderer {
             _ => view,
         };
         let depth_view = &self.depth.as_ref().expect("depth ensured").2;
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         let issued = self.encode_scene(
             &mut encoder,
             "opaque forward",
@@ -1075,6 +1313,7 @@ impl Renderer {
             depth_view,
             &self.frame_bind_group,
             &runs,
+            shadowed,
         );
 
         self.stats.draws = issued;
@@ -1202,6 +1441,15 @@ impl Renderer {
     ///   rest (see `frame_uniform`); a circle aimed at the host's screen has
     ///   no meaning in another world's viewport. If a tutorial card ever needs
     ///   to *demonstrate* phasing, this is where a per-target phase would go.
+    /// - **No shadow pass** (DESIGN §5's shadow map, [`shadow`]). The map is
+    ///   fitted around the *host* camera's focus, which means nothing to a
+    ///   second world, and a second map per target would be the gate's cost
+    ///   multiplied by every open card. So the target's frame block says
+    ///   shadows-off, its bind group holds the 1×1 dummy, and a viewport is
+    ///   lit by key + hemisphere alone — the pre-shadow look, which for a
+    ///   tutorial card is a rendering choice nobody will ever file a bug on.
+    ///   If a card someday needs one, the decision to revisit is per-target
+    ///   shadow state, not a flag here.
     ///
     /// # Every frame, or on change
     ///
@@ -1249,8 +1497,9 @@ impl Renderer {
             self.ensure_pipeline(run.variant);
         }
 
-        // The target's own frame block, written into the target's own buffer.
-        let uniform = self.frame_uniform(frame, width, height, [0.0; 4]);
+        // The target's own frame block, written into the target's own buffer —
+        // circle at rest, shadows off (see the omissions list above).
+        let uniform = self.frame_uniform(frame, width, height, [0.0; 4], None);
         let scene = self
             .scene_targets
             .get(&target)
@@ -1270,6 +1519,8 @@ impl Renderer {
             &scene.depth,
             &scene.frame_bind_group,
             &runs,
+            // A viewport skips shadows outright — see the omissions list.
+            false,
         );
         self.queue.submit(Some(encoder.finish()));
 
@@ -1354,14 +1605,16 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let frame_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("scene target frame"),
-            layout: &self.frame_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: frame_buffer.as_entire_binding(),
-            }],
-        });
+        // Always the dummy in the shadow slot: `render_to_texture` skips
+        // shadows outright (see its doc list of deliberate omissions), so its
+        // frame block writes `shadow_params.x = 0` and this binding is inert.
+        let frame_bind_group = create_frame_bind_group(
+            &self.device,
+            &self.frame_layout,
+            &frame_buffer,
+            &self.shadow_dummy,
+            &self.shadow_sampler,
+        );
 
         // The colour texture goes to the registry, which is what makes it
         // samplable by handle from the UI pass and the material path alike.
@@ -1478,6 +1731,7 @@ impl Renderer {
     /// time it runs (the caller uploaded, baked, wrote and compiled), and
     /// taking the working sets as an argument rather than reading them back out
     /// of `self` is what lets the caller keep holding them.
+    #[allow(clippy::too_many_arguments)]
     fn encode_scene(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1486,6 +1740,10 @@ impl Renderer {
         depth: &wgpu::TextureView,
         frame_group: &wgpu::BindGroup,
         runs: &[draw::InstanceRun],
+        // Whether this pass samples a live shadow map — lit draws then bind
+        // their [`SHADOW`](MaterialVariant::SHADOW) twin. False for every
+        // offscreen scene target (see `render_to_texture`'s omissions list).
+        shadowed: bool,
     ) -> u32 {
         let mut issued = 0u32;
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1540,13 +1798,14 @@ impl Renderer {
             let Some(gpu) = self.meshes.get(run.mesh) else {
                 continue; // Geometry the library could not supply; warned about above.
             };
-            if bound_variant != Some(run.variant) {
+            let variant = resolve_shadow_variant(run.variant, shadowed);
+            if bound_variant != Some(variant) {
                 let pipeline = self
                     .pipelines
-                    .get(&run.variant)
+                    .get(&variant)
                     .expect("variant compiled above");
                 pass.set_pipeline(pipeline);
-                bound_variant = Some(run.variant);
+                bound_variant = Some(variant);
             }
             // Group 2 is in the layout for every variant, so it is bound for
             // every draw — the sort order (texture is the second key)
@@ -1577,8 +1836,14 @@ impl Renderer {
 
     /// `width`/`height` are the **render** target's, not the host view's — see
     /// [`FrameUniform::viewport`].
-    fn write_frame_uniform(&mut self, frame: &FrameParams, width: u32, height: u32) {
-        let uniform = self.frame_uniform(frame, width, height, self.phase);
+    fn write_frame_uniform(
+        &mut self,
+        frame: &FrameParams,
+        width: u32,
+        height: u32,
+        shadow: Option<glam::Mat4>,
+    ) {
+        let uniform = self.frame_uniform(frame, width, height, self.phase, shadow);
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&uniform));
     }
@@ -1591,15 +1856,33 @@ impl Renderer {
     /// has no reason to inherit a circle aimed at the host's view, and
     /// inheriting one would make a demo viewport's geometry vanish because
     /// something happened on the HUD behind it.
+    ///
+    /// `shadow` is a parameter for the same shape of reason: the light matrix
+    /// belongs to the frame whose camera it was fitted around, and the
+    /// offscreen scene path passes `None` — `shadow_params.x = 0`, identity
+    /// matrix, dummy texture in its bind group, no lookup ever taken.
     fn frame_uniform(
         &self,
         frame: &FrameParams,
         width: u32,
         height: u32,
         phase: [f32; 4],
+        shadow: Option<glam::Mat4>,
     ) -> FrameUniform {
         let light = frame.lighting;
         let (w, h) = (width.max(1) as f32, height.max(1) as f32);
+        let (light_view_proj, shadow_params) = match shadow {
+            Some(matrix) => (
+                matrix.to_cols_array_2d(),
+                [
+                    1.0,
+                    self.shadow_settings.bias,
+                    self.shadow_settings.slope_bias,
+                    0.0,
+                ],
+            ),
+            None => (glam::Mat4::IDENTITY.to_cols_array_2d(), [0.0; 4]),
+        };
         FrameUniform {
             view_proj: frame.view_proj.to_cols_array_2d(),
             inv_view_proj: frame.view_proj.inverse().to_cols_array_2d(),
@@ -1612,6 +1895,8 @@ impl Renderer {
             time: self.time,
             viewport: [w, h, 1.0 / w, 1.0 / h],
             sky_params: [light.clouds, light.sun, 0.0, 0.0],
+            light_view_proj,
+            shadow_params,
         }
     }
 
@@ -1905,6 +2190,289 @@ impl Renderer {
             bind_group,
         });
     }
+
+    /// Build the shadow map, its pipeline and its buffers at `resolution`, and
+    /// rebind the frame group to sample it. Idempotent at an unchanged
+    /// resolution; a tier change rebuilds the lot, which is a hand-flipped
+    /// event and not a per-frame one.
+    fn ensure_shadow(&mut self, resolution: u32) {
+        if matches!(&self.shadow, Some(s) if s.resolution == resolution) {
+            return;
+        }
+        let view = self
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("shadow map"),
+                size: wgpu::Extent3d {
+                    width: resolution,
+                    height: resolution,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        // The pass's own single-entry layout, *not* the frame layout: the
+        // frame group now names the map itself, and a group that samples the
+        // pass's own attachment cannot be bound while it renders. The little
+        // uniform holds exactly the one matrix the pass reads.
+        let light_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shadow light uniform"),
+            size: std::mem::size_of::<[[f32; 4]; 4]>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("shadow pass layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<[[f32; 4]; 4]>() as u64,
+                        ),
+                    },
+                    count: None,
+                }],
+            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow pass bind group"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: light_buffer.as_entire_binding(),
+            }],
+        });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("shadow pipeline layout"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("shadow depth"),
+                source: wgpu::ShaderSource::Wgsl(SHADOW_SHADER.into()),
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shadow depth"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_shadow"),
+                    // The same two slots every material pipeline declares, so
+                    // the mesh registry's buffers and `InstanceRaw` need no
+                    // second layout; the shader reads position and the matrix
+                    // columns and ignores the rest.
+                    buffers: &[Some(Vertex::LAYOUT), Some(InstanceRaw::LAYOUT)],
+                    compilation_options: Default::default(),
+                },
+                // A fragment stage with no targets: depth is the only output.
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_shadow"),
+                    targets: &[],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    // Back-face culling, same as the main pass: front-face
+                    // culling is the other classic acne dodge, but it breaks
+                    // open meshes (a heightfield terrain has no back), and the
+                    // shader's slope bias is the tunable version of the same
+                    // fix.
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    // No hardware depth bias: the bias lives in the shader's
+                    // compare (`ShadowSettings`), where it is tunable at
+                    // runtime without a pipeline rebuild.
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        let instance_buffer = create_instance_buffer(&self.device, INITIAL_INSTANCE_CAPACITY);
+        log::info!("shadow map: {resolution}²");
+        self.shadow = Some(ShadowPass {
+            resolution,
+            view,
+            pipeline,
+            light_buffer,
+            bind_group,
+            instance_buffer,
+            instance_capacity: INITIAL_INSTANCE_CAPACITY,
+            scratch: Vec::new(),
+            casters: Vec::new(),
+            runs: Vec::new(),
+        });
+        // The main frame group samples the new map from now on. Offscreen
+        // scene targets keep their dummies — they skip shadows by design.
+        let shadow_view = &self.shadow.as_ref().expect("just built").view;
+        self.frame_bind_group = create_frame_bind_group(
+            &self.device,
+            &self.frame_layout,
+            &self.frame_buffer,
+            shadow_view,
+            &self.shadow_sampler,
+        );
+    }
+
+    /// The shadow map's frame: cull the casters against the light's box, pack
+    /// their instances, and encode the depth-only pass. Runs on the same
+    /// encoder as — and before — the scene pass that samples the result.
+    ///
+    /// `draws` is the **whole** extracted list, not the camera-visible half:
+    /// a caster behind the camera still throws its shadow into frame. The
+    /// light's own frustum ([`Frustum`](draw::Frustum) works unchanged on an
+    /// orthographic matrix) is what keeps the pass from drawing the world.
+    ///
+    /// Casters are the opaque lit population only. Blended items do not cast —
+    /// a ghost with a solid shadow reads as a bug, and the original's
+    /// transparent surfaces cast nothing either — and unlit billboards are
+    /// emissive sprites whose camera-facing quad would throw a lying
+    /// silhouette.
+    fn encode_shadow(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        draws: &[DrawItem],
+        light_view_proj: glam::Mat4,
+    ) {
+        let Some(mut pass_data) = self.shadow.take() else {
+            return;
+        };
+        // Taken out of `self` (the `visible`/`runs` move in `render_scaled`,
+        // one struct deeper): filling the working sets reads `self.meshes`.
+        pass_data.casters.clear();
+        pass_data.casters.extend(
+            draws
+                .iter()
+                .filter(|item| {
+                    !item.is_blended()
+                        && !item.variant.contains(MaterialVariant::BILLBOARD_UNLIT)
+                })
+                .copied(),
+        );
+        let frustum = draw::Frustum::from_view_proj(&light_view_proj);
+        draw::cull_draw_list(&mut pass_data.casters, &frustum, |handle| {
+            self.meshes.bounds(handle)
+        });
+
+        // Coalesce by mesh alone: one pipeline and no texture means the mesh
+        // is the only state between draws (see `ShadowPass`). The list is
+        // still in the main sort's order, so same-mesh neighbours are common.
+        pass_data.runs.clear();
+        for (index, item) in pass_data.casters.iter().enumerate() {
+            match pass_data.runs.last_mut() {
+                Some((mesh, _, count)) if *mesh == item.mesh => *count += 1,
+                _ => pass_data.runs.push((item.mesh, index as u32, 1)),
+            }
+        }
+
+        self.queue.write_buffer(
+            &pass_data.light_buffer,
+            0,
+            bytemuck::bytes_of(&light_view_proj.to_cols_array_2d()),
+        );
+        if !pass_data.casters.is_empty() {
+            let needed = pass_data.casters.len() as u32;
+            if needed > pass_data.instance_capacity {
+                let capacity = needed.max(pass_data.instance_capacity.saturating_mul(2));
+                pass_data.instance_buffer = create_instance_buffer(&self.device, capacity);
+                pass_data.instance_capacity = capacity;
+            }
+            pass_data.scratch.clear();
+            pass_data
+                .scratch
+                .extend(pass_data.casters.iter().map(InstanceRaw::from_item));
+            self.queue.write_buffer(
+                &pass_data.instance_buffer,
+                0,
+                bytemuck::cast_slice(&pass_data.scratch),
+            );
+        }
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow depth"),
+                // No colour at all: 1.0 (the far plane, "nothing here") is
+                // what an empty map compares as, so a frame with no casters
+                // shadows nothing rather than everything.
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &pass_data.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pass_data.pipeline);
+            pass.set_bind_group(0, &pass_data.bind_group, &[]);
+            if !pass_data.runs.is_empty() {
+                pass.set_vertex_buffer(1, pass_data.instance_buffer.slice(..));
+            }
+            let mut bound_mesh: Option<MeshHandle> = None;
+            for &(mesh, first, count) in &pass_data.runs {
+                let Some(gpu) = self.meshes.get(mesh) else {
+                    continue; // Unsupplied geometry; the main pass warned.
+                };
+                if bound_mesh != Some(mesh) {
+                    pass.set_vertex_buffer(0, gpu.vertices.slice(..));
+                    pass.set_index_buffer(gpu.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    bound_mesh = Some(mesh);
+                }
+                pass.draw_indexed(0..gpu.index_count, 0, first..first + count);
+            }
+        }
+        self.shadow = Some(pass_data);
+    }
+}
+
+/// Which key a draw's pipeline is actually looked up under once the shadow
+/// gate has had its say: lit looks gain [`SHADOW`](MaterialVariant::SHADOW)
+/// while the gate is open, unlit looks and closed gates pass through
+/// untouched.
+///
+/// The renderer-side twin of [`draw::resolve_variant`] (§11: gates select
+/// variants), and — like that one — a pure function, public so the mapping is
+/// a unit test. `shadowed` is "this pass samples a live shadow map", which is
+/// [`Renderer::render_scaled`] with the gate open and never
+/// [`Renderer::render_to_texture`]. With it false the key is returned
+/// *unchanged*, so a closed gate draws through the byte-identical cached
+/// pipelines it always had — that, not a runtime branch, is what keeps
+/// shadows-off pinned-frame exact (see the lit branch in `shader.wgsl`).
+pub fn resolve_shadow_variant(variant: MaterialVariant, shadowed: bool) -> MaterialVariant {
+    if shadowed && !variant.intersects(MaterialVariant::UNLIT) {
+        variant | MaterialVariant::SHADOW
+    } else {
+        variant
+    }
 }
 
 /// The fixed-function half of a variant: what [`Renderer::ensure_pipeline`]
@@ -2059,6 +2627,38 @@ fn create_sky_pipeline(
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
+    })
+}
+
+/// A frame bind group: the block at 0, the shadow map (or its 1×1 dummy) at 1,
+/// the comparison sampler at 2. The one place the group's shape is spelled
+/// out, because three call sites build one — the main frame, every offscreen
+/// scene target (always the dummy; those skip shadows by design), and the
+/// rebuild when the gate flips.
+fn create_frame_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    frame_buffer: &wgpu::Buffer,
+    shadow_view: &wgpu::TextureView,
+    shadow_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("frame bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: frame_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(shadow_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(shadow_sampler),
+            },
+        ],
     })
 }
 

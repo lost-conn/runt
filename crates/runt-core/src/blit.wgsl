@@ -53,6 +53,11 @@ struct Frame {
     // x: cloud cover, 0 = no cloud pass. y: sun-disk size as 1 − cos θ, 0 = no
     // disk. zw: reserved.
     sky_params: vec4<f32>,
+    // World → the key light's clip space (the shadow map's matrix). A copy
+    // pass reads no light; restated for the one-buffer reason above.
+    light_view_proj: mat4x4<f32>,
+    // x: shadow map bound. y: constant bias. z: slope bias. w: reserved.
+    shadow_params: vec4<f32>,
 };
 
 // The frame block keeps its number here for the reason it keeps it everywhere

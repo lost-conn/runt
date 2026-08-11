@@ -14,7 +14,7 @@
 use runt_core::{FrameUniform, MaterialVariant, Renderer};
 
 /// The fields, in order, as `FrameUniform` declares them.
-const FIELDS: [&str; 11] = [
+const FIELDS: [&str; 13] = [
     "view_proj",
     "inv_view_proj",
     "light_dir",
@@ -26,15 +26,17 @@ const FIELDS: [&str; 11] = [
     "time",
     "viewport",
     "sky_params",
+    "light_view_proj",
+    "shadow_params",
 ];
 
 #[test]
 fn the_block_is_std140_shaped() {
-    // Two mat4x4 (64 B each) and nine vec4 (16 B each). Nothing needs padding
+    // Three mat4x4 (64 B each) and ten vec4 (16 B each). Nothing needs padding
     // because nothing in it is smaller than a vec4 — which is the whole reason
     // the light direction is a `vec4` with a wasted `w` rather than a `vec3`.
-    assert_eq!(std::mem::size_of::<FrameUniform>(), 2 * 64 + 9 * 16);
-    assert_eq!(std::mem::size_of::<FrameUniform>(), 272);
+    assert_eq!(std::mem::size_of::<FrameUniform>(), 3 * 64 + 10 * 16);
+    assert_eq!(std::mem::size_of::<FrameUniform>(), 352);
     assert_eq!(
         std::mem::size_of::<FrameUniform>() % 16,
         0,
@@ -55,17 +57,24 @@ fn the_block_is_std140_shaped() {
         std::mem::offset_of!(FrameUniform, time),
         std::mem::offset_of!(FrameUniform, viewport),
         std::mem::offset_of!(FrameUniform, sky_params),
+        std::mem::offset_of!(FrameUniform, light_view_proj),
+        std::mem::offset_of!(FrameUniform, shadow_params),
     ];
-    assert_eq!(offsets, [0, 64, 128, 144, 160, 176, 192, 208, 224, 240, 256]);
+    assert_eq!(
+        offsets,
+        [0, 64, 128, 144, 160, 176, 192, 208, 224, 240, 256, 272, 336]
+    );
     for (field, offset) in FIELDS.iter().zip(offsets) {
         assert_eq!(offset % 16, 0, "{field} is not 16-byte aligned");
     }
 
-    // D1's three new vec4s are appended, never inserted: a field that moved
-    // would re-key nothing (there is no cache on this block) but would put the
-    // sky pass and the material pass on different pages of the same buffer for
-    // exactly as long as it took someone to notice.
+    // D1's three vec4s — and the shadow map's matrix after them — are
+    // appended, never inserted: a field that moved would re-key nothing (there
+    // is no cache on this block) but would put the sky pass and the material
+    // pass on different pages of the same buffer for exactly as long as it
+    // took someone to notice.
     assert_eq!(std::mem::offset_of!(FrameUniform, horizon_color), 192);
+    assert_eq!(std::mem::offset_of!(FrameUniform, light_view_proj), 272);
 }
 
 /// The field list of a WGSL `struct Frame { … };` block, comments stripped.
@@ -93,9 +102,11 @@ fn wgsl_frame_fields(source: &str) -> Vec<String> {
 fn all_three_declarations_agree() {
     let material = wgsl_frame_fields(runt_core::material::BASE_SHADER);
     let sky = wgsl_frame_fields(runt_core::SKY_SHADER);
+    let blit = wgsl_frame_fields(runt_core::BLIT_SHADER);
 
     assert_eq!(material, FIELDS, "shader.wgsl drifted from FrameUniform");
     assert_eq!(sky, FIELDS, "sky.wgsl drifted from FrameUniform");
+    assert_eq!(blit, FIELDS, "blit.wgsl drifted from FrameUniform");
     assert_eq!(material, sky, "the two shaders drifted from each other");
 }
 

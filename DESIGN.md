@@ -196,6 +196,25 @@ port).** Both were written above as "later" and both are now the only path.
   coalescer are pure functions of (list, camera, transforms), so the command
   stream is as reproducible as it was — there is simply less of it.
 
+**The shadow map landed (2026-08-10, for the port's ground-contact cue).** The
+pass list's "(later)" slot, filled as written: one depth-only pass before the
+forward pass, rendering the opaque lit draws through a fixed-size orthographic
+box aimed along the key light and centred down the camera's central ray, its
+light-space translation snapped to whole texels so a panning camera cannot
+shimmer the edges (`shadow.rs`). The main pass samples it through a comparison
+sampler (hardware PCF — core WebGL2, §11's floor) and attenuates the **key term
+only**; the hemisphere ambient is skylight and stays whole. Receiving is a
+*variant bit* (`SHADOW`), renderer-resolved exactly as `LIVE_TEX` is §7's gate:
+with the gate closed every pipeline keeps its old key and therefore its old
+bytes — which is not a nicety but a scar, because a runtime uniform branch
+around the key term moved lit pixels by an LSB with shadows *off*. The gate is
+§11's row (`ShadowQuality`: off / 512² / 2048², resource-flipped, default
+**off**), the tuning is a reflected `ShadowSettings` resource (box extent,
+constant + slope bias), and `render_to_texture` skips the pass outright — a
+viewport card is lit pre-shadow rather than paying a per-target map. Off costs
+nothing: no texture, no pipeline, no pass, byte-identical frames
+(`tests/shadows.rs`).
+
 **Render-to-texture: a second camera, a second world (2026-08-06, for the
 port's tutorial cards).** "Exactly one camera per `render()` call" is still
 true; there is now a second call.

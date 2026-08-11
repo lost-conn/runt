@@ -37,8 +37,24 @@ struct Frame {
     // by nothing here — restated because the block is one buffer with one
     // layout and all three files move together or it is silently misaligned.
     sky_params: vec4<f32>,
+    // World → the key light's clip space, for the shadow-map lookup. Identity
+    // while shadows are off, and never read then: shadow_params.x gates it.
+    light_view_proj: mat4x4<f32>,
+    // x: 1.0 while a shadow map is bound, 0.0 otherwise. y: constant depth
+    // bias. z: slope-scaled depth bias. w: reserved.
+    shadow_params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> frame: Frame;
+
+// The key light's shadow map, riding in the frame group (bindings 1–2; group 1
+// stays the documented hole below). Bound for every variant — the 1×1 dummy
+// while shadows are off — and sampled only on the lit path, only while
+// `shadow_params.x` says a real map is there. The sampler is a *comparison*
+// sampler: one tap answers "is this fragment nearer the light than what the
+// map saw?", averaged 2×2 by the hardware (PCF) because the sampler filters
+// linearly. Both halves are core WebGL2 (DESIGN §11).
+@group(0) @binding(1) var t_shadow: texture_depth_2d;
+@group(0) @binding(2) var s_shadow: sampler_comparison;
 
 // Per-entity data arrives as **vertex attributes** on buffer slot 1, stepped
 // per instance (DESIGN §5's first sanctioned optimization; `runt_core::
@@ -490,6 +506,41 @@ fn phase_distance(frag_pos: vec2<f32>) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// The key light's shadow (DESIGN §5, §11; `src/shadow.rs`)
+// ---------------------------------------------------------------------------
+//
+// How lit by the key light this fragment is: 1 in the open, 0 hard in shadow,
+// fractional on the PCF-softened edge. The term scales the **key term only**
+// — hemisphere ambient is skylight, not sunlight, and leaving it untouched is
+// what keeps a shadowed floor a dimmer version of itself (the two-colour
+// ambient still separating its silhouettes) rather than a black hole.
+//
+// `textureSampleCompareLevel`, not `textureSampleCompare`: the map has one mip
+// so the level is a formality, and the Level form carries no implicit-derivative
+// uniformity requirement — this runs after the phase circle's discard, which is
+// exactly the control flow the implicit form is not allowed in.
+fn shadow_factor(world_pos: vec3<f32>, n: vec3<f32>) -> f32 {
+    let pos = frame.light_view_proj * vec4<f32>(world_pos, 1.0);
+    // Orthographic, so w is 1 and this is not a divide in disguise.
+    let ndc = pos.xyz;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    // Outside the light's box — beyond the map's edge or its depth range — is
+    // *lit*, not shadowed: the box tracks the camera, so the world past its
+    // rim must fade to daylight rather than to a wall of shadow.
+    if (ndc.z <= 0.0 || ndc.z >= 1.0
+        || uv.x <= 0.0 || uv.x >= 1.0
+        || uv.y <= 0.0 || uv.y >= 1.0) {
+        return 1.0;
+    }
+    // Constant + slope bias, in light-depth units (see `ShadowSettings` for
+    // the acne/peter-panning trade). Applied to the reference depth rather
+    // than baked into the map, so the knobs work without a pipeline rebuild.
+    let ndotl = max(dot(n, normalize(frame.light_dir.xyz)), 0.0);
+    let bias = frame.shadow_params.y + frame.shadow_params.z * (1.0 - ndotl);
+    return textureSampleCompareLevel(t_shadow, s_shadow, uv, ndc.z - bias);
+}
+
+// ---------------------------------------------------------------------------
 // The rim term (`F_FRESNEL`)
 // ---------------------------------------------------------------------------
 //
@@ -667,8 +718,31 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         // Y. Cheap, and it separates silhouettes far better than a constant
         // term.
         let hemi = mix(frame.ground_color.rgb, frame.sky_color.rgb, 0.5 + 0.5 * n.y);
-        let key = frame.light_color.rgb * max(dot(n, normalize(frame.light_dir.xyz)), 0.0);
-        color = (hemi + key) * albedo;
+        // The shadow attenuates the key light alone; `hemi` stays whole (see
+        // `shadow_factor`), so a shadowed floor keeps the two-colour ambient.
+        //
+        // Behind `F_SHADOW` — a **const**, not the runtime uniform, and that
+        // is a scar rather than a style: a live `if` around the key term
+        // perturbed the driver's instruction scheduling enough to move a few
+        // lit pixels by one LSB with shadows *off*, which is a moved golden
+        // hash. A const branch folds away entirely, so every pre-shadow
+        // variant compiles to the pre-shadow instructions — same key, same
+        // cached pipeline, same bytes (`MaterialVariant::SHADOW`). The
+        // runtime check stays inside the folded arm as insurance against a
+        // shadowed pipeline ever meeting a shadowless frame block.
+        if (F_SHADOW) {
+            var shade = 1.0;
+            if (frame.shadow_params.x > 0.5) {
+                shade = shadow_factor(in.world_pos, n);
+            }
+            let key = frame.light_color.rgb
+                * max(dot(n, normalize(frame.light_dir.xyz)), 0.0)
+                * shade;
+            color = (hemi + key) * albedo;
+        } else {
+            let key = frame.light_color.rgb * max(dot(n, normalize(frame.light_dir.xyz)), 0.0);
+            color = (hemi + key) * albedo;
+        }
     }
 
     if (F_PHASE_CIRCLE) {
