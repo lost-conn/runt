@@ -65,7 +65,7 @@ use runt_mesh::Quality;
 use serde::{Deserialize, Serialize};
 
 use crate::noise::{
-    self, CellReturn, FbmAccum, Fractal, Lattice, OCTAVE_LOD_OFF,
+    self, CellReturn, FbmAccum, Fractal, Lattice, NoiseKind, OCTAVE_LOD_OFF,
 };
 
 // ---------------------------------------------------------------------------
@@ -150,9 +150,27 @@ pub const LIVE_LOD_CELL_PIXELS: f32 = 2.0;
 
 /// Which noise the texture is made of.
 ///
-/// An enum with one variant today, on purpose: it is the seam where value /
-/// Perlin / simplex land if a material ever wants them, and having it now keeps
-/// the serialized form (and therefore every cached bake) stable when they do.
+/// The seam where value / Perlin / simplex land if a material ever wants them.
+/// Two variants today, and the second is worth an explanation because it looks
+/// like a special case of the first.
+///
+/// # Why `Grid` is a variant and not `Cellular { jitter: 0.0 }`
+///
+/// It *is* that field — [`noise::grid`]'s docs work the algebra and
+/// `the_grid_is_jitter_free_cellular` measures it — but the spelling decides
+/// what the shader does. Written as a cellular spec, a jitter-free lattice
+/// still pays for a 27-cell search and 27 hashes to rediscover a number two
+/// lines of arithmetic already know. Written as its own kind, the fragment
+/// shader takes a branch and skips the loop, which is what makes it cheap
+/// enough for §7's **live** path on a moving object.
+///
+/// The second reason is that it is parameterised by *nothing*. `lattice`,
+/// `return_type` and `jitter` are all meaningless to it — a grid has one
+/// lattice, one return and no jitter by definition — and a variant that
+/// carried three fields it ignores would advertise combinations (FCC, a grid
+/// with `CellValue`) that the closed form does not cover.
+///
+/// [`noise::grid`]: crate::noise::grid
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "reflect", derive(bevy_reflect::Reflect))]
 pub enum NoiseSpec {
@@ -162,10 +180,59 @@ pub enum NoiseSpec {
         #[serde(default)]
         return_type: CellReturn,
         /// `0` locks feature points to cell centres (a regular grid); `1` lets
-        /// them anywhere in the cell. Every authored material uses `1`.
+        /// them anywhere in the cell. Every authored material uses `1` — a
+        /// material that wants `0` wants [`Grid`](NoiseSpec::Grid) instead.
         #[serde(default = "one")]
         jitter: f32,
     },
+    /// The jitter-free cubic lattice in closed form: round cells on a regular
+    /// grid, no hash, no search. See [`noise::grid`](crate::noise::grid).
+    Grid,
+    /// [`Grid`](NoiseSpec::Grid) in **cylindrical** coordinates about `+Y`:
+    /// wedges around and bands up — the two axes a UV-mapped texture has, and
+    /// the shape it makes on a sphere. See
+    /// [`noise::radial_grid`](crate::noise::radial_grid).
+    ///
+    /// # It is about an axis, so it is only meaningful in object space
+    ///
+    /// The axis is the `+Y` through the **sample space's origin**. Under
+    /// `MaterialVariant::LOCAL_SPACE` that is the entity's own axis, which is
+    /// what this is for; in the world basis it is the world origin, and a
+    /// surface anywhere else gets a slice of somebody else's wedges.
+    ///
+    /// [`TextureSpec::seed_offset`] therefore means something different here
+    /// than elsewhere, and [`TextureSpec::seed_displacement`] is what makes it
+    /// safe: the seed slides the bands **along** the axis and never moves it.
+    /// Left unfiltered it displaces the origin by hundreds of units even at
+    /// `seed_offset: 0.0`, which does not decorrelate this field — it deletes
+    /// it. [`NoiseKind::has_axis`](crate::noise::NoiseKind::has_axis) tells that
+    /// story in full.
+    ///
+    /// # It does not tile
+    ///
+    /// The angular coordinate wraps by construction and `y` is periodic, but
+    /// neither is a *translation*: a tile is a plane, and this field is not
+    /// translation-invariant in `x` or `z`. Worse, a bake's plane is
+    /// `z = 0` — so `atan2(0, x)` is constant across it and a baked tile of this
+    /// kind is **bands only**, with the wedges collapsed out entirely.
+    ///
+    /// A material wanting this should therefore ask for the **live** path
+    /// (`MaterialVariant::LIVE_TEX`). The baked path is left defined rather than
+    /// forbidden because it is what a live/baked A/B toggle shows, and a mode
+    /// that refused to render would be worse than one that renders honestly
+    /// badly — but the two modes are *not* the same picture here, which is the
+    /// one place in §7 where that is true and is why it is said this loudly.
+    RadialGrid {
+        /// Wedges around one full turn at octave 0. Rounded to a whole number
+        /// per octave — a fractional count puts a seam down the `+X` half-plane,
+        /// which [`noise::radial_grid`](crate::noise::radial_grid) explains.
+        #[serde(default = "four_sectors")]
+        sectors: u32,
+    },
+}
+
+fn four_sectors() -> u32 {
+    4
 }
 
 impl Default for NoiseSpec {
@@ -179,21 +246,48 @@ impl Default for NoiseSpec {
 }
 
 impl NoiseSpec {
+    pub fn kind(self) -> NoiseKind {
+        match self {
+            NoiseSpec::Cellular { .. } => NoiseKind::Cellular,
+            NoiseSpec::Grid => NoiseKind::Grid,
+            NoiseSpec::RadialGrid { .. } => NoiseKind::RadialGrid,
+        }
+    }
+
+    /// The lattice the field sits on. `Grid` answers [`Lattice::Cubic`] because
+    /// it *is* the cubic lattice — which is not cosmetic: it is what
+    /// `TextureSpec::quantize_span` reads to decide that a grid tile rounds to
+    /// a whole number of cells rather than an even one.
     pub fn lattice(self) -> Lattice {
         match self {
             NoiseSpec::Cellular { lattice, .. } => lattice,
+            NoiseSpec::Grid | NoiseSpec::RadialGrid { .. } => Lattice::Cubic,
         }
     }
 
+    /// Ignored by `Grid`, whose return is `1 − d1²/d2²` and nothing else.
     pub fn return_type(self) -> CellReturn {
         match self {
             NoiseSpec::Cellular { return_type, .. } => return_type,
+            NoiseSpec::Grid | NoiseSpec::RadialGrid { .. } => CellReturn::default(),
         }
     }
 
+    /// `Grid` answers `0` — the value that *defines* it, and the one a panel
+    /// reading this field should show.
     pub fn jitter(self) -> f32 {
         match self {
             NoiseSpec::Cellular { jitter, .. } => jitter,
+            NoiseSpec::Grid | NoiseSpec::RadialGrid { .. } => 0.0,
+        }
+    }
+
+    /// Wedges around one turn at octave 0. `0` for every kind that has no axis
+    /// — the value the shader is handed and ignores.
+    pub fn sectors(self) -> f32 {
+        match self {
+            NoiseSpec::RadialGrid { sectors } => sectors as f32,
+            NoiseSpec::Cellular { .. } | NoiseSpec::Grid => 0.0,
         }
     }
 }
@@ -276,7 +370,11 @@ pub struct TextureSpec {
     pub gain: f32,
     #[serde(default)]
     pub fractal: Fractal,
-    /// [`Fractal::Ridged`] only: how hard a ridge suppresses the octave above.
+    /// How hard a ridge suppresses the octave above it. Read by both ridges and
+    /// ignored by [`Fractal::Fbm`] — and it means a **different thing** to each
+    /// of the two, so it does not survive a change of `fractal`: a replacing
+    /// gain to [`Fractal::Ridged`], a lerp factor to [`Fractal::RidgedFnl`].
+    /// Those variants' own docs work the difference out.
     #[serde(default = "half")]
     pub weighted_strength: f32,
     /// `(n − 0.5) · contrast + 0.5`, clamped.
@@ -623,7 +721,7 @@ impl TextureSpec {
     /// The result is centred on zero rather than left in `[0, span_0)`, which
     /// keeps the magnitudes smallest and the agreement window widest.
     pub fn live_seed_offset(&self) -> Vec3 {
-        let offset = noise::seed_offset_3d(self.seed_offset);
+        let offset = self.seed_displacement();
         let span = self.octave_plan().first().map(|o| o.span).unwrap_or(1.0);
         let fold = |v: f32| {
             let r = v.rem_euclid(span);
@@ -634,6 +732,30 @@ impl TextureSpec {
             }
         };
         Vec3::new(fold(offset.x), fold(offset.y), offset.z)
+    }
+
+    /// The seed displacement this spec's noise may actually be given.
+    ///
+    /// [`seed_offset_3d`](crate::noise::seed_offset_3d) for every kind that is
+    /// translation-invariant, and **axis-only** for a kind that is not — see
+    /// [`NoiseKind::has_axis`], which carries the argument and the bug that
+    /// prompted it. For [`NoiseSpec::RadialGrid`] that means the seed slides the
+    /// bands along `Y` and leaves the wedges' centre where the object is.
+    ///
+    /// Every place the offset enters — the bake uniform, [`sample_at`], and
+    /// [`live_seed_offset`] — goes through here, so a kind cannot pick up a
+    /// displacement on one path and not another.
+    ///
+    /// [`sample_at`]: TextureSpec::sample_at
+    /// [`live_seed_offset`]: TextureSpec::live_seed_offset
+    /// [`NoiseKind::has_axis`]: crate::noise::NoiseKind::has_axis
+    pub fn seed_displacement(&self) -> Vec3 {
+        let offset = noise::seed_offset_3d(self.seed_offset);
+        if self.noise.kind().has_axis() {
+            Vec3::new(0.0, offset.y, 0.0)
+        } else {
+            offset
+        }
     }
 
     /// The tile-space window over which the live field and the baked tile are
@@ -750,12 +872,14 @@ impl TextureSpec {
     /// two are held together by `tests/noise_bake.rs`.
     pub fn sample_at(&self, uv: Vec2) -> (f32, f32, f32) {
         let plan = self.octave_plan();
-        let offset = noise::seed_offset_3d(self.seed_offset);
+        let offset = self.seed_displacement();
         let normal = self.normal.unwrap_or_default();
         let has_normal = self.normal.is_some();
+        let kind = self.noise.kind();
         let lattice = self.noise.lattice();
         let ret = self.noise.return_type();
         let jitter = self.noise.jitter();
+        let sectors = self.noise.sectors();
 
         // The step the normal differentiates over, in *base* sample-space units
         // — resolution-independent by design (see NORMAL_REFERENCE_TEXELS).
@@ -772,7 +896,7 @@ impl TextureSpec {
                 offset.z * octave.freq,
             );
             let period = Vec3::new(octave.span, octave.span, 0.0);
-            let cell = noise::cellular(p, lattice, ret, jitter, period);
+            let cell = noise::field(p, kind, lattice, ret, jitter, sectors * octave.freq, period);
 
             accum.push(
                 cell.value,
@@ -861,13 +985,23 @@ impl TextureSpec {
     /// a different field would still look fine on its own.
     pub fn live_value_at(&self, world: Vec3) -> f32 {
         let q = world * self.live_cells_per_metre() + self.live_seed_offset();
+        let kind = self.noise.kind();
         let lattice = self.noise.lattice();
         let ret = self.noise.return_type();
         let jitter = self.noise.jitter();
+        let sectors = self.noise.sectors();
 
         let mut accum = FbmAccum::new();
         for octave in &self.octave_plan() {
-            let cell = noise::cellular(q * octave.freq, lattice, ret, jitter, Vec3::ZERO);
+            let cell = noise::field(
+                q * octave.freq,
+                kind,
+                lattice,
+                ret,
+                jitter,
+                sectors * octave.freq,
+                Vec3::ZERO,
+            );
             accum.push(
                 cell.value,
                 octave.amplitude,
@@ -1603,7 +1737,7 @@ mod tests {
         assert_eq!(plan.len(), 1, "the claim wants exactly one feature point in play");
         let span = plan[0].span;
         assert_eq!(plan[0].freq, 1.0, "octave 0 is always its own reference frequency");
-        let offset = noise::seed_offset_3d(spec.seed_offset);
+        let offset = spec.seed_displacement();
         let lattice = spec.noise.lattice();
         let ret = spec.noise.return_type();
         let jitter = spec.noise.jitter();

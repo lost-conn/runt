@@ -124,3 +124,62 @@ pub fn ridged() -> TextureSpec {
         ..fine()
     }
 }
+
+/// The [`NoiseSpec::Grid`] fixture: a jitter-free cubic lattice under
+/// [`Fractal::RidgedFnl`] — the second branch of `noise_field` **and** the
+/// second branch of `fbm_push`, on both sides.
+///
+/// The parameters are `3dimenshift`'s player material (`player.tscn:91-101`,
+/// `FastNoiseLite_lgqa7`): three ridged octaves at lacunarity 2.49, gain 0.255,
+/// weighted strength 0.22, and its greyscale ramp verbatim. A fixture nobody
+/// ships is a fixture nobody notices drifting, so this is the authored chain
+/// the variant exists for rather than an invented one.
+///
+/// `frequency / world_scale` is `2.24 / 0.28 = 8` cells across a 3.57 m tile.
+/// Cubic quantization rounds to a whole number rather than an even one (evenness
+/// is the FCC lattice's parity rule), so 8 is exact.
+///
+/// It carries **no** [`NormalSpec`]. The closed form fills `f1`/`f2` and the
+/// boundary accumulation runs on it unchanged — but the surface this stands for
+/// is a ball whose relief is its silhouette, and a fixture that switched on a
+/// channel nothing ships would be pinning a path nobody looks at.
+pub fn grid() -> TextureSpec {
+    TextureSpec {
+        noise: NoiseSpec::Grid,
+        frequency: 2.24,
+        octaves: 3,
+        lacunarity: 2.49,
+        gain: 0.255,
+        fractal: Fractal::RidgedFnl,
+        weighted_strength: 0.22,
+        ramp: vec![
+            (0.0, Vec3::splat(0.400_697_44)),
+            (0.559_322_06, Vec3::splat(0.258_325_22)),
+            (0.946_327_7, Vec3::splat(0.099_985_994)),
+        ],
+        normal: None,
+        world_scale: 0.28,
+        triplanar_sharpness: 4.0,
+        base_resolution: 1024,
+        ..TextureSpec::default()
+    }
+}
+
+/// The [`NoiseSpec::RadialGrid`] fixture: the same closed form in cylindrical
+/// coordinates about `+Y`.
+///
+/// [`grid`]'s chain with the noise swapped, so a comparison between the two
+/// isolates the warp. Four wedges around, which is what `3dimenshift`'s player
+/// material's UV wrap comes to.
+///
+/// **It does not tile**, and no test here asks it to. A bake's plane is `z = 0`,
+/// where `atan2(0, x)` is constant, so a baked tile of this kind is bands with
+/// the wedges collapsed out — see [`NoiseSpec::RadialGrid`]. The angular warp is
+/// held against the twin by `live_texture.rs`'s *horizontal* rig instead, which
+/// is the only one that sweeps `θ` at all.
+pub fn radial_grid() -> TextureSpec {
+    TextureSpec {
+        noise: NoiseSpec::RadialGrid { sectors: 4 },
+        ..grid()
+    }
+}

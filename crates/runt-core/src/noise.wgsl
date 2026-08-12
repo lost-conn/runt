@@ -24,6 +24,11 @@
 // 0.0973, 31.32, 33.33) and the asymmetric `p3.yxx` in `hash33` are load-bearing
 // and match the 3dimenshift originals byte for byte.
 
+// Noise-kind codes, mirroring `runt_core::noise::NoiseKind::code`.
+const KIND_CELLULAR: u32 = 0u;
+const KIND_GRID: u32 = 1u;
+const KIND_RADIAL_GRID: u32 = 2u;
+
 // Lattice codes, mirroring `runt_core::noise::Lattice`.
 const LATTICE_CUBIC: u32 = 0u;
 const LATTICE_FCC: u32 = 1u;
@@ -38,6 +43,7 @@ const RET_CELL_VALUE: u32 = 4u;
 // Fractal codes, mirroring `runt_core::noise::Fractal::code`.
 const FRACTAL_FBM: u32 = 1u;
 const FRACTAL_RIDGED: u32 = 2u;
+const FRACTAL_RIDGED_FNL: u32 = 3u;
 
 // Normal modes, mirroring `runt_core::texture::NormalMode::code`.
 const NORMAL_NONE: u32 = 0u;
@@ -284,6 +290,118 @@ fn cellular(p: vec3<f32>, lattice: u32, ret: u32, jitter: f32, period: vec3<f32>
 }
 
 // ---------------------------------------------------------------------------
+// The jitter-free grid
+// ---------------------------------------------------------------------------
+
+// The cubic lattice with jitter 0, in closed form: no hash, no 27-cell loop.
+//
+// Not a lookalike for `cellular` — the same field. Lock every feature point to
+// its cell centre and the search is computing algebra: the nearest point *is*
+// the centre, and the second-nearest is one unit step along whichever axis the
+// sample has drifted furthest down (a second axis costs a whole unit and buys
+// back less). `runt_core::noise::grid` is the CPU twin and carries the full
+// argument; `tests/noise_cpu.rs` holds the two together.
+//
+// `value` is `1 - d1²/d2²`: 1 at a cell centre, 0 on the boundary. Positive on
+// purpose — FastNoiseLite's own `RETURN_DISTANCE2_DIV` is `ratio - 1` and would
+// clamp to black under FBM, while under RIDGED (`1 - |n|`, which is `ratio`
+// either way) the two are identical.
+//
+// No `period` argument: with no hash there is nothing to wrap, and the field is
+// already exactly 1-periodic, so any whole-cell tile is seamless for free.
+fn noise_grid(p: vec3<f32>) -> CellSample {
+    // `cell + 0.5`, matching `cellular`'s cubic branch — the two fields sit on
+    // the same lattice rather than half a cell apart.
+    let centre = floor(p) + vec3<f32>(0.5);
+    let q = p - centre;
+    let a = abs(q);
+    let m = max(max(a.x, a.y), a.z);
+
+    let d1_sq = dot(q, q);
+    // `d1² >= m²` and `m <= 0.5`, so this is at least `(1 - m)² >= 0.25`: it
+    // cannot reach zero and needs no epsilon.
+    let d2_sq = d1_sq + 1.0 - 2.0 * m;
+
+    // The dominant axis, stepped towards the sample. `sign(0) == 0` in WGSL
+    // would leave `f2` sitting on top of `f1`, so a zero picks +1 — the same
+    // tie-break `fcc_round` makes.
+    var axis = vec3<f32>(0.0, 0.0, 1.0);
+    if (a.x >= a.y && a.x >= a.z) {
+        axis = vec3<f32>(1.0, 0.0, 0.0);
+    } else if (a.y >= a.z) {
+        axis = vec3<f32>(0.0, 1.0, 0.0);
+    }
+    var s = sign(dot(q, axis));
+    if (s == 0.0) { s = 1.0; }
+
+    var out: CellSample;
+    out.value = 1.0 - d1_sq / d2_sq;
+    out.f1 = centre;
+    out.f2 = centre + axis * s;
+    out.d1 = sqrt(d1_sq);
+    out.d2 = sqrt(d2_sq);
+    return out;
+}
+
+// The same grid in cylindrical coordinates about +Y: wedges around, bands up,
+// rings out — the shape a UV-mapped texture makes on a sphere, which is what a
+// ball wants and what an axis-aligned box lattice does not give it.
+//
+//   theta = atan2(p.z, p.x)/tau + 0.5    the turn, in [0,1)
+//   u     = theta * sectors              wedges, a whole number of them
+//   v     = p.y                          bands
+//   w     = length(p.xz)                 rings
+//
+// `sectors` arrives already multiplied by the octave's frequency (theta is
+// invariant under a uniform scale of p, so the angular density cannot come from
+// the scale the way v and w do) and is rounded *here*, with floor(x + 0.5)
+// rather than `round`: WGSL rounds half to even and Rust rounds half away from
+// zero, and a sector count that disagreed would be a different field per side.
+// A whole count is what makes theta = 1 wrap onto theta = 0 with no seam.
+//
+// The Y axis is a singularity where every wedge meets — exactly what a UV
+// sphere does at its poles. `runt_core::noise::radial_grid` is the CPU twin and
+// carries the full argument, including why f1/f2 are mapped back out of the
+// warp and d1/d2 are not.
+fn noise_radial_grid(p: vec3<f32>, sectors: f32) -> CellSample {
+    let s = max(floor(sectors + 0.5), 1.0);
+    let turn = atan2(p.z, p.x) / 6.283185307179586 + 0.5;
+    let radius = length(p.xz);
+
+    var cell = noise_grid(vec3<f32>(turn * s, p.y, 0.5));
+
+    // Back to the caller's basis, on the sample's own cylinder, so the boundary
+    // normal points somewhere real.
+    let a1 = (cell.f1.x / s) * 6.283185307179586;
+    let a2 = (cell.f2.x / s) * 6.283185307179586;
+    cell.f1 = vec3<f32>(radius * cos(a1), cell.f1.y, radius * sin(a1));
+    cell.f2 = vec3<f32>(radius * cos(a2), cell.f2.y, radius * sin(a2));
+    return cell;
+}
+
+// One noise evaluation, whichever kind the spec asked for — the single seam
+// both `bake.wgsl` and `shader.wgsl`'s live path go through, and the twin of
+// `runt_core::noise::field`. `lattice`/`ret`/`jitter`/`period` are `cellular`'s
+// arguments and mean nothing to `KIND_GRID`, which has no parameters at all.
+fn noise_field(
+    p: vec3<f32>,
+    kind: u32,
+    lattice: u32,
+    ret: u32,
+    jitter: f32,
+    sectors: f32,
+    period: vec3<f32>,
+) -> CellSample {
+    if (kind == KIND_GRID) {
+        return noise_grid(p);
+    }
+    if (kind == KIND_RADIAL_GRID) {
+        return noise_radial_grid(p, sectors);
+    }
+    return cellular(p, lattice, ret, jitter, period);
+}
+
+// ---------------------------------------------------------------------------
 // Fractal layering
 // ---------------------------------------------------------------------------
 
@@ -333,10 +451,31 @@ fn fbm_push(
         n = n * n;
         n = n * a.weight;
         a.weight = clamp(n * weighted_strength, 0.0, 1.0);
+    } else if (fractal == FRACTAL_RIDGED_FNL) {
+        // FastNoiseLite's own ridge. `(1 - 2|n|)` is its fold; the `+1, *0.5` is
+        // `NoiseTexture2D`'s remap to [0,1], done per octave so it shares
+        // `fbm_finish`'s denominator and cancels — see
+        // `runt_core::noise::Fractal::RidgedFnl`, which argues why that is not
+        // the same as doing it once at the end.
+        let m = abs(n);
+        n = ((1.0 - 2.0 * m) * a.weight + 1.0) * 0.5;
+        // `lerp(1, 1 - m, weighted_strength)`. The clamp is the one guard FNL
+        // lacks; it cannot bite on a generator whose range is [-1, 1].
+        a.weight = clamp(a.weight * (1.0 - weighted_strength * m), 0.0, 1.0);
     }
     a.sum = a.sum + n * amplitude * w;
     a.max_amplitude = a.max_amplitude + amplitude * w;
     return a;
+}
+
+// Whether an octave feeds the *next* one's amplitude, and so whether a
+// faded-out octave may be skipped. The twin of
+// `runt_core::noise::Fractal::feeds_forward`, and the reason `shader.wgsl` asks
+// rather than testing one variant: skipping a ridge drops the suppression it
+// owes the octaves above it, which is a different field, and there are two
+// ridges to forget.
+fn fractal_feeds_forward(fractal: u32) -> bool {
+    return fractal == FRACTAL_RIDGED || fractal == FRACTAL_RIDGED_FNL;
 }
 
 fn fbm_finish(a: FbmAccum) -> f32 {

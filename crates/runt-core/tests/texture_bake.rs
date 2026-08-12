@@ -138,6 +138,142 @@ fn the_bake_matches_the_cpu_twin() {
     );
 }
 
+/// The same claim for `NoiseSpec::Grid` — the closed form, which is a second
+/// implementation on each side and therefore a second chance to disagree.
+///
+/// Tighter than the cellular budget above, and it should be: the whole field is
+/// a `floor`, a dot product and a divide, with no hash to lose a bit in, no
+/// tie-breaking `fcc_round`, and — because it is continuous everywhere, unlike
+/// `CellValue` — no step function for a float divergence to fall off. If this
+/// is not near-exact, the two sides are not running the same arithmetic.
+#[test]
+fn the_grid_bake_matches_the_cpu_twin() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    const N: u32 = 256;
+    let spec = TextureSpec {
+        base_resolution: N,
+        ..common::grid()
+    };
+    let (albedo, _) = bake(&mut renderer, &spec, N);
+    let errors = albedo_divergence(&spec, &albedo, N, 4000);
+    let (_, p99, max) = report("WGSL vs CPU, grid (3 ridged octaves)", &errors);
+
+    assert!(
+        p99 <= 2.0 / 255.0,
+        "p99 was {p99} ({:.1} LSB); the grid has no hash and no step to hide in",
+        p99 * 255.0
+    );
+    assert!(max <= 3.0 / 255.0, "max was {max} ({:.1} LSB)", max * 255.0);
+}
+
+/// The same again for `NoiseSpec::RadialGrid`, with a stated limit on what it
+/// can show.
+///
+/// A bake's sample plane is `z = 0`, and `atan2(0, x)` is constant there — so
+/// this exercises the kind's *dispatch* and its band axis and **not** its
+/// angular warp, which collapses out of any baked tile. The warp is held against
+/// the twin by `live_texture.rs`'s horizontal rig, which exists for exactly that
+/// reason. Kept anyway, because the dispatch and the uniform's `sectors` slot
+/// are worth a bake-path test of their own.
+#[test]
+fn the_radial_grid_bake_matches_the_cpu_twin() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    const N: u32 = 256;
+    let spec = TextureSpec {
+        base_resolution: N,
+        ..common::radial_grid()
+    };
+    let (albedo, _) = bake(&mut renderer, &spec, N);
+    let errors = albedo_divergence(&spec, &albedo, N, 4000);
+    let (_, p99, max) = report("WGSL vs CPU, radial grid", &errors);
+
+    assert!(
+        p99 <= 3.0 / 255.0,
+        "p99 was {p99} ({:.1} LSB); the warp is not the same warp",
+        p99 * 255.0
+    );
+    // The axis is a singularity — every wedge meets there and `atan2` is at its
+    // least well-conditioned — so a texel that lands on it is allowed to be off
+    // by more than a well-behaved one.
+    assert!(max <= 0.10, "max was {max}");
+}
+
+/// A grid tile wraps with no `period` and no blend, because the field is
+/// exactly 1-periodic and the span quantizes to a whole number of cells.
+///
+/// The cellular path buys its seamlessness by hashing a wrapped cell index; the
+/// grid's is bought by arithmetic alone, so it is worth measuring rather than
+/// inheriting.
+///
+/// # Stated against the tile's own gradient, not against an LSB count
+///
+/// The two edge columns are one texel apart *across* the wrap, so a seamless
+/// tile does not make them equal — it makes them differ by exactly what any two
+/// adjacent texels differ by. An absolute threshold would therefore be a claim
+/// about the material's *contrast* wearing a seam test's name, and it broke the
+/// first time the fixture's fractal changed, at 4.0 LSB, with no seam anywhere.
+///
+/// So the wrap is compared against the interior: the worst step across the seam
+/// against the 99th-percentile step between neighbours inside the tile. A real
+/// seam is a discontinuity in a field that is continuous everywhere else, and
+/// shows up as a wrap step far *outside* the interior's own distribution.
+#[test]
+fn the_grid_tile_wraps_with_no_wrap() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    const N: u32 = 256;
+    let spec = TextureSpec {
+        base_resolution: N,
+        ..common::grid()
+    };
+    assert_eq!(
+        spec.base_span(),
+        8.0,
+        "the fixture no longer holds a whole number of cells"
+    );
+    let (albedo, _) = bake(&mut renderer, &spec, N);
+
+    let step = |a: [f32; 3], b: [f32; 3]| {
+        (0..3).fold(0.0f32, |m, c| m.max((a[c] - b[c]).abs()))
+    };
+
+    let mut wrap = 0.0f32;
+    let mut interior = Vec::with_capacity((N * N) as usize * 2);
+    for i in 0..N {
+        wrap = wrap.max(step(
+            pixel(&albedo, 0, i, N),
+            pixel(&albedo, N - 1, i, N),
+        ));
+        wrap = wrap.max(step(
+            pixel(&albedo, i, 0, N),
+            pixel(&albedo, i, N - 1, N),
+        ));
+        for j in 1..N {
+            interior.push(step(pixel(&albedo, j - 1, i, N), pixel(&albedo, j, i, N)));
+            interior.push(step(pixel(&albedo, i, j - 1, N), pixel(&albedo, i, j, N)));
+        }
+    }
+    interior.sort_by(f32::total_cmp);
+    let p99 = interior[interior.len() * 99 / 100];
+    println!(
+        "wrap step {:.1} LSB, interior p99 {:.1} LSB",
+        wrap * 255.0,
+        p99 * 255.0
+    );
+    assert!(
+        wrap <= p99.max(1.0 / 255.0),
+        "the grid tile has a seam: {:.1} LSB across the wrap against an interior \
+         p99 of {:.1} LSB",
+        wrap * 255.0,
+        p99 * 255.0
+    );
+}
+
 /// The authored 5-octave stack, where the top octaves are finer than a texel.
 ///
 /// Octave 4 puts 318 cells across the tile, so adjacent texels land in

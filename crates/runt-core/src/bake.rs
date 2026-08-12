@@ -110,7 +110,11 @@ pub fn bake_shader_source() -> String {
 pub struct BakeUniform {
     /// lattice, cell return type, fractal, octave count.
     pub mode: [u32; 4],
-    /// normal mode, ramp stop count, unused, unused.
+    /// normal mode, ramp stop count, noise kind, radial sectors.
+    ///
+    /// The kind rides here rather than replacing `mode.x` because `mode.x` is
+    /// the *lattice* and stays meaningful either way — a grid is the cubic
+    /// lattice, and the span quantization on both sides reads it as such.
     pub counts: [u32; 4],
     /// jitter, contrast, brightness, ridged weighted strength.
     pub shape: [f32; 4],
@@ -129,7 +133,7 @@ impl BakeUniform {
     pub fn from_spec(spec: &TextureSpec) -> BakeUniform {
         let plan = spec.octave_plan();
         let normal = spec.normal;
-        let offset = crate::noise::seed_offset_3d(spec.seed_offset);
+        let offset = spec.seed_displacement();
 
         let mut octaves = [[0.0f32; 4]; MAX_OCTAVES];
         for (slot, o) in octaves.iter_mut().zip(&plan) {
@@ -161,8 +165,8 @@ impl BakeUniform {
             counts: [
                 normal.map(|n| n.mode.code()).unwrap_or(0),
                 stops as u32,
-                0,
-                0,
+                spec.noise.kind().code(),
+                spec.noise.sectors() as u32,
             ],
             shape: [
                 spec.noise.jitter(),

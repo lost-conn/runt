@@ -390,6 +390,8 @@ fn live_sample(q: vec3<f32>, dqx: vec3<f32>, dqy: vec3<f32>, lod: vec2<f32>) -> 
     let fractal = tex.mode.z;
     let count = tex.mode.w;
     let normal_mode = tex.counts.x;
+    let kind = tex.counts.z;
+    let sectors = f32(tex.counts.w);
 
     let jitter = tex.shape.x;
     let weighted_strength = tex.shape.w;
@@ -413,17 +415,21 @@ fn live_sample(q: vec3<f32>, dqx: vec3<f32>, dqy: vec3<f32>, lod: vec2<f32>) -> 
         // evaluated and multiplied by zero, so a distant fragment really does
         // pay for two nineteen-cell Voronoi loops instead of five. A zero
         // weight contributes nothing to either half of the fBm normalization,
-        // so skipping is arithmetically identical — except under `RIDGED`,
+        // so skipping is arithmetically identical — except under a *ridge*,
         // where every octave feeds the next one's suppression whatever its
         // weight, and there the loop runs in full.
-        if (w <= 0.0 && fractal != FRACTAL_RIDGED) {
+        //
+        // Asked as a question rather than compared against one variant: there
+        // are two ridges now, and the second was exactly the kind of thing a
+        // `!= FRACTAL_RIDGED` here would have silently left out.
+        if (w <= 0.0 && !fractal_feeds_forward(fractal)) {
             continue;
         }
 
         let p = q * freq;
         // `vec3(0.0)` is `wrap_cell`'s "do not wrap this axis" sentinel on all
         // three axes: unbounded noise, which is the whole point of live.
-        let cs = cellular(p, lattice, ret, jitter, vec3<f32>(0.0));
+        let cs = noise_field(p, kind, lattice, ret, jitter, sectors * freq, vec3<f32>(0.0));
         accum = fbm_push(accum, cs.value, amplitude, w, fractal, weighted_strength);
 
         if (normal_mode != NORMAL_NONE) {

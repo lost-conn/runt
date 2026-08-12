@@ -24,7 +24,7 @@
 struct Bake {
     // x: lattice, y: cell return type, z: fractal, w: octave count.
     mode: vec4<u32>,
-    // x: normal mode, y: ramp stop count, zw: unused.
+    // x: normal mode, y: ramp stop count, z: noise kind, w: radial sectors.
     counts: vec4<u32>,
     // x: jitter, y: contrast, z: brightness, w: ridged weighted strength.
     shape: vec4<f32>,
@@ -79,6 +79,8 @@ fn bake_sample(uv: vec2<f32>) -> BakeResult {
     let fractal = bake.mode.z;
     let count = bake.mode.w;
     let normal_mode = bake.counts.x;
+    let kind = bake.counts.z;
+    let sectors = f32(bake.counts.w);
 
     let jitter = bake.shape.x;
     let weighted_strength = bake.shape.w;
@@ -107,7 +109,7 @@ fn bake_sample(uv: vec2<f32>) -> BakeResult {
             offset.z * freq,
         );
         let period = vec3<f32>(span, span, 0.0);
-        let cs = cellular(p, lattice, ret, jitter, period);
+        let cs = noise_field(p, kind, lattice, ret, jitter, sectors * freq, period);
 
         accum = fbm_push(accum, cs.value, amplitude, w, fractal, weighted_strength);
 

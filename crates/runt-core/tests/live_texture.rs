@@ -534,6 +534,212 @@ fn live_eval_matches_the_cpu_twin_on_a_two_octave_spec() {
     assert!(max <= 0.10, "max {max}");
 }
 
+/// `NoiseSpec::RadialGrid` down the live path — the branch that actually ships,
+/// since a radial field has no tile it could be baked into seamlessly.
+///
+/// # This rig is *horizontal*, and it has to be
+///
+/// Every other test in this file draws its quad in the **XY** plane at `z = 0`,
+/// which is exactly the wrong plane for this field: `θ = atan2(p.z, p.x)` with
+/// `p.z ≡ 0` and `p.x ≥ 0` is the constant `0`, so a vertical quad samples one
+/// value of the turn and the whole angular warp — the `atan2`, the sector
+/// rounding, the wrap — goes unexercised. The first version of this test passed
+/// at half an LSB while checking none of it.
+///
+/// So the quad lies in the **XZ** plane and the camera looks down `−Y`. That
+/// sweeps `θ` through a full turn across the frame and leaves `p.y` constant,
+/// which is the complement of what the vertical rig covers.
+/// [`live_eval_matches_the_cpu_twin_on_the_grid`] still covers the band axis on
+/// the same field, so between them both axes are held against the twin.
+#[test]
+fn live_eval_matches_the_cpu_twin_on_the_radial_grid() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    let spec = common::radial_grid();
+    // Centred on the axis, so the frame contains the singularity and every
+    // sector boundary rather than a comfortable patch away from both.
+    let half = SPAN * 0.5;
+    let pixels = render_horizontal(&mut renderer, &spec, -half);
+    let errors = horizontal_divergence(&spec, &pixels, -half, 4000);
+    let (median, p99, max) = report("live WGSL vs CPU, radial grid (XZ plane)", &errors);
+
+    // The rig has to *sweep* the turn, not merely be pointed the right way — a
+    // frame of one flat value agrees with the twin perfectly and proves nothing,
+    // which is exactly how the vertical rig passed this test while checking none
+    // of it. Four wedges across a frame centred on the axis is most of the ramp.
+    let mut lo = f32::MAX;
+    let mut hi = f32::MIN;
+    for i in 0..1000u32 {
+        let v = pixel(&pixels, i.wrapping_mul(97) % SIZE, i.wrapping_mul(59) % SIZE)[0];
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    println!("  frame spans {lo:.3}..{hi:.3} of the ramp");
+    assert!(
+        hi - lo > 0.15,
+        "the frame is nearly flat ({lo:.3}..{hi:.3}); this rig is not sweeping θ \
+         and the comparison below is vacuous"
+    );
+
+    assert!(
+        median <= 1.0 / 255.0,
+        "median {median} ({:.2} LSB): live eval is not the twin's warp",
+        median * 255.0
+    );
+    assert!(p99 <= 3.0 / 255.0, "p99 {p99} ({:.2} LSB)", p99 * 255.0);
+    // Looser than the Cartesian grid's, and the reason is in the frame: the
+    // axis is a singularity where every wedge meets and `atan2` is at its least
+    // well-conditioned, and this rig deliberately points at it.
+    assert!(max <= 0.10, "max {max}");
+}
+
+/// A quad in the **XZ** plane at `y = 0.25`, seen from directly above.
+///
+/// `y` is off zero on purpose: `0` sits exactly on a band boundary of the
+/// fixture's chain, where the dominant axis is pinned and the field is at an
+/// extremum across the whole frame — a probe there measures the one height that
+/// hides the most. (That is not a hypothetical either; it is how the first
+/// reading of this field was misread.)
+fn quad_horizontal(o: f32) -> MeshData {
+    let (a, b) = (o, o + SPAN);
+    let y = 0.25;
+    MeshData {
+        positions: vec![
+            Vec3::new(a, y, a),
+            Vec3::new(a, y, b),
+            Vec3::new(b, y, b),
+            Vec3::new(b, y, a),
+        ],
+        normals: vec![Vec3::Y; 4],
+        uvs: vec![glam::Vec2::ZERO; 4],
+        colors: vec![Vec3::ONE; 4],
+        // Wound the other way round from the vertical rig's: swapping two view
+        // axes flips the handedness, so the same corner order that faces the
+        // camera there faces away here — and the opaque pipeline culls it, which
+        // renders as an empty frame rather than as anything a divergence number
+        // would explain.
+        indices: vec![0, 2, 1, 0, 3, 2],
+    }
+}
+
+/// The world point at the centre of pixel `(x, y)` on [`quad_horizontal`].
+fn world_at_horizontal(o: f32, x: u32, y: u32) -> Vec3 {
+    Vec3::new(
+        o + (x as f32 + 0.5) / SIZE as f32 * SPAN,
+        0.25,
+        o + (y as f32 + 0.5) / SIZE as f32 * SPAN,
+    )
+}
+
+/// [`render`]'s horizontal twin: same orthographic span and same flat lighting,
+/// looking down `−Y` so that screen `x`/`y` map to world `x`/`z`.
+fn render_horizontal(renderer: &mut Renderer, spec: &TextureSpec, o: f32) -> Vec<u8> {
+    let mut library = MeshLibrary::new();
+    let mesh: MeshHandle = library.insert(quad_horizontal(o));
+
+    let mut textures = TextureLibrary::new();
+    let handle = textures.insert(spec.clone(), texture::MIN_RESOLUTION);
+    renderer.bake_texture(spec, texture::MIN_RESOLUTION, &NoopCache);
+
+    let draws = [DrawItem {
+        entity: bevy_ecs::entity::Entity::from_raw_u32(0).expect("entity 0"),
+        variant: MaterialVariant::LIVE_TEX,
+        mesh,
+        model: Mat4::IDENTITY,
+        base_color: Vec4::ONE,
+        params: Vec4::ZERO,
+        texture: Some(handle),
+    }];
+
+    let target = renderer.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("live probe (horizontal)"),
+        size: wgpu::Extent3d {
+            width: SIZE,
+            height: SIZE,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    // Orthographic over x and z, then the swap that sends world `z` to screen
+    // `y`. Row 0 of the target is `z = o`, which is what `world_at_horizontal`
+    // assumes — no vertical flip, unlike the vertical rig, because looking down
+    // `−Y` already reverses the handedness once.
+    let ortho = glam::camera::rh::proj::directx::orthographic(o, o + SPAN, o, o + SPAN, -8.0, 8.0);
+    let look_down = Mat4::from_cols(
+        glam::Vec4::new(1.0, 0.0, 0.0, 0.0),
+        glam::Vec4::new(0.0, 0.0, 1.0, 0.0),
+        glam::Vec4::new(0.0, 1.0, 0.0, 0.0),
+        glam::Vec4::W,
+    );
+
+    renderer.render(
+        &view,
+        SIZE,
+        SIZE,
+        &FrameParams {
+            view_proj: ortho * look_down,
+            lighting: flat_lighting(),
+        },
+        &draws,
+        &library,
+        &textures,
+    );
+
+    read_back(renderer, &target)
+}
+
+/// [`divergence`]'s horizontal twin.
+fn horizontal_divergence(spec: &TextureSpec, pixels: &[u8], o: f32, samples: u32) -> Vec<f32> {
+    let mut errors = Vec::with_capacity(samples as usize);
+    for i in 0..samples {
+        let x = i.wrapping_mul(97) % SIZE;
+        let y = i.wrapping_mul(59).wrapping_add(i / SIZE * 31) % SIZE;
+        let want = spec.live_albedo_at(world_at_horizontal(o, x, y));
+        let got = pixel(pixels, x, y);
+        errors.push(
+            (0..3)
+                .map(|c| (got[c] - want[c]).abs())
+                .fold(0.0f32, f32::max),
+        );
+    }
+    errors.sort_by(f32::total_cmp);
+    errors
+}
+
+/// `NoiseSpec::Grid` down the live path — the branch that matters most for the
+/// variant, because the closed form exists so that a *moving* object can afford
+/// to evaluate its field per fragment instead of sampling a world-space tile.
+///
+/// The budget is the tight one and there is no outlier allowance, for the
+/// reason `texture_bake.rs`'s twin gives: the grid is continuous everywhere, so
+/// unlike `CellValue` it has no step for a float divergence to fall off, and
+/// "almost every pixel" would be a weaker claim than this path can support.
+#[test]
+fn live_eval_matches_the_cpu_twin_on_the_grid() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    let spec = common::grid();
+    let pixels = render(&mut renderer, &spec, MaterialVariant::LIVE_TEX);
+    let errors = divergence(&spec, &pixels, 4000);
+    let (median, p99, max) = report("live WGSL vs CPU, grid (3 ridged octaves)", &errors);
+    assert!(
+        median <= 1.0 / 255.0,
+        "median {median} ({:.2} LSB): live eval is not the twin's grid",
+        median * 255.0
+    );
+    assert!(p99 <= 2.0 / 255.0, "p99 {p99} ({:.2} LSB)", p99 * 255.0);
+    assert!(max <= 3.0 / 255.0, "max {max} ({:.2} LSB)", max * 255.0);
+}
+
 #[test]
 fn live_eval_matches_the_cpu_twin_for_the_coarse_fixture() {
     // The coarse fixture differs from the fine one in every way that

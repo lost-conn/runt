@@ -511,6 +511,39 @@ pub struct MaterialDesc {
     /// textureless entity's variant key is untouched by this field existing.
     #[serde(default = "yes")]
     pub normal_map: bool,
+    /// Sample the texture in the **object's** space rather than the world's
+    /// (`MaterialVariant::LOCAL_SPACE`), so the pattern belongs to the thing
+    /// wearing it and travels with it.
+    ///
+    /// Off by default, and it has to be: the world basis is what lets a surface
+    /// assembled out of many entities read as one continuous material, which is
+    /// what terrain wants and what every scene written before this field
+    /// existed already got. Like [`live_texture`](MaterialDesc::live_texture) it
+    /// is **only consulted when `texture` names one**, so a textureless
+    /// entity's variant key is untouched by this field existing.
+    ///
+    /// On is for anything that **moves**: without it a moving textured surface
+    /// drags itself through a pattern pinned to the world, and the pattern
+    /// slides across it.
+    ///
+    /// # It usually wants [`live_texture`] beside it
+    ///
+    /// The baked path is triplanar, and this bit moves only the plane
+    /// *coordinates* into object space — the plane **weights** come from the
+    /// world normal and stay there, because moving them would cost a second
+    /// interpolated `vec3` on every draw in the engine (`shader.wgsl` argues
+    /// that at its `blend`). So a baked local-space surface is exact under
+    /// translation and under any rotation that leaves `abs(n)` alone, and
+    /// cross-fades between the three projections under any other: a slow
+    /// dissolve where the world basis gave a slide.
+    ///
+    /// A live fragment has no triplanar projection at all — a 3D field is
+    /// defined everywhere — so it is exact under any rigid transform. A body
+    /// that tumbles wants both bits; a platform that only slides wants this one.
+    ///
+    /// [`live_texture`]: MaterialDesc::live_texture
+    #[serde(default)]
+    pub local_space: bool,
 }
 
 impl Default for MaterialDesc {
@@ -523,6 +556,7 @@ impl Default for MaterialDesc {
             ramp: false,
             live_texture: false,
             normal_map: true,
+            local_space: false,
         }
     }
 }
@@ -547,6 +581,10 @@ impl MaterialDesc {
             (
                 texture.is_some() && self.normal_map,
                 MaterialVariant::NORMAL_MAP,
+            ),
+            (
+                texture.is_some() && self.local_space,
+                MaterialVariant::LOCAL_SPACE,
             ),
         ] {
             if on {
