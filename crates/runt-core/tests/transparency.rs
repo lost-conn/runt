@@ -336,12 +336,17 @@ fn render_blended_frame(strength: f32) -> Option<Frame> {
     assert_eq!(handle, MeshHandle::of(&mesh));
 
     let mut world = World::new();
-    let mut place = |color: Vec4, variant: MaterialVariant, mode: f32, at: Vec3, scale: f32| {
+    // `params` is deliberately zero on every one of these. The phase mode used
+    // to arrive here as `params.x` and this closure used to take it as an
+    // argument; it is variant bits now (`MaterialVariant::PHASE_CIRCLE`), so
+    // the slot is untouched and the frame below proves the discard still works
+    // without it.
+    let mut place = |color: Vec4, variant: MaterialVariant, at: Vec3, scale: f32| {
         world.spawn((
             MeshRef(handle),
             Material {
                 base_color: color,
-                params: Vec4::new(mode, 0.0, 0.0, 0.0),
+                params: Vec4::ZERO,
                 texture: None,
                 variant: variant | UNLIT,
             },
@@ -355,11 +360,16 @@ fn render_blended_frame(strength: f32) -> Option<Frame> {
     // Everything is BILLBOARD_UNLIT so each surface is exactly its base colour
     // and the blends below are arithmetic rather than an estimate of a light
     // rig. Spawn order is deliberately not draw order.
-    place(GHOST, TRANSPARENT, 0.0, Vec3::new(-1.5, 1.2, 0.0), 2.0);
-    place(FLOOR, MaterialVariant::NONE, 0.0, Vec3::new(0.0, 0.0, -3.0), 40.0);
-    place(GLOW, ADDITIVE, 0.0, Vec3::new(-1.5, -1.2, 0.0), 2.0);
-    place(PHASED, PHASE, Material::PHASE_ONLY, PHASE_ONLY_AT, 2.0);
-    place(SOLID, PHASE, Material::PHASE_WORLD_ONLY, WORLD_ONLY_AT, 2.0);
+    place(GHOST, TRANSPARENT, Vec3::new(-1.5, 1.2, 0.0), 2.0);
+    place(FLOOR, MaterialVariant::NONE, Vec3::new(0.0, 0.0, -3.0), 40.0);
+    place(GLOW, ADDITIVE, Vec3::new(-1.5, -1.2, 0.0), 2.0);
+    place(
+        PHASED,
+        PHASE | MaterialVariant::PHASE_INVERT,
+        PHASE_ONLY_AT,
+        2.0,
+    );
+    place(SOLID, PHASE, WORLD_ONLY_AT, 2.0);
 
     let draws = build_draw_list(&mut world, 0.0);
     assert_eq!(draws.len(), 5);
@@ -491,7 +501,8 @@ fn one_of_each_new_state_over_an_opaque_floor() {
     assert_rgb(glow, GLOW.truncate() * GLOW.w + floor, "additive quad");
     assert!(glow.cmpgt(floor).all(), "additive must only ever add");
 
-    // Phase-only (params.x = 1): visible inside the circle, gone outside it.
+    // Phase-only (`PHASE_CIRCLE | PHASE_INVERT`): visible inside the circle,
+    // gone outside it.
     //
     // Inside is also where the screen effect is at full strength, so the
     // expectation is the quad's colour *through* it. That the two agree is the
@@ -512,8 +523,8 @@ fn one_of_each_new_state_over_an_opaque_floor() {
     );
     assert_rgb(frame.sample(corner), floor, "phase-only quad outside the circle");
 
-    // World-only (params.x = 0): the mirror image — solid everywhere the circle
-    // is not, and this quad is entirely outside it.
+    // World-only (`PHASE_CIRCLE` alone, no mode bit): the mirror image — solid
+    // everywhere the circle is not, and this quad is entirely outside it.
     assert!(!frame.inside_circle(WORLD_ONLY_AT, center));
     assert_rgb(
         frame.sample(WORLD_ONLY_AT),

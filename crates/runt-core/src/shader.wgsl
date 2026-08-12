@@ -644,20 +644,37 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     if (F_PHASE_CIRCLE) {
         phase_dist = phase_distance(in.clip.xy);
         let inside = frame.phase.z > PHASE_MIN_RADIUS && phase_dist < frame.phase.z;
-        // `in.params.x`: 0 world-only, 1 phase-only, 2 effect-only. Compared
-        // with slack rather than `==` because it arrives as a float in a
-        // uniform, and an authored 1.0 that survived a round trip through RON
-        // must not become mode 0.
-        let mode = in.params.x;
-        if (mode < 0.5) {
-            // World-only: the circle removes it.
-            if (inside) {
-                discard;
-            }
-        } else if (mode < 1.5) {
-            // Phase-only: it exists nowhere else.
-            if (!inside) {
-                discard;
+        // The mode is two `const bool`s off the variant key, not a number in
+        // `in.params.x`. It used to be that number, and `params.x` is
+        // `F_VERTEX_WAVE`'s amplitude — a waterfall that sways *and* phases
+        // needs both, and one float cannot be both, so the mode moved into the
+        // key where a three-state choice belongs. See
+        // `MaterialVariant::PHASE_CIRCLE`.
+        //
+        // What that buys here, beyond the slot: these branches fold. The
+        // comparisons this replaced ran per fragment against a uniform the
+        // compiler could not see through; a `const` chain leaves one of the
+        // three bodies and deletes the other two before a backend sees the
+        // module.
+        //
+        // `F_PHASE_NO_DISCARD` leads and takes the whole branch away: effect
+        // only means the surface is there on both sides and all it takes from
+        // the circle is the fringe at the bottom of this function. Testing it
+        // first is also the resolution rule for a key carrying both mode bits —
+        // "never discard" wins, rather than the pair being undefined
+        // (`MaterialVariant::PHASE_NO_DISCARD`), the same shape as
+        // live-beats-baked below.
+        if (!F_PHASE_NO_DISCARD) {
+            if (F_PHASE_INVERT) {
+                // Phase-only: it exists nowhere but inside.
+                if (!inside) {
+                    discard;
+                }
+            } else {
+                // World-only: the circle removes it.
+                if (inside) {
+                    discard;
+                }
             }
         }
     }
@@ -932,8 +949,13 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     if (F_PHASE_CIRCLE) {
         // The fringe: a band at the circle's edge, whitened by `phase.w`. It is
         // what makes the boundary read as an *event* rather than a clipping
-        // plane, and it is the only thing mode 2 (effect-only) is for. Two
-        // instructions on a fragment that already survived the discard above.
+        // plane, and it is the only thing `F_PHASE_NO_DISCARD` (effect-only) is
+        // for. Two instructions on a fragment that already survived the discard
+        // above.
+        //
+        // Deliberately outside the mode branch: the fringe belongs to the
+        // *circle*, not to the geometry's side of it, so all three modes draw
+        // it on whatever they did not throw away.
         if (frame.phase.z > PHASE_MIN_RADIUS) {
             let edge = 1.0 - smoothstep(0.0, PHASE_EDGE, abs(phase_dist - frame.phase.z));
             color = mix(color, vec3<f32>(1.0), edge * frame.phase.w);

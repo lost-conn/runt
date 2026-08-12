@@ -56,6 +56,29 @@ const LOCAL_SPACE_REACH: [MaterialVariant; 4] = [
     MaterialVariant::VERTEX_WAVE,
 ];
 
+/// The three phase modes, as keys — the same narrow-product argument
+/// [`LOCAL_SPACE_REACH`] makes, for the pair of bits that carry the mode.
+///
+/// `PHASE_INVERT` and `PHASE_NO_DISCARD` branch, so by the letter of
+/// [`SHADER_BITS`]' rule they belong in it. They stay out for its measured
+/// reason: appending two bits to a 256-key product makes it 1024, and the file's
+/// own numbers put that near forty seconds to compile modules that differ inside
+/// a branch the sweep already crosses in full.
+///
+/// Their reach really is that small. Both are read in exactly one place —
+/// `shader.wgsl`'s discard chain, inside `if (F_PHASE_CIRCLE)` — and they touch
+/// no varying, no binding and no other branch. So what has to be crossed is
+/// `PHASE_CIRCLE` (which enables them) and the looks a phase surface is actually
+/// built from in the port: [`VERTEX_WAVE`](MaterialVariant::VERTEX_WAVE), the
+/// composition the mode moved out of `params` *for*, and
+/// [`FRESNEL`](MaterialVariant::FRESNEL), which is how the ghost pass draws the
+/// complement of a discard.
+///
+/// If a future bit ever reads the mode from outside that chain, this list grows
+/// or the pair goes into `SHADER_BITS` and the sweep pays quadruple.
+const PHASE_MODE_REACH: [MaterialVariant; 2] =
+    [MaterialVariant::VERTEX_WAVE, MaterialVariant::FRESNEL];
+
 /// Every combination of the flags the WGSL can branch on — 256 of them.
 ///
 /// The sweep follows [`SHADER_BITS`] rather than `FLAGS` so that adding a
@@ -73,7 +96,9 @@ const LOCAL_SPACE_REACH: [MaterialVariant; 4] = [
 /// written and crossing them in would quadruple it again. Both are exercised
 /// end to end by `tests/transparency.rs` and by the port's own frames.
 /// `LOCAL_SPACE` is also absent, and that one *is* a decision — see
-/// [`LOCAL_SPACE_REACH`].
+/// [`LOCAL_SPACE_REACH`]. So are `PHASE_INVERT` and `PHASE_NO_DISCARD`, for the
+/// same kind of reason and with the same kind of narrow product beside it — see
+/// [`PHASE_MODE_REACH`].
 ///
 /// The sweep includes combinations the draw list will never emit
 /// (`TEXTURE | LIVE_TEX`, with and without the rest). They stay in on purpose:
@@ -110,6 +135,8 @@ fn variant_source_declares_every_flag_with_the_right_value() {
     assert!(src.contains("const F_VERTEX_WAVE: bool = false;"));
     assert!(src.contains("const F_TWO_SIDED: bool = false;"));
     assert!(src.contains("const F_LOCAL_SPACE: bool = false;"));
+    assert!(src.contains("const F_PHASE_INVERT: bool = false;"));
+    assert!(src.contains("const F_PHASE_NO_DISCARD: bool = false;"));
     assert!(src.ends_with(material::BASE_SHADER), "base source is appended verbatim");
 
     let none = material::variant_source(material::BASE_SHADER, MaterialVariant::NONE);
@@ -180,6 +207,12 @@ fn variant_keys_behave_as_bitflags() {
     assert_eq!(MaterialVariant::TWO_SIDED.bits(), 1 << 13);
     assert_eq!(MaterialVariant::SHADOW.bits(), 1 << 14);
     assert_eq!(MaterialVariant::LOCAL_SPACE.bits(), 1 << 15);
+    // The phase mode moved out of `Material::params.x` and into the key. It
+    // appends at 16/17 like every look before it — 12 and 13 (`VERTEX_WAVE`,
+    // `TWO_SIDED`) were taken, and a bit position is permanent whatever else
+    // moves.
+    assert_eq!(MaterialVariant::PHASE_INVERT.bits(), 1 << 16);
+    assert_eq!(MaterialVariant::PHASE_NO_DISCARD.bits(), 1 << 17);
 
     // The flag list and the bits agree, so no key can be generated that the
     // preprocessor would not emit a const for.
@@ -188,7 +221,7 @@ fn variant_keys_behave_as_bitflags() {
         assert!(!union.contains(flag), "duplicate flag bit {:#06b}", flag.bits());
         union |= flag;
     }
-    assert_eq!(union.bits(), 0b1111_1111_1111_1111);
+    assert_eq!(union.bits(), 0b11_1111_1111_1111_1111);
 
     // The four looks that replace the lighting term rather than feeding it.
     // Exactly one wins per fragment; the mask is what says which four they are.
@@ -207,6 +240,84 @@ fn variant_keys_behave_as_bitflags() {
     assert!(!MaterialVariant::TRANSPARENT.contains(both));
     assert!(both.contains(both));
     assert!(!MaterialVariant::DEPTH_GREATER.intersects(both));
+}
+
+/// The phase mode is a **key**, so it composes with a look that owns
+/// `Material::params` — and that composition is the reason it moved.
+///
+/// `VERTEX_WAVE` reads `params.xyz` (amplitude, frequency, speed) and the phase
+/// mode used to read `params.x` as a three-valued float. The port's waterfall is
+/// one draw that wants both: `water_flow.tscn` hangs a `Phaseable` on a surface
+/// running `fx/water.gdshader`'s vertex stage. While the mode lived in the slot
+/// the two could not coexist — world-only *is* `0.0`, so tagging the ribbon set
+/// its wave amplitude to zero and the waterfall went flat.
+///
+/// Nothing below needs a GPU: the claim is about the key and the uniform block
+/// being disjoint, which is a property of the types.
+#[test]
+fn the_phase_mode_is_a_key_and_leaves_the_params_block_alone() {
+    use glam::Vec4;
+    use runt_core::Material;
+
+    // `fx/water.gdshader:19-21`'s authored uniforms, in the slots
+    // `VERTEX_WAVE` reads them from.
+    let wave = Vec4::new(0.13, 0.8, 0.9, 0.0);
+    let mut ribbon = Material {
+        base_color: Vec4::ONE,
+        params: wave,
+        texture: None,
+        variant: MaterialVariant::VERTEX_WAVE | MaterialVariant::TRANSPARENT,
+    };
+    ribbon.set_phase_mode(MaterialVariant::NONE);
+
+    // The whole point: it phases *and* it sways.
+    assert!(ribbon.variant.contains(MaterialVariant::PHASE_CIRCLE));
+    assert!(ribbon.variant.contains(MaterialVariant::VERTEX_WAVE));
+    assert_eq!(ribbon.params, wave, "the phase mode wrote into params");
+    assert!(ribbon.params.x > 0.0, "the wave amplitude was zeroed");
+    // …and nothing the material already carried was disturbed.
+    assert!(ribbon.variant.contains(MaterialVariant::TRANSPARENT));
+
+    // World-only is the bare bit — the absence of a mode, which is exactly why
+    // it cannot be OR'd on and `set_phase_mode` exists.
+    assert!(!ribbon.variant.intersects(MaterialVariant::PHASE_MODE));
+
+    // The three modes are exclusive, and re-tagging replaces rather than
+    // accumulates. A material that has been every mode in turn carries one.
+    for mode in [
+        MaterialVariant::PHASE_INVERT,
+        MaterialVariant::PHASE_NO_DISCARD,
+        MaterialVariant::NONE,
+    ] {
+        ribbon.set_phase_mode(mode);
+        assert_eq!(
+            ribbon.variant.bits() & MaterialVariant::PHASE_MODE.bits(),
+            mode.bits(),
+            "re-tagging left a stale mode bit behind"
+        );
+        assert!(ribbon.variant.contains(MaterialVariant::PHASE_CIRCLE));
+        assert_eq!(ribbon.params, wave);
+    }
+
+    // `PHASE_MODE` is the pair and nothing else — it must never take the
+    // enabling bit with it, or clearing a mode would switch the effect off.
+    assert_eq!(
+        MaterialVariant::PHASE_MODE.bits(),
+        MaterialVariant::PHASE_INVERT.bits() | MaterialVariant::PHASE_NO_DISCARD.bits()
+    );
+    assert!(!MaterialVariant::PHASE_MODE.intersects(MaterialVariant::PHASE_CIRCLE));
+
+    // Both mode bits at once is defined rather than undefined: the shader tests
+    // `F_PHASE_NO_DISCARD` first, so "never discard" wins. Nothing should author
+    // it; the guarantee is that it cannot surprise anyone.
+    let confused = MaterialVariant::PHASE_CIRCLE | MaterialVariant::PHASE_MODE;
+    assert!(confused.contains(MaterialVariant::PHASE_NO_DISCARD));
+    let src = material::variant_source(material::BASE_SHADER, confused);
+    assert!(src.contains("const F_PHASE_NO_DISCARD: bool = true;"));
+    assert!(src.contains("const F_PHASE_INVERT: bool = true;"));
+
+    // Both bits are implemented, not reserved — the shader branches on them.
+    assert_eq!(confused.unimplemented(), MaterialVariant::NONE);
 }
 
 /// The keystone claim of D2: fixed-function state is a pure function of the
@@ -401,6 +512,77 @@ fn every_local_space_texture_combination_compiles() {
         renderer.pipeline_count(),
         keys.len(),
         "one pipeline per key, and the bit is part of the key"
+    );
+}
+
+/// Every phase mode compiles, against every look a phase surface is built from.
+///
+/// [`PHASE_MODE_REACH`] carries the argument for why this is a twelve-key list
+/// rather than two more bits in [`SHADER_BITS`]. What it proves is the half a
+/// string test cannot: the discard chain is a `const` branch three ways, and a
+/// mode whose body failed to compile would be a crash the first time a level
+/// authored it — which for `PHASE_NO_DISCARD` is a mode nothing in the port
+/// currently spells, and so exactly the one that would reach a player first.
+#[test]
+fn every_phase_mode_compiles_against_the_looks_it_composes_with() {
+    let mut renderer = match pollster::block_on(Renderer::headless(FORMAT)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("SKIP (no GPU adapter): {e}");
+            return;
+        }
+    };
+
+    let modes = [
+        MaterialVariant::NONE,
+        MaterialVariant::PHASE_INVERT,
+        MaterialVariant::PHASE_NO_DISCARD,
+        // Both, which nothing should author — compiled anyway, because
+        // "defined rather than undefined" is only worth claiming if the key
+        // it describes actually builds.
+        MaterialVariant::PHASE_MODE,
+    ];
+    let mut keys = Vec::new();
+    for mode in modes {
+        for bits in 0..(1u32 << PHASE_MODE_REACH.len()) {
+            let mut variant = MaterialVariant::PHASE_CIRCLE | mode;
+            for (i, flag) in PHASE_MODE_REACH.iter().enumerate() {
+                if bits & (1 << i) != 0 {
+                    variant |= *flag;
+                }
+            }
+            keys.push(variant);
+        }
+    }
+    assert_eq!(keys.len(), 16, "four modes over a two-bit product");
+
+    for variant in &keys {
+        let scope = renderer
+            .device()
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let _module = renderer
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("phase-mode variant under test"),
+                source: wgpu::ShaderSource::Wgsl(
+                    material::variant_source(material::BASE_SHADER, *variant).into(),
+                ),
+            });
+        let err = pollster::block_on(scope.pop());
+        assert!(
+            err.is_none(),
+            "variant {:#020b} failed to compile: {err:?}",
+            variant.bits()
+        );
+        renderer.ensure_pipeline(*variant);
+    }
+
+    // The mode is part of the key, so four modes of the same look are four
+    // pipelines — not one that happened to be compiled first.
+    assert_eq!(
+        renderer.pipeline_count(),
+        keys.len(),
+        "one pipeline per key, and the mode is part of the key"
     );
 }
 

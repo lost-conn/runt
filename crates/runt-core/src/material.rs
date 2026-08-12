@@ -122,19 +122,53 @@ impl MaterialVariant {
     /// centred and sized by [`FrameUniform::phase`], that decides per fragment
     /// whether this surface exists.
     ///
-    /// The mode is per material, in [`Material::params`]`.x`:
+    /// This bit turns the effect **on**. Which way round it cuts is two more
+    /// bits — [`PHASE_INVERT`] and [`PHASE_NO_DISCARD`] — so the whole mode
+    /// lives in the key:
     ///
-    /// | `params.x` | meaning |
+    /// | key | meaning |
     /// |---|---|
-    /// | `0` | **world-only** — discard *inside* the circle |
-    /// | `1` | **phase-only** — discard *outside* it |
-    /// | `2` | **effect only** — never discard, just take the edge fringe |
+    /// | `PHASE_CIRCLE` | **world-only** — discard *inside* the circle |
+    /// | `PHASE_CIRCLE \| PHASE_INVERT` | **phase-only** — discard *outside* it |
+    /// | `PHASE_CIRCLE \| PHASE_NO_DISCARD` | **effect only** — never discard, just take the edge fringe |
+    ///
+    /// World-only is the bare bit, so the default reading of "phase geometry"
+    /// is the commonest one and a key that says nothing extra says the right
+    /// thing.
+    ///
+    /// The edge fringe is drawn for every fragment that survives, whatever the
+    /// mode — it is a property of the *circle*, not of the geometry, and
+    /// `PHASE_NO_DISCARD` is simply the mode with nothing else left.
     ///
     /// A radius of ~0 means "no circle": nothing is inside it, so world
     /// geometry is solid and phase geometry is gone — which is the resting
     /// state, and matches the original's `phase_common.gdshaderinc` exactly.
     ///
+    /// # Why the mode is bits and not a number in [`Material::params`]
+    ///
+    /// It was `params.x`, and `params.x` is not the material's to spend. Three
+    /// of the four slots already belong to [`VERTEX_WAVE`], whose amplitude
+    /// *is* `x`, and the two are not alternatives — the port's waterfall is one
+    /// draw that sways **and** answers to the circle
+    /// (`3dimenshift/scenes/objects/water_flow.tscn`'s `Phaseable` over
+    /// `fx/water.gdshader`'s vertex stage). One `f32` cannot be an amplitude
+    /// and a mode at once, and the reading that lost was the wave: a mode of
+    /// `0` is an amplitude of `0`, so the waterfall went flat the moment it
+    /// learned to phase.
+    ///
+    /// Godot never had to choose — its shader carries `phase_mode` and
+    /// `wave_amplitude` as two uniforms — and neither does this, because a mode
+    /// is exactly what the variant key is for: three states, known at pipeline
+    /// build time, folded to straight-line code by the `const` branch rather
+    /// than compared against a float every fragment. `params` is for numbers an
+    /// author *tunes*; the key is for choices that pick a shader. The
+    /// waterfall is the draw that proved the difference, and it is why
+    /// `params.x` is now [`VERTEX_WAVE`]'s alone.
+    ///
     /// [`FrameUniform::phase`]: crate::FrameUniform::phase
+    /// [`PHASE_INVERT`]: MaterialVariant::PHASE_INVERT
+    /// [`PHASE_NO_DISCARD`]: MaterialVariant::PHASE_NO_DISCARD
+    /// [`VERTEX_WAVE`]: MaterialVariant::VERTEX_WAVE
     pub const PHASE_CIRCLE: MaterialVariant = MaterialVariant(1 << 8);
     /// No lighting at all: the fragment is `base_color` × vertex color ×
     /// texture, written flat.
@@ -320,6 +354,70 @@ impl MaterialVariant {
     /// [`TEXTURE`]: MaterialVariant::TEXTURE
     /// [`LIVE_TEX`]: MaterialVariant::LIVE_TEX
     pub const LOCAL_SPACE: MaterialVariant = MaterialVariant(1 << 15);
+    /// Flip which side of the phase circle [`PHASE_CIRCLE`] discards: *outside*
+    /// instead of inside. Godot's `phase_mode = 1`, "phase-only".
+    ///
+    /// Geometry that exists nowhere but inside the circle — the port's ten
+    /// materialising steps and floats, which are intangible until you shift and
+    /// then are the only thing you can stand on. Inert without
+    /// [`PHASE_CIRCLE`]: it names which way that bit cuts and has no meaning of
+    /// its own.
+    ///
+    /// It is also how the **ghost** is spelled. `phase_outline.gdshader` writes
+    /// its complement as arithmetic (`1 - phase_mode`) so that a second,
+    /// additive draw of the same mesh fills in exactly what the solid draw threw
+    /// away; here the same statement is this bit toggled, which is the same
+    /// swap without the float.
+    ///
+    /// # Bit 16, and not the 12 the mode moved out of
+    ///
+    /// Bit positions are permanent (see the type docs) and 0..=15 were all
+    /// spoken for when the mode left `params` — 12 is [`VERTEX_WAVE`] and 13 is
+    /// [`TWO_SIDED`]. So the pair appends, like every look before it.
+    ///
+    /// [`PHASE_CIRCLE`]: MaterialVariant::PHASE_CIRCLE
+    /// [`VERTEX_WAVE`]: MaterialVariant::VERTEX_WAVE
+    /// [`TWO_SIDED`]: MaterialVariant::TWO_SIDED
+    pub const PHASE_INVERT: MaterialVariant = MaterialVariant(1 << 16);
+    /// [`PHASE_CIRCLE`] with **no discard at all**: the surface is there on both
+    /// sides and takes only the edge fringe. Godot's `phase_mode = 2`,
+    /// "effect only".
+    ///
+    /// For geometry that must never vanish but should still register that the
+    /// circle swept over it — and, in the port, for `Phaseable` bodies tagged
+    /// into the world dimension *and* a phase tier at once, which are solid
+    /// either way and so have no side to be removed from.
+    ///
+    /// # With [`PHASE_INVERT`]
+    ///
+    /// This bit **wins**, and the shader says so with an `if / else if` in that
+    /// order rather than leaving the pair undefined — the same resolution rule
+    /// [`LIVE_TEX`] beats [`TEXTURE`] by and [`UNLIT`]'s chain uses. Nothing
+    /// should author the combination: "never discard" and "discard on the other
+    /// side" are not two halves of a look, they are two answers to one question,
+    /// and a key carrying both is a caller that has not decided. Defined so that
+    /// it cannot be a *surprise*, not so that it can be used.
+    ///
+    /// [`PHASE_CIRCLE`]: MaterialVariant::PHASE_CIRCLE
+    /// [`PHASE_INVERT`]: MaterialVariant::PHASE_INVERT
+    /// [`LIVE_TEX`]: MaterialVariant::LIVE_TEX
+    /// [`TEXTURE`]: MaterialVariant::TEXTURE
+    /// [`UNLIT`]: MaterialVariant::UNLIT
+    pub const PHASE_NO_DISCARD: MaterialVariant = MaterialVariant(1 << 17);
+
+    /// The two bits that name *which way* [`PHASE_CIRCLE`] cuts, as one mask.
+    ///
+    /// What a caller setting a mode wants to clear first: the three states are
+    /// exclusive, so "world-only" is the absence of both and cannot be OR'd on.
+    /// [`Material::set_phase_mode`] is that operation with the rule already in it.
+    ///
+    /// Neither bit means anything without [`PHASE_CIRCLE`], which is why they
+    /// are a mask over it rather than looks of their own.
+    ///
+    /// [`PHASE_CIRCLE`]: MaterialVariant::PHASE_CIRCLE
+    /// [`Material::set_phase_mode`]: Material::set_phase_mode
+    pub const PHASE_MODE: MaterialVariant =
+        MaterialVariant(MaterialVariant::PHASE_INVERT.0 | MaterialVariant::PHASE_NO_DISCARD.0);
 
     /// Every declared flag, with the WGSL `const` it maps to. The order here is
     /// the order the preprocessor emits, so generated sources are stable.
@@ -329,7 +427,7 @@ impl MaterialVariant {
     /// `F_TWO_SIDED`: this list is the *declaration* of the key space, and a bit
     /// missing from it would be a key the preprocessor silently could not
     /// describe.
-    pub const FLAGS: [(&'static str, MaterialVariant); 16] = [
+    pub const FLAGS: [(&'static str, MaterialVariant); 18] = [
         ("F_VERTEX_COLOR", MaterialVariant::VERTEX_COLOR),
         ("F_TEXTURE", MaterialVariant::TEXTURE),
         ("F_RAMP", MaterialVariant::RAMP),
@@ -346,6 +444,8 @@ impl MaterialVariant {
         ("F_TWO_SIDED", MaterialVariant::TWO_SIDED),
         ("F_SHADOW", MaterialVariant::SHADOW),
         ("F_LOCAL_SPACE", MaterialVariant::LOCAL_SPACE),
+        ("F_PHASE_INVERT", MaterialVariant::PHASE_INVERT),
+        ("F_PHASE_NO_DISCARD", MaterialVariant::PHASE_NO_DISCARD),
     ];
 
     /// The two blend bits, as one mask: the draws that leave the opaque
@@ -370,7 +470,9 @@ impl MaterialVariant {
             | MaterialVariant::VERTEX_WAVE.0
             | MaterialVariant::TWO_SIDED.0
             | MaterialVariant::SHADOW.0
-            | MaterialVariant::LOCAL_SPACE.0,
+            | MaterialVariant::LOCAL_SPACE.0
+            | MaterialVariant::PHASE_INVERT.0
+            | MaterialVariant::PHASE_NO_DISCARD.0,
     );
 
     /// The four bits that each *replace* the lighting term rather than feeding
@@ -482,29 +584,39 @@ pub struct Material {
     ///
     /// | bits | `x` | `y` | `z` | `w` |
     /// |---|---|---|---|---|
-    /// | [`PHASE_CIRCLE`] | mode | — | — | — |
     /// | [`FRESNEL`] | — | rim power | — | — |
     /// | [`EMISSIVE_SWEEP`] | un-swept gain | progress | fade width | swept gain |
     /// | [`VERTEX_WAVE`] | amplitude | frequency | speed | — |
     ///
-    /// `x` is shared, which is why the consumers of it are: the phase circle's
-    /// mode is a property of *phase* geometry, the sweep is a property of a
-    /// wire and the wave is a property of a water surface, and no draw is more
-    /// than one of those. That is the same resolution rule the rest of the key
-    /// space uses — a combination is *defined* rather than forbidden, and the
-    /// definition is "whichever variant reads the slot gets the number the
-    /// author put there". The rest is reserved for ramp threshold/softness/… as
-    /// those variants land. Uploaded whole from the start so a new variant never
-    /// changes the uniform layout.
+    /// These are numbers an author **tunes**. A choice between a fixed set of
+    /// behaviours is not one of those and does not belong here: it goes in the
+    /// variant key, where it costs a `const` branch the compiler folds instead
+    /// of a float comparison every fragment.
+    ///
+    /// [`PHASE_CIRCLE`] used to be the exception — its mode was `x`, a
+    /// three-valued float compared with slack — and the exception is what broke.
+    /// [`VERTEX_WAVE`] owns three of these four slots, `x` among them, and the
+    /// port has a draw that is both: a waterfall that sways *and* answers to the
+    /// phase circle. One slot cannot be an amplitude and a mode at once. The
+    /// mode moved to [`PHASE_INVERT`] / [`PHASE_NO_DISCARD`] and `x` is the
+    /// wave's alone; the whole argument is under [`PHASE_CIRCLE`].
+    ///
+    /// `x` is still shared between the sweep and the wave, and that stays
+    /// defined rather than forbidden — a wire is not a water surface, and the
+    /// rule is "whichever variant reads the slot gets the number the author put
+    /// there". What changed is that the set of readers is now only ever
+    /// *authored* numbers, so two of them on one draw is a caller describing one
+    /// surface as two looks, not a mode colliding with a tuning value. The rest
+    /// is reserved for ramp threshold/softness/… as those variants land.
+    /// Uploaded whole from the start so a new variant never changes the uniform
+    /// layout.
     ///
     /// [`FRESNEL`]: MaterialVariant::FRESNEL
     /// [`EMISSIVE_SWEEP`]: MaterialVariant::EMISSIVE_SWEEP
     /// [`VERTEX_WAVE`]: MaterialVariant::VERTEX_WAVE
-    ///
     /// [`PHASE_CIRCLE`]: MaterialVariant::PHASE_CIRCLE
-    /// [`PHASE_WORLD_ONLY`]: Material::PHASE_WORLD_ONLY
-    /// [`PHASE_ONLY`]: Material::PHASE_ONLY
-    /// [`PHASE_EFFECT_ONLY`]: Material::PHASE_EFFECT_ONLY
+    /// [`PHASE_INVERT`]: MaterialVariant::PHASE_INVERT
+    /// [`PHASE_NO_DISCARD`]: MaterialVariant::PHASE_NO_DISCARD
     pub params: Vec4,
     /// Which baked texture (§7) this material samples, if any.
     ///
@@ -523,14 +635,41 @@ impl Default for Material {
 }
 
 impl Material {
-    /// [`PHASE_CIRCLE`](MaterialVariant::PHASE_CIRCLE) mode for `params.x`:
-    /// ordinary world geometry, which the circle *removes*.
-    pub const PHASE_WORLD_ONLY: f32 = 0.0;
-    /// …geometry that only exists inside the circle.
-    pub const PHASE_ONLY: f32 = 1.0;
-    /// …geometry the circle never removes: it takes the edge fringe and
-    /// nothing else.
-    pub const PHASE_EFFECT_ONLY: f32 = 2.0;
+    /// Turn the phase circle on in `mode`, replacing whatever mode was there.
+    ///
+    /// `mode` is one of [`NONE`] (world-only — discard inside the circle),
+    /// [`PHASE_INVERT`] (phase-only) or [`PHASE_NO_DISCARD`] (effect only);
+    /// [`PHASE_CIRCLE`] itself is added for you, because a mode with the effect
+    /// switched off is not a state, it is a caller who forgot.
+    ///
+    /// The three modes are **exclusive**, which is the whole reason this exists
+    /// rather than a bare `|=` at each call site: world-only is the *absence* of
+    /// the two mode bits, so it cannot be OR'd on and re-tagging a material that
+    /// already had a mode has to clear first. One copy of that rule, here.
+    ///
+    /// This replaced three `f32` constants (`PHASE_WORLD_ONLY`, `PHASE_ONLY`,
+    /// `PHASE_EFFECT_ONLY`) that named values for `params.x`. They are gone
+    /// rather than redefined as masks: a mask is a [`MaterialVariant`] and every
+    /// other named combination of bits lives on that type ([`BLENDED`],
+    /// [`UNLIT`], [`PHASE_MODE`]), so keeping phase aliases on `Material` would
+    /// have been the one set of variant constants filed under the uniform
+    /// struct. And world-only has no mask to be — it is the empty one — so two
+    /// of the three would have read as "nothing" at the call site. A verb that
+    /// takes the mode says it once and says it correctly.
+    ///
+    /// [`NONE`]: MaterialVariant::NONE
+    /// [`PHASE_CIRCLE`]: MaterialVariant::PHASE_CIRCLE
+    /// [`PHASE_INVERT`]: MaterialVariant::PHASE_INVERT
+    /// [`PHASE_NO_DISCARD`]: MaterialVariant::PHASE_NO_DISCARD
+    /// [`PHASE_MODE`]: MaterialVariant::PHASE_MODE
+    /// [`BLENDED`]: MaterialVariant::BLENDED
+    /// [`UNLIT`]: MaterialVariant::UNLIT
+    pub fn set_phase_mode(&mut self, mode: MaterialVariant) {
+        let kept = self.variant.bits() & !MaterialVariant::PHASE_MODE.bits();
+        let mode = mode.bits() & MaterialVariant::PHASE_MODE.bits();
+        self.variant =
+            MaterialVariant::from_bits(kept | mode) | MaterialVariant::PHASE_CIRCLE;
+    }
 
     /// Untinted, taking its color from the mesh's vertex colors.
     pub fn vertex_colored() -> Material {
