@@ -25,7 +25,34 @@ const SHADER_BITS: [MaterialVariant; 8] = [
     MaterialVariant::BILLBOARD_UNLIT,
     // The one bit the *vertex* stage branches on. In here rather than only in
     // `tests/vertex_wave.rs` because a vertex branch can fail to compile
-    // against any fragment branch, and 256 modules is still under a second.
+    // against any fragment branch, and 256 modules is a few seconds.
+    MaterialVariant::VERTEX_WAVE,
+];
+
+/// `LOCAL_SPACE`'s whole reach, as a product of its own — the reason it is
+/// **not** in [`SHADER_BITS`].
+///
+/// It belongs there by the letter of that list's rule: it does branch, so it does
+/// change a module's bytes, which is the test `TWO_SIDED` fails. What it fails
+/// instead is the cost/coverage trade — and the trade was measured rather than
+/// guessed. `SHADER_BITS` with the bit appended compiles 512 modules in **21.3 s**
+/// where 256 take **9.3 s**; the 32-key product below costs **1.3 s**.
+///
+/// The twelve seconds buy nothing. The bit's entire reach is `shader.wgsl`'s
+/// `p_source` and the two derivative pairs, so the only flags it can interact with
+/// are the two texture paths, `NORMAL_MAP` (which reads a pair) and `VERTEX_WAVE`
+/// (which writes the varying it selects) — four flags, all four crossed in full
+/// below. The other 240 modules re-prove that a `const` the fragment already
+/// folded is still folded.
+///
+/// This is therefore a *narrower* claim than `SHADER_BITS`' and it is written
+/// down as one: if a future bit ever reads `local_pos` from outside the texture
+/// branches, this list is what has to grow, or the bit goes in `SHADER_BITS`
+/// and the sweep pays double.
+const LOCAL_SPACE_REACH: [MaterialVariant; 4] = [
+    MaterialVariant::TEXTURE,
+    MaterialVariant::LIVE_TEX,
+    MaterialVariant::NORMAL_MAP,
     MaterialVariant::VERTEX_WAVE,
 ];
 
@@ -45,6 +72,8 @@ const SHADER_BITS: [MaterialVariant; 8] = [
 /// that is a gap rather than a decision: they were appended after this list was
 /// written and crossing them in would quadruple it again. Both are exercised
 /// end to end by `tests/transparency.rs` and by the port's own frames.
+/// `LOCAL_SPACE` is also absent, and that one *is* a decision — see
+/// [`LOCAL_SPACE_REACH`].
 ///
 /// The sweep includes combinations the draw list will never emit
 /// (`TEXTURE | LIVE_TEX`, with and without the rest). They stay in on purpose:
@@ -80,6 +109,7 @@ fn variant_source_declares_every_flag_with_the_right_value() {
     assert!(src.contains("const F_BILLBOARD_UNLIT: bool = false;"));
     assert!(src.contains("const F_VERTEX_WAVE: bool = false;"));
     assert!(src.contains("const F_TWO_SIDED: bool = false;"));
+    assert!(src.contains("const F_LOCAL_SPACE: bool = false;"));
     assert!(src.ends_with(material::BASE_SHADER), "base source is appended verbatim");
 
     let none = material::variant_source(material::BASE_SHADER, MaterialVariant::NONE);
@@ -149,6 +179,7 @@ fn variant_keys_behave_as_bitflags() {
     assert_eq!(MaterialVariant::VERTEX_WAVE.bits(), 1 << 12);
     assert_eq!(MaterialVariant::TWO_SIDED.bits(), 1 << 13);
     assert_eq!(MaterialVariant::SHADOW.bits(), 1 << 14);
+    assert_eq!(MaterialVariant::LOCAL_SPACE.bits(), 1 << 15);
 
     // The flag list and the bits agree, so no key can be generated that the
     // preprocessor would not emit a const for.
@@ -157,7 +188,7 @@ fn variant_keys_behave_as_bitflags() {
         assert!(!union.contains(flag), "duplicate flag bit {:#06b}", flag.bits());
         union |= flag;
     }
-    assert_eq!(union.bits(), 0b111_1111_1111_1111);
+    assert_eq!(union.bits(), 0b1111_1111_1111_1111);
 
     // The four looks that replace the lighting term rather than feeding it.
     // Exactly one wins per fragment; the mask is what says which four they are.
@@ -303,6 +334,74 @@ fn every_variant_compiles_into_a_pipeline() {
     // The cache is a cache: asking again compiles nothing new.
     renderer.ensure_pipeline(MaterialVariant::VERTEX_COLOR);
     assert_eq!(renderer.pipeline_count(), all_variants().len());
+}
+
+/// The sweep [`LOCAL_SPACE_REACH`] buys instead of doubling the one above: the
+/// local-space basis compiled against every flag that can reach it, with the bit
+/// on and off, and one cached pipeline per key.
+///
+/// The failures it is aimed at are specific rather than generic. Under
+/// `LOCAL_SPACE | NORMAL_MAP | LIVE_TEX` the fragment takes **two** derivative
+/// pairs where every other key takes one, and both `dpdx` calls sit inside a
+/// `const bool` branch — WGSL forbids a derivative in non-uniform control flow,
+/// so if naga ever stopped treating a module-level `const` condition as uniform,
+/// this is the key that would stop compiling. Under `LOCAL_SPACE | VERTEX_WAVE`
+/// the varying the fragment selects is written from a value the vertex stage
+/// mutated, which is the one place the two stages' halves of the bit meet.
+#[test]
+fn every_local_space_texture_combination_compiles() {
+    let mut renderer = match pollster::block_on(Renderer::headless(FORMAT)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("SKIP (no GPU adapter): {e}");
+            return;
+        }
+    };
+
+    let mut keys = Vec::new();
+    for local in [MaterialVariant::NONE, MaterialVariant::LOCAL_SPACE] {
+        for bits in 0..(1u32 << LOCAL_SPACE_REACH.len()) {
+            let mut variant = local;
+            for (i, flag) in LOCAL_SPACE_REACH.iter().enumerate() {
+                if bits & (1 << i) != 0 {
+                    variant |= *flag;
+                }
+            }
+            keys.push(variant);
+        }
+    }
+    assert_eq!(keys.len(), 32, "two halves of a four-bit product");
+
+    for variant in &keys {
+        let scope = renderer
+            .device()
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let _module = renderer
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("local-space variant under test"),
+                source: wgpu::ShaderSource::Wgsl(
+                    material::variant_source(material::BASE_SHADER, *variant).into(),
+                ),
+            });
+        let err = pollster::block_on(scope.pop());
+        assert!(
+            err.is_none(),
+            "variant {:#018b} failed to compile: {err:?}",
+            variant.bits()
+        );
+        renderer.ensure_pipeline(*variant);
+    }
+
+    // Half of these keys differ from the other half in bit 15 alone, so a key
+    // space that had quietly masked `LOCAL_SPACE` off — the way
+    // `resolve_variant` masks the two texture bits — would show up here as
+    // sixteen pipelines instead of thirty-two.
+    assert_eq!(
+        renderer.pipeline_count(),
+        keys.len(),
+        "one pipeline per key, and the bit is part of the key"
+    );
 }
 
 /// The render-state bits key the cache like any other bit: every combination is

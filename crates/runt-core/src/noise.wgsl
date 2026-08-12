@@ -364,11 +364,21 @@ fn fbm_finish(a: FbmAccum) -> f32 {
 // Distance from the camera is the *cause* of a large footprint and is what the
 // Godot original ramped on; the footprint is the effect, and using it directly
 // also handles a floor seen at a grazing angle, which no distance ramp can.
+//
+// `top` is floored at `1.0` — the CPU twin's doc comment
+// (`TextureSpec::live_octave_window`) works the arithmetic in full, but the
+// short version: unfloored, a large enough footprint pushes `top` to `0` or
+// below, `octave_weight(0, top - 1, top)` is `0` there, and `fbm_finish`
+// divides `0 / 0` into its zero fallback — the surface goes flat instead of
+// merely blurry. Flooring pins the window at `(0.0, 1.0)`, which gives octave 0
+// full weight (`octave_weight(0, 0, 1) == 1.0`, unconditionally) while octave 1
+// still fades to `0` exactly as before. A live material may blur; it must
+// never disappear.
 fn live_octave_window(footprint: f32, log2_lacunarity: f32, cell_pixels: f32) -> vec2<f32> {
     if (cell_pixels <= 0.0) {
         return vec2<f32>(1.0, 0.0); // max < min: octave LOD off.
     }
-    let top = -log2(max(footprint * cell_pixels, 1.0e-8)) / max(log2_lacunarity, 1.0e-3);
+    let top = max(-log2(max(footprint * cell_pixels, 1.0e-8)) / max(log2_lacunarity, 1.0e-3), 1.0);
     return vec2<f32>(top - 1.0, top);
 }
 

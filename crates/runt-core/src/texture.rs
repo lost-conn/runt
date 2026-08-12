@@ -133,6 +133,15 @@ pub const NORMAL_REFERENCE_TEXELS: f32 = 1024.0;
 /// Raising it blurs distant surfaces and makes them cheaper; lowering it is how
 /// you buy shimmer. Zero turns the window off entirely (every octave at full
 /// weight, the bake's behaviour), which is what the CPU twin compares against.
+///
+/// This used to be the whole knob — one value, engine-wide. It is now only the
+/// *default* for [`TextureSpec::live_cell_pixels`]: a material made of fine
+/// detail (grass) and one made of large slow-changing blobs (a cliff face) do
+/// not want to give up their finest octave at the same footprint, and a single
+/// `const` could not tell them apart. Kept rather than deleted because it is
+/// still the number every existing scene file and cached bake was authored
+/// against, and it is what [`TextureUniform::inert`](crate::bake::TextureUniform::inert)
+/// uses for a draw that has no spec to read a per-material value from.
 pub const LIVE_LOD_CELL_PIXELS: f32 = 2.0;
 
 // ---------------------------------------------------------------------------
@@ -223,6 +232,13 @@ pub struct NormalSpec {
     pub edge_width: f32,
     /// Multiplies the accumulated gradient before packing. The authored
     /// materials run hot (≈5–6) because the boundary term is small.
+    ///
+    /// A negative value inverts the relief — cell centres read as basins
+    /// instead of domes — because `strength` is a factor of `w` in
+    /// [`sample_at`](TextureSpec::sample_at)'s per-octave weight, and that
+    /// weight scales `dndx`/`dndy` linearly. No separate "invert" flag is
+    /// needed for the rare material that wants the sunk look; the sign of
+    /// this field already is that flag.
     #[serde(default = "one")]
     pub strength: f32,
 }
@@ -334,6 +350,40 @@ pub struct TextureSpec {
     /// [`MIN_RESOLUTION`]/[`MAX_RESOLUTION`] clamp it.
     #[serde(default = "default_resolution")]
     pub base_resolution: u32,
+    /// The per-material override of [`LIVE_LOD_CELL_PIXELS`]: how many pixels
+    /// wide a lattice cell must stay before §7's **live** path stops
+    /// evaluating its octave. Only the live path reads this — the bake has no
+    /// camera and always passes [`OCTAVE_LOD_OFF`].
+    ///
+    /// `#[serde(default)]` at the constant's own value, so every scene file and
+    /// cached bake written before this field existed keeps today's fade
+    /// exactly. Raise it for a material whose detail is coarse and slow to
+    /// change (a cliff face can give up its finest octave at a smaller
+    /// footprint than grass can without anyone noticing); lower it to hold
+    /// detail closer to the camera at the cost of the shimmer that is the
+    /// whole reason the window exists.
+    ///
+    /// # It is folded into `content_key` like everything else here
+    ///
+    /// It cannot change one baked pixel — [`bake::BakeUniform`](crate::bake::BakeUniform)
+    /// never reads it — but [`content_key`](TextureSpec::content_key) still
+    /// hashes it, on purpose. The handle is not only the pixel cache's key; it
+    /// is also [`TextureRegistry::resolve`](crate::bake::TextureRegistry::resolve)'s
+    /// key for the *uniform* two materials share, and `world_scale` and
+    /// `triplanar_sharpness` already sit in that same boat — neither reaches
+    /// [`BakeUniform`](crate::bake::BakeUniform) either, both still mint a new
+    /// handle when they change. Two specs that differed only in
+    /// `live_cell_pixels` but shared a handle would share one resident
+    /// [`TextureUniform`](crate::bake::TextureUniform): whichever spec resolved
+    /// the handle first would silently pick the fade the *other* material
+    /// renders with. Folding it into identity costs a rebake — never a wrong
+    /// pixel — the first time an old cache is read with this field in the
+    /// struct, because postcard encodes every field positionally regardless of
+    /// its default; that rebake produces byte-identical pixels under a new key,
+    /// which is what makes a stale on-disk entry merely wasted space rather
+    /// than a correctness bug.
+    #[serde(default = "default_live_cell_pixels")]
+    pub live_cell_pixels: f32,
 }
 
 fn one() -> f32 {
@@ -363,6 +413,9 @@ fn default_world_scale() -> f32 {
 fn default_resolution() -> u32 {
     512
 }
+fn default_live_cell_pixels() -> f32 {
+    LIVE_LOD_CELL_PIXELS
+}
 
 impl Default for TextureSpec {
     fn default() -> TextureSpec {
@@ -383,6 +436,7 @@ impl Default for TextureSpec {
             triplanar_sharpness: 4.0,
             anti_tiling: true,
             base_resolution: default_resolution(),
+            live_cell_pixels: default_live_cell_pixels(),
         }
     }
 }
@@ -639,11 +693,29 @@ impl TextureSpec {
     ///
     /// Returns `(min, max)` for [`noise::octave_weight`]; `cell_pixels <= 0`
     /// gives [`OCTAVE_LOD_OFF`](crate::noise::OCTAVE_LOD_OFF).
+    ///
+    /// # `top` is floored at `1.0`
+    ///
+    /// Unfloored, `top` keeps falling as the footprint grows, and once it
+    /// reaches `0` [`octave_weight(0, top - 1, top)`](noise::octave_weight)
+    /// reads `1 - clamp(1 - top, 0, 1)`, which is `0` for every `top <= 0` —
+    /// octave 0 fades along with everything above it. `FbmAccum`'s normalizing
+    /// sum is then zero over zero octaves, `finish` returns its `0.0` fallback,
+    /// and the surface does not go blurry, it goes to a single flat value: the
+    /// live path was deleting the material rather than reducing its detail.
+    /// Flooring `top` at `1.0` pins the window to `(0.0, 1.0)` for any
+    /// footprint that would otherwise have pushed it lower, which makes
+    /// `octave_weight(0, 0, 1) = 1 - clamp(1, 0, 1) = 1 - 1 + 1 = 1` — full
+    /// weight, unconditionally. (`1 - clamp((0-0)/1, 0, 1) = 1 - 0 = 1`, to
+    /// spell out the arithmetic the doc-test below pins.) Octave 1 at that same
+    /// window is `1 - clamp((1-0)/1, 0, 1) = 1 - 1 = 0`, so the floor costs
+    /// nothing above octave 0 — every octave past it still fades to zero
+    /// exactly as before, just never quite to a blank surface.
     pub fn live_octave_window(&self, footprint: f32, cell_pixels: f32) -> (f32, f32) {
         if cell_pixels <= 0.0 {
             return OCTAVE_LOD_OFF;
         }
-        let top = -(footprint * cell_pixels).max(1e-8).log2() / self.log2_lacunarity();
+        let top = (-(footprint * cell_pixels).max(1e-8).log2() / self.log2_lacunarity()).max(1.0);
         (top - 1.0, top)
     }
 
@@ -718,7 +790,19 @@ impl TextureSpec {
                     NormalMode::ToPoint => p - cell.f1,
                 };
                 let len = delta.length();
-                let dir = if len > 1e-4 { delta / len } else { Vec3::ZERO };
+                // `delta` points *away* from the nearest feature point — ToPoint
+                // is literally `sample - f1`, and ToEdge's `f2 - f1` is the far
+                // side of the boundary. But `dndx`/`dndy` are consumed below as
+                // a height gradient (`packed_normal_at`'s
+                // `normalize(-dndx, -dndy, 0.5)`), under the convention that a
+                // cell *centre* is the relief's high point — a tile stands
+                // proud, its grout recedes, DESIGN's rock and grass materials
+                // both read that way. Uphill is therefore toward the feature
+                // point, the opposite of `delta`, so the direction is negated
+                // once here rather than at the two `+=` sites below (which
+                // would need the same flip twice and be one place easier to get
+                // half-right).
+                let dir = if len > 1e-4 { -delta / len } else { Vec3::ZERO };
                 let w = octave.amplitude * octave.freq * edge_mag * octave.weight * normal.strength;
                 dndx += w * dir.x * step;
                 dndy += w * dir.y * step;
@@ -980,6 +1064,55 @@ impl TextureLibrary {
             .map(|(_, spec, res)| (spec, *res))
     }
 
+    /// Forget `handle`, so nothing can resolve it any more. `true` if it was
+    /// there.
+    ///
+    /// # What this is for, and what it deliberately is not
+    ///
+    /// A content-addressed entry is never *stale* — the pixels a handle names
+    /// are the pixels that spec bakes, this session and every other. So the
+    /// reason to remove one is never that it went wrong; it is that **nothing
+    /// references it any more**, which is a question only the world can answer.
+    ///
+    /// The case that needs it is live authoring. Editing a
+    /// [`TextureSpec`](crate::texture::TextureSpec) cannot mutate an entry in
+    /// place — the handle *is* the params, so an edit is a new handle and the
+    /// old one is left behind. A designer dragging one slider through fifty
+    /// values would therefore mint fifty entries and fifty bakes, and both this
+    /// library and the renderer's registry would hold every one of them for the
+    /// rest of the session. Removing the superseded entry is how that stops
+    /// being a leak.
+    ///
+    /// It does **not** free any GPU memory on its own. The registry is a cache
+    /// of this resource, so the pixels go when the two are reconciled —
+    /// [`Engine::sweep_baked_textures`], which is the call that makes this one
+    /// worth making.
+    ///
+    /// [`Engine::sweep_baked_textures`]: crate::Engine::sweep_baked_textures
+    pub fn remove(&mut self, handle: TextureHandle) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|(h, _, _)| *h != handle);
+        self.entries.len() != before
+    }
+
+    /// Keep only the entries `keep` answers `true` for; returns how many went.
+    ///
+    /// The bulk form of [`remove`](TextureLibrary::remove), and the shape a
+    /// reconcile against the world wants: gather the handles the live
+    /// [`Material`](crate::Material)s name, then retain the ones in that set.
+    /// Order is preserved among the survivors, which matters for the same
+    /// reason [`insert`](TextureLibrary::insert) keeps a `Vec` — nothing near
+    /// content resolution may depend on a hash container's iteration order.
+    pub fn retain(
+        &mut self,
+        mut keep: impl FnMut(TextureHandle, &TextureSpec, u32) -> bool,
+    ) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|(handle, spec, resolution)| keep(*handle, spec, *resolution));
+        before - self.entries.len()
+    }
+
     pub fn contains(&self, handle: TextureHandle) -> bool {
         self.entries.iter().any(|(h, _, _)| *h == handle)
     }
@@ -997,133 +1130,70 @@ impl TextureLibrary {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Authored materials (DESIGN §7, ported from 3dimenshift)
-// ---------------------------------------------------------------------------
-
-/// The `grass_cell` material's params, verbatim from the port spec.
-///
-/// Here rather than only in a scene file because they are *reference data*: the
-/// port spec's table is the source of truth and a test holds this against it,
-/// so a scene file that drifts is a scene file that is wrong.
-///
-/// The one number that is **not** from the Godot material is `world_scale`,
-/// which the original does not have an equivalent of in the live-noise shader
-/// (it sampled world space unbounded). It is chosen so the tile quantizes
-/// cleanly — see [`TextureSpec::world_scale`].
-// `lacunarity: 2.718` is what the artist typed into the Godot material. It is
-// not an approximation of `e`, and swapping in `std::f32::consts::E` would
-// change every texture the engine has ever baked — hence the allow.
-#[allow(clippy::approx_constant)]
-pub fn grass() -> TextureSpec {
-    TextureSpec {
-        noise: NoiseSpec::Cellular {
-            lattice: Lattice::Fcc,
-            return_type: CellReturn::CellValue,
-            jitter: 1.0,
-        },
-        frequency: 0.21,
-        octaves: 5,
-        lacunarity: 2.718,
-        gain: 0.562,
-        ramp: vec![
-            (0.12, Vec3::new(0.0, 0.31, 0.17566665)),
-            (0.45714286, Vec3::new(0.0, 0.44481665, 0.31058022)),
-            (1.0, Vec3::new(0.0, 0.53464526, 0.37844315)),
-        ],
-        normal: Some(NormalSpec {
-            mode: NormalMode::ToPoint,
-            edge_width: 0.52,
-            strength: 5.106,
-        }),
-        // 27.8 m tile, 5.83 → 6 cells across it: a 2.9% frequency nudge, and
-        // 36.9 texels per metre at 1024² — comfortably sharp, so this one never
-        // needed the retune `rock` did.
-        world_scale: 0.036,
-        triplanar_sharpness: 4.0,
-        base_resolution: 1024,
-        ..TextureSpec::default()
-    }
-}
-
-/// The `rock_cell` material's params, verbatim from the port spec.
-pub fn rock() -> TextureSpec {
-    TextureSpec {
-        noise: NoiseSpec::Cellular {
-            lattice: Lattice::Fcc,
-            return_type: CellReturn::CellValue,
-            jitter: 1.0,
-        },
-        frequency: 0.046,
-        octaves: 5,
-        lacunarity: 3.512,
-        gain: 0.543,
-        ramp: vec![
-            (0.12, Vec3::new(0.23, 0.1909, 0.20719166)),
-            (0.45714286, Vec3::new(0.27, 0.2187, 0.240075)),
-            (1.0, Vec3::new(0.41, 0.3362, 0.36694998)),
-        ],
-        normal: Some(NormalSpec {
-            mode: NormalMode::ToEdge,
-            edge_width: 0.351,
-            // The Godot material says 5.921. This is `5.921 × 10 / 2` — the
-            // exact compensation for the tile shrinking below, not a restyling.
-            //
-            // The bake differentiates the field over `base_span / 1024` cells
-            // (see NORMAL_REFERENCE_TEXELS), so the packed normal's tilt is
-            // proportional to `strength × base_span` and to nothing else in
-            // this struct. The base span went 10 → 2 with the retune, so
-            // leaving 5.921 alone would have shipped a rock five times flatter
-            // — which is precisely what the first screenshot of the retune
-            // showed: a sharp texture on a surface with no relief left.
-            // 29.605 × 2 = 59.21 = 5.921 × 10, so the normal map the shader
-            // samples is the one Godot's number asked for.
-            strength: 29.605,
-        }),
-        // A 40 m tile: 1024² of bake over 40 m is **25.6 texels per metre**.
-        //
-        // This used to be `0.0046`, chosen because it puts *exactly* ten cells
-        // across the tile and quantizes the whole lacunarity chain for free.
-        // That was optimizing the wrong number. Ten cells of a 21.7 m feature
-        // is a 217 m tile, and 1024² spread over 217 m is 4.7 px/m — a metre of
-        // rock covered by fewer than five texels, which is exactly the blur
-        // that was reported. The clean quantization was bought with an eightyfold
-        // deficit in the thing anyone can actually see.
-        //
-        // Shrinking the tile 5.4× costs quantization instead, and the trade is
-        // lopsided in the other direction (see `lacunarity_error`): the ideal
-        // spans become 1.84 / 6.46 / 22.7 / 79.7 / 280, which round to
-        // 2 / 6 / 22 / 80 / 280 — worst octave 8.7% off, against 2.5% before.
-        // What that 8.7% *means* is that the coarsest cell is 20.0 m instead of
-        // 21.7 m and the second is 6.7 m instead of 6.0 m; the three octaves
-        // that carry the grain anyone reads as "stone" (1.82 m, 0.50 m,
-        // 0.143 m) move by 3.7%, 0.2% and 0.06%. Nobody can see the first pair.
-        // Everybody could see 4.7 px/m.
-        //
-        // The alternative was nudging `lacunarity` off the authored 3.512 to an
-        // integer, which quantizes exactly from a base span of 2 — and moves
-        // the *fine* octaves instead: 4.0 makes the finest grain 0.085 m
-        // (under-resolved again at 25 px/m), 3.0 makes it 0.27 m (visibly
-        // chunkier stone). The authored chain is kept and the tile absorbs the
-        // error; the repetition a 40 m tile brings is hidden by the anti-tiling
-        // sampler, which is what it is for, and the level's rock is on props
-        // 2–7 m across that never show a 40 m period anyway.
-        world_scale: 0.025,
-        triplanar_sharpness: 1.0,
-        base_resolution: 1024,
-        ..TextureSpec::default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The unit tests' own spec: a cleanly quantized tile with a normal map.
+    ///
+    /// The same numbers `tests/common/mod.rs` calls `fine`, duplicated rather
+    /// than shared because a `#[cfg(test)]` module inside the crate and an
+    /// integration test cannot see one another. Named for its character, not for
+    /// a material — the engine has no opinion about what grass looks like.
+    // A number an artist typed, not an approximation of `e`.
+    #[allow(clippy::approx_constant)]
+    fn fine() -> TextureSpec {
+        TextureSpec {
+            noise: NoiseSpec::Cellular {
+                lattice: Lattice::Fcc,
+                return_type: CellReturn::CellValue,
+                jitter: 1.0,
+            },
+            frequency: 0.21,
+            octaves: 5,
+            lacunarity: 2.718,
+            gain: 0.562,
+            ramp: vec![
+                (0.12, Vec3::new(0.0, 0.31, 0.175_666_65)),
+                (0.457_142_86, Vec3::new(0.0, 0.444_816_65, 0.310_580_22)),
+                (1.0, Vec3::new(0.0, 0.534_645_26, 0.378_443_15)),
+            ],
+            normal: Some(NormalSpec {
+                mode: NormalMode::ToPoint,
+                edge_width: 0.52,
+                strength: 5.106,
+            }),
+            world_scale: 0.036,
+            triplanar_sharpness: 4.0,
+            base_resolution: 1024,
+            ..TextureSpec::default()
+        }
+    }
+
+    /// The awkward one: a 40 m tile holding two cells of its base feature, so
+    /// the base octave rounds 8.7%. `tests/common/mod.rs`'s `coarse`.
+    fn coarse() -> TextureSpec {
+        TextureSpec {
+            frequency: 0.046,
+            octaves: 5,
+            lacunarity: 3.512,
+            gain: 0.543,
+            normal: Some(NormalSpec {
+                mode: NormalMode::ToEdge,
+                edge_width: 0.351,
+                strength: 29.605,
+            }),
+            world_scale: 0.025,
+            triplanar_sharpness: 1.0,
+            ..fine()
+        }
+    }
 
     #[test]
     fn the_tile_is_seamless_in_both_axes() {
         // The whole point of the wrapped-lattice bake: the field at u=0 and u=1
         // is not merely close, it is the same number.
-        let spec = grass();
+        let spec = fine();
         for i in 0..16 {
             let t = i as f32 / 16.0;
             let (a, _, _) = spec.sample_at(Vec2::new(0.0, t));
@@ -1138,7 +1208,7 @@ mod tests {
 
     #[test]
     fn octave_spans_are_whole_and_even_on_fcc() {
-        for spec in [grass(), rock()] {
+        for spec in [fine(), coarse()] {
             for octave in spec.octave_plan() {
                 assert_eq!(octave.span, octave.span.round(), "span must be integral");
                 assert_eq!(octave.span % 2.0, 0.0, "FCC needs an even period");
@@ -1148,58 +1218,68 @@ mod tests {
     }
 
     #[test]
-    fn quantizing_the_lacunarity_chain_stays_within_its_budget() {
-        // The documented price of seamlessness, per material — one budget for
-        // both would either let `grass` drift or forbid `rock`'s retune.
+    fn lacunarity_error_reports_the_price_of_seamlessness() {
+        // Whether a *particular* material's quantization is acceptable is a
+        // question for whoever authored it — the game holds its own budgets
+        // (`shift/src/textures.rs`). What the engine owes is that the number is
+        // honest, because a budget can only be enforced against a measurement
+        // that moves.
         //
-        // `rock` is deliberately the expensive one: its 40 m tile holds under
-        // two cells of a 21.7 m base feature, so the base octave alone rounds
-        // 8.7% (see `rock`'s comment for why that is the right trade against
-        // 4.7 texels per metre). If *this* ever fails the tile has shrunk
-        // further still, and the next lever is `frequency`, not the rounding
-        // rule.
-        for (name, spec, budget) in [("grass", grass(), 0.035), ("rock", rock(), 0.09)] {
-            let error = spec.lacunarity_error();
-            assert!(
-                error < budget,
-                "{name}: lacunarity quantized by {:.2}%, budget {:.1}%",
-                error * 100.0,
-                budget * 100.0
-            );
-        }
+        // The two fixtures bracket the range: `fine` has 6 cells across its tile
+        // and rounds cheaply, `coarse` has fewer than 2 and rounds dearly.
+        let cheap = fine().lacunarity_error();
+        let dear = coarse().lacunarity_error();
+        assert!(cheap < 0.035, "fine quantized by {:.2}%", cheap * 100.0);
+        assert!(
+            (0.08..0.09).contains(&dear),
+            "coarse quantized by {:.2}%, expected ~8.7%",
+            dear * 100.0
+        );
+        assert!(dear > cheap, "fewer cells across the tile must cost more");
+
+        // A spec whose spans are already whole and even pays nothing, which is
+        // the floor the measurement has to be able to report.
+        let exact = TextureSpec {
+            frequency: 2.0,
+            world_scale: 1.0,
+            lacunarity: 2.0,
+            octaves: 4,
+            ..fine()
+        };
+        assert_eq!(exact.lacunarity_error(), 0.0);
     }
 
     #[test]
-    fn the_authored_materials_are_dense_enough_to_read_as_sharp() {
-        // The regression this exists for: `rock` shipped a 217 m tile at 1024²
-        // — 4.7 texels per metre, one texel every 21 cm, and a stepping stone
-        // the player stands on covered by nine of them.
-        for (name, spec) in [("grass", grass()), ("rock", rock())] {
-            let density = spec.texel_density(spec.base_resolution);
-            println!(
-                "{name}: {:.1} m tile, {:.1} px/m at {}²",
-                spec.tile_meters(),
-                density,
-                spec.base_resolution
-            );
-            assert!(
-                density >= 25.0,
-                "{name}: {density:.1} texels/m is blurred up close"
-            );
-            // …and the other end: a tile so small the anti-tiling sampler has
-            // to work over a period the eye can take in at a glance.
-            assert!(spec.tile_meters() >= 20.0, "{name}: {} m tile", spec.tile_meters());
-        }
+    fn texel_density_is_resolution_over_the_tile() {
+        // The arithmetic a material author tunes `world_scale` against, and the
+        // regression it exists for: a 217 m tile at 1024² is 4.7 texels per
+        // metre — one texel every 21 cm — which is the blur that got a whole
+        // material re-tiled. The *threshold* is the game's to set; that the
+        // number is this ratio is the engine's to guarantee.
+        let spec = TextureSpec {
+            world_scale: 0.025,
+            ..fine()
+        };
+        assert_eq!(spec.tile_meters(), 40.0);
+        assert_eq!(spec.texel_density(1024), 25.6);
+        // Ten times the tile is a tenth the density, which is what makes the
+        // trade legible when it is written down.
+        let wide = TextureSpec {
+            world_scale: 0.0025,
+            ..spec
+        };
+        assert_eq!(wide.tile_meters(), 400.0);
+        assert_eq!(wide.texel_density(1024), 2.56);
     }
 
     #[test]
     fn param_key_ignores_resolution_but_content_key_does_not() {
-        let spec = grass();
-        assert_eq!(spec.param_key(), grass().param_key());
+        let spec = fine();
+        assert_eq!(spec.param_key(), fine().param_key());
         assert_ne!(spec.content_key(512), spec.content_key(1024));
-        assert_eq!(spec.content_key(512), grass().content_key(512));
+        assert_eq!(spec.content_key(512), fine().content_key(512));
 
-        let mut other = grass();
+        let mut other = fine();
         other.seed_offset = 4.0;
         assert_ne!(spec.param_key(), other.param_key());
     }
@@ -1210,7 +1290,7 @@ mod tests {
         // specs and resolutions that a mask applied to only one branch of
         // `content_key` would show up here.
         for seed in 0..64 {
-            let mut spec = grass();
+            let mut spec = fine();
             spec.seed_offset = seed as f32;
             for resolution in [16, 64, 512, 1024] {
                 let handle = TextureHandle(spec.content_key(resolution));
@@ -1233,6 +1313,44 @@ mod tests {
     }
 
     #[test]
+    fn octave_zero_never_fades_no_matter_how_large_the_footprint() {
+        // The bug this pins: before the `top.max(1.0)` floor, a footprint large
+        // enough pushed `top` to `0` or below, and `octave_weight(0, top - 1,
+        // top)` is `0` there — every octave, including the first, dropped out
+        // of `FbmAccum`'s normalizing sum, and the material collapsed to a flat
+        // colour instead of merely losing detail. The floor exists so octave 0
+        // is the one thing the live path never takes away.
+        let spec = fine();
+        for footprint in [
+            1e-6, 0.01, 0.5, 1.0, 5.0, 100.0, 1.0e6, 1.0e12, f32::MAX / 4.0,
+        ] {
+            let (min, max) = spec.live_octave_window(footprint, LIVE_LOD_CELL_PIXELS);
+            let w0 = noise::octave_weight(0, min, max);
+            assert_eq!(
+                w0, 1.0,
+                "footprint {footprint}: window {min:?}..{max:?} gave octave 0 weight {w0}, not 1.0"
+            );
+        }
+
+        // The floor is a *pin*, not a general amnesty: with the window still
+        // exactly one octave wide, octave 1 fades to zero at the same absurd
+        // footprints that would have zeroed octave 0 pre-fix.
+        for footprint in [100.0, 1.0e6, 1.0e12] {
+            let (min, max) = spec.live_octave_window(footprint, LIVE_LOD_CELL_PIXELS);
+            let w1 = noise::octave_weight(1, min, max);
+            assert_eq!(
+                w1, 0.0,
+                "footprint {footprint}: octave 1 should have fully faded, got weight {w1}"
+            );
+        }
+
+        // And a sub-cell footprint is unaffected by the floor at all — the
+        // window sits well above 1.0, exactly as before this fix.
+        let (min, _) = spec.live_octave_window(1e-6, LIVE_LOD_CELL_PIXELS);
+        assert!(min > 5.0, "a tiny footprint should leave every octave on, got min {min}");
+    }
+
+    #[test]
     fn resolution_scales_with_the_tier_and_respects_the_caps() {
         let spec = TextureSpec {
             base_resolution: 512,
@@ -1248,7 +1366,7 @@ mod tests {
 
     #[test]
     fn the_ramp_holds_its_ends_and_interpolates_between() {
-        let spec = grass();
+        let spec = fine();
         let first = spec.ramp[0].1;
         let last = spec.ramp[2].1;
         assert_eq!(spec.ramp_at(0.0), first);
@@ -1262,71 +1380,152 @@ mod tests {
         assert_eq!(plain.ramp_at(0.7), Vec3::splat(0.7));
     }
 
-    #[test]
-    #[allow(clippy::approx_constant)]
-    fn the_authored_params_match_the_port_spec_table() {
-        // freq / oct / lacunarity / gain / return / normal mode / edge / strength
-        let g = grass();
-        assert_eq!(g.frequency, 0.21);
-        assert_eq!(g.octaves, 5);
-        assert_eq!(g.lacunarity, 2.718);
-        assert_eq!(g.gain, 0.562);
-        assert_eq!(g.noise.return_type(), CellReturn::CellValue);
-        assert_eq!(g.noise.jitter(), 1.0);
-        let gn = g.normal.expect("grass has normals");
-        assert_eq!(gn.mode, NormalMode::ToPoint);
-        assert_eq!(gn.edge_width, 0.52);
-        assert_eq!(gn.strength, 5.106);
-
-        let r = rock();
-        assert_eq!(r.frequency, 0.046);
-        assert_eq!(r.octaves, 5);
-        assert_eq!(r.lacunarity, 3.512);
-        assert_eq!(r.gain, 0.543);
-        let rn = r.normal.expect("rock has normals");
-        assert_eq!(rn.mode, NormalMode::ToEdge);
-        assert_eq!(rn.edge_width, 0.351);
-        // `strength` is the one authored number that is *rescaled* rather than
-        // verbatim, because the bake ties normal amplitude to the tile — see
-        // `the_normal_amplitude_survived_the_density_retune`, which holds the
-        // quantity Godot's 5.921 actually meant.
-        assert_eq!(rn.strength, 29.605);
+    /// Root-mean-square tilt of the packed normal over a uv grid — how steep a
+    /// surface reads, as one number. Per-uv comparison is meaningless across a
+    /// re-tile: `world_scale` changes which part of the field a uv lands on, so
+    /// the two are the same *relief* over different neighbourhoods.
+    fn rms_tilt(spec: &TextureSpec) -> f32 {
+        let n = 24;
+        let mut sum = 0.0;
+        for y in 0..n {
+            for x in 0..n {
+                let uv = Vec2::new(x as f32 / n as f32, y as f32 / n as f32);
+                let (_, dndx, dndy) = spec.sample_at(uv);
+                sum += dndx * dndx + dndy * dndy;
+            }
+        }
+        (sum / (n * n) as f32).sqrt()
     }
 
     #[test]
-    fn the_normal_amplitude_survived_the_density_retune() {
-        // What the bake multiplies the boundary gradient by is
-        // `strength × (base_span / NORMAL_REFERENCE_TEXELS)`, so `strength`
-        // alone says nothing about how steep a material reads — the product
-        // does. Godot authored 5.921 against a tile holding ten cells; any
-        // retiling that keeps `strength × span` at 59.21 keeps the relief.
+    fn normal_amplitude_is_strength_times_the_base_span_and_nothing_else() {
+        // [`NORMAL_REFERENCE_TEXELS`]'s one non-obvious consequence, as an
+        // executable statement: the bake differentiates the field over
+        // `base_span / 1024`, so the packed tilt is proportional to
+        // `strength × base_span` and to no other field in the struct. Re-tile a
+        // material without scaling `strength` inversely and it goes flat.
         //
-        // Without this the coupling is invisible: the albedo gets sharper, the
-        // surface goes flat, and the two changes look unrelated.
-        let r = rock();
-        let amplitude = r.normal.expect("rock has normals").strength * r.octave_plan()[0].span;
+        // This used to be a claim about a specific ported material's number
+        // (5.921 against a ten-cell tile, rescaled to 29.605 when the tile
+        // shrank to two). The material went to the game and its arithmetic went
+        // with it; the *coupling* is the engine's, so what is left here is the
+        // coupling.
+        let base = TextureSpec {
+            frequency: 1.0,
+            world_scale: 0.25,
+            normal: Some(NormalSpec {
+                mode: NormalMode::ToEdge,
+                edge_width: 0.35,
+                strength: 8.0,
+            }),
+            ..fine()
+        };
+        assert_eq!(base.octave_plan()[0].span, 4.0);
+
+        // Halve the tile, double the strength: the same product, and — the
+        // claim — the same packed normal, to floating-point noise.
+        let retiled = TextureSpec {
+            world_scale: 0.5,
+            normal: Some(NormalSpec {
+                strength: 16.0,
+                ..base.normal.expect("a normal")
+            }),
+            ..base.clone()
+        };
+        assert_eq!(retiled.octave_plan()[0].span, 2.0);
+
+        // Same product, same relief: 0.108 against 0.106, which is two
+        // neighbourhoods of one field rather than two amplitudes.
+        let (a, b) = (rms_tilt(&base), rms_tilt(&retiled));
         assert!(
-            (amplitude - 59.21).abs() < 1e-3,
-            "rock's normal amplitude is {amplitude}, not the authored 59.21"
+            (a - b).abs() / a < 0.05,
+            "compensated retiling changed the relief: {a:.5} -> {b:.5}"
         );
 
-        // grass never re-tiled, so its authored number stands unscaled.
-        let g = grass();
-        let g_amp = g.normal.expect("grass has normals").strength * g.octave_plan()[0].span;
-        assert!((g_amp - 5.106 * 6.0).abs() < 1e-3, "{g_amp}");
+        // …and forgetting to compensate does not. Half the span at the same
+        // strength is half the relief — exactly, because `step` is the only
+        // place the span reaches the gradient — which is the failure the
+        // coupling exists to make findable: the albedo gets sharper, the surface
+        // goes flat, and the two changes look unrelated.
+        let flattened = TextureSpec {
+            world_scale: 0.5,
+            ..base.clone()
+        };
+        let f = rms_tilt(&flattened);
+        assert!(
+            (f - b * 0.5).abs() / f < 0.05,
+            "half the tile at the same strength should be half the relief: \
+             {f:.5} against {:.5}",
+            b * 0.5
+        );
     }
 
     #[test]
     fn the_library_dedups_by_content_key() {
         let mut library = TextureLibrary::new();
-        let a = library.insert(grass(), 512);
-        let b = library.insert(grass(), 512);
-        let c = library.insert(grass(), 1024);
+        let a = library.insert(fine(), 512);
+        let b = library.insert(fine(), 512);
+        let c = library.insert(fine(), 1024);
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(library.len(), 2);
         assert!(library.contains(a));
         assert_eq!(library.get(a).expect("registered").1, 512);
+    }
+
+    #[test]
+    fn the_library_forgets_what_a_spec_edit_superseded() {
+        // The live-authoring lifecycle: a spec is edited, so the old handle is
+        // not stale — it is unreferenced, and nothing but the world knows that.
+        let mut library = TextureLibrary::new();
+        let before = library.insert(fine(), 512);
+        let edited = TextureSpec {
+            contrast: 1.4,
+            ..fine()
+        };
+        let after = library.insert(edited, 512);
+        assert_ne!(before, after, "an edited spec is a different handle");
+        assert_eq!(library.len(), 2, "the edit left the old entry behind");
+
+        assert!(library.remove(before));
+        assert!(!library.contains(before));
+        assert!(library.contains(after), "the edit's own entry survived");
+        assert_eq!(library.len(), 1);
+        assert!(!library.remove(before), "removing twice is not an error");
+    }
+
+    #[test]
+    fn retain_keeps_the_survivors_in_order() {
+        // A reconcile is a bulk remove, and the order it leaves behind is the
+        // insertion order of whatever it kept — same reason `insert` is a `Vec`.
+        let mut library = TextureLibrary::new();
+        let handles: Vec<TextureHandle> = (0..5)
+            .map(|i| {
+                library.insert(
+                    TextureSpec {
+                        seed_offset: i as f32,
+                        ..fine()
+                    },
+                    512,
+                )
+            })
+            .collect();
+
+        let keep: Vec<TextureHandle> = vec![handles[0], handles[3], handles[4]];
+        let dropped = library.retain(|handle, _, _| keep.contains(&handle));
+        assert_eq!(dropped, 2);
+        assert_eq!(
+            library.iter().map(|(h, _, _)| h).collect::<Vec<_>>(),
+            keep,
+            "retain reordered the survivors"
+        );
+
+        // A retain that keeps everything reports nothing and moves nothing.
+        assert_eq!(library.retain(|_, _, _| true), 0);
+        assert_eq!(library.len(), 3);
+        // …and one that keeps nothing empties it rather than half-emptying it.
+        assert_eq!(library.retain(|_, _, _| false), 3);
+        assert!(library.is_empty());
     }
 
     #[test]
@@ -1376,9 +1575,105 @@ mod tests {
     fn a_normal_free_spec_bakes_a_flat_normal() {
         let spec = TextureSpec {
             normal: None,
-            ..grass()
+            ..fine()
         };
         let packed = spec.packed_normal_at(Vec2::new(0.3, 0.7));
         assert!(packed.abs_diff_eq(Vec3::new(0.5, 0.5, 1.0), 1e-5), "{packed:?}");
+    }
+
+    #[test]
+    fn a_cell_reads_as_a_dome_and_not_a_bowl() {
+        // The regression the negation in `sample_at`'s `dir` guards against:
+        // before it, `dir` pointed *away* from the nearest feature point, so
+        // `packed_normal_at`'s `normalize(-dndx, -dndy, 0.5)` tilted toward
+        // cell centres — every cell a basin, its boundary a ridge, which read
+        // as grout standing proud of the tile it grouts. The fix makes a
+        // cell's own feature point its high point, so the unpacked normal's
+        // (x, y) has to lean *away* from that point everywhere off it, and
+        // lean harder the closer the sample gets to the boundary — a field
+        // of domes, not bowls.
+        //
+        // One octave, so there is exactly one feature point in play near any
+        // sample and nothing else's contribution to argue the sign with.
+        let spec = TextureSpec {
+            octaves: 1,
+            ..fine()
+        };
+        let plan = spec.octave_plan();
+        assert_eq!(plan.len(), 1, "the claim wants exactly one feature point in play");
+        let span = plan[0].span;
+        assert_eq!(plan[0].freq, 1.0, "octave 0 is always its own reference frequency");
+        let offset = noise::seed_offset_3d(spec.seed_offset);
+        let lattice = spec.noise.lattice();
+        let ret = spec.noise.return_type();
+        let jitter = spec.noise.jitter();
+        let period = Vec3::new(span, span, 0.0);
+
+        // `sample_at`'s own `p(uv)` for a single octave (freq 1, so
+        // `offset * freq` is just `offset`) — see its `let p = ...`.
+        let sample_p =
+            |uv: Vec2| Vec3::new(uv.x * span + offset.x, uv.y * span + offset.y, offset.z);
+
+        // Any tile point names a cell; walk from its centre toward the
+        // second-nearest point until `d2 - d1` bottoms out, which is the
+        // Voronoi boundary by definition. Scanning rather than assuming the
+        // midpoint, because a jittered feature point is not symmetric around
+        // it — `fine()` runs jitter at 1.0.
+        let home = noise::cellular(sample_p(Vec2::new(0.5, 0.5)), lattice, ret, jitter, period);
+        let centre_uv = Vec2::new((home.f1.x - offset.x) / span, (home.f1.y - offset.y) / span);
+        let dir_xy = Vec2::new(home.f2.x - home.f1.x, home.f2.y - home.f1.y);
+        let dir_n = dir_xy.normalize();
+        let reach = dir_xy.length() * 1.5;
+
+        let steps = 300;
+        let (mut boundary_t, mut narrowest) = (0.0f32, f32::INFINITY);
+        for i in 1..steps {
+            let t = reach * i as f32 / steps as f32;
+            let uv = centre_uv + dir_n * (t / span);
+            let cs = noise::cellular(sample_p(uv), lattice, ret, jitter, period);
+            let gap = cs.d2 - cs.d1;
+            if gap < narrowest {
+                narrowest = gap;
+                boundary_t = t;
+            }
+        }
+        assert!(
+            narrowest < 0.05,
+            "no boundary found within {reach} units of the centre: closest gap was {narrowest}"
+        );
+
+        // 5% and 90% of the way from centre to boundary: solidly interior,
+        // and hugging the edge without crossing it.
+        let near_centre = centre_uv + dir_n * (0.05 * boundary_t / span);
+        let near_boundary = centre_uv + dir_n * (0.9 * boundary_t / span);
+
+        // Both probes have to still belong to `home` — the same nearest
+        // point — or the comparison below is two different cells' relief
+        // rather than one cell's centre against its own edge.
+        let still_home = |uv: Vec2| {
+            noise::cellular(sample_p(uv), lattice, ret, jitter, period)
+                .f1
+                .abs_diff_eq(home.f1, 1e-4)
+        };
+        assert!(still_home(near_centre), "{near_centre:?} crossed into the next cell");
+        assert!(still_home(near_boundary), "{near_boundary:?} crossed into the next cell");
+
+        let tilt = |uv: Vec2| {
+            let packed = spec.packed_normal_at(uv);
+            Vec2::new(packed.x * 2.0 - 1.0, packed.y * 2.0 - 1.0)
+        };
+        let (centre_lean, boundary_lean) = (tilt(near_centre).dot(dir_n), tilt(near_boundary).dot(dir_n));
+
+        // The claim: the normal leans *outward* — toward `dir_n`, the
+        // direction from the feature point to the sample — both deep inside
+        // the cell and hugging its boundary, and leans harder the closer it
+        // gets. The pre-fix bug would have failed the sign check outright,
+        // at either point.
+        assert!(centre_lean > 0.0, "near the centre the normal should already lean outward: {centre_lean:.4}");
+        assert!(boundary_lean > 0.0, "near the boundary the normal should lean outward too: {boundary_lean:.4}");
+        assert!(
+            boundary_lean > centre_lean,
+            "the outward lean should grow approaching the boundary: {centre_lean:.4} at centre vs {boundary_lean:.4} near the edge"
+        );
     }
 }

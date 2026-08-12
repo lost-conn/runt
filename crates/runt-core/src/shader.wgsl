@@ -145,6 +145,41 @@ struct VSOut {
     // varying cannot be conditional in WGSL and one more `vec2` interpolant is
     // below the noise floor of a pass that already passes two flat `vec4`s.
     @location(5) uv: vec2<f32>,
+    // The same point as `world_pos`, before the model matrix — the sampling
+    // basis `F_LOCAL_SPACE` swaps in so that a procedural pattern belongs to the
+    // object rather than to the world (`MaterialVariant::LOCAL_SPACE`).
+    //
+    // **Unconditional, and it cannot be otherwise.** The preprocessor's `F_*`
+    // are `const bool`s — values, not `#ifdef`s — and a struct member is not
+    // inside any control flow for a value to gate. WGSL has no conditional
+    // compilation, no `@location` attribute that takes a condition, and no
+    // `@must_use`-style pruning of an unread varying that the *interface*
+    // declares; so a varying is declared for every variant or for none. `uv`
+    // above is the same concession made for the same reason, and this one is the
+    // more expensive half of it: three interpolated floats on every draw in the
+    // engine, read by two variants.
+    //
+    // The two ways out are worse in kind, not merely in degree:
+    //
+    //   * **Reuse `world_pos`** — write the local point into it when the bit is
+    //     set and carry nothing new. It cannot be done: `shadow_factor` needs
+    //     the *world* point in the same fragment, and `F_SHADOW` is ORed onto
+    //     every lit draw by the renderer (`resolve_shadow_variant`), so a
+    //     local-space lit surface would look its shadow up in the wrong space
+    //     and acquire a self-shadow pattern that travels with it. One varying is
+    //     cheaper than that bug, and the bug would only appear once the shadow
+    //     gate was open.
+    //   * **Undo the transform in the fragment stage** — carry the model
+    //     matrix's four columns as `flat` varyings (sixteen floats, not three)
+    //     and invert per fragment, or upload a precomputed inverse and grow
+    //     `InstanceRaw` by 64 bytes per entity per frame. Both cost more than
+    //     the thing they avoid, and the vertex stage already has the
+    //     pre-transform position in a register.
+    //
+    // The varying budget is not close: this is location 6 of the sixteen `vec4`
+    // slots GLSL ES 3.00 guarantees, which is the downlevel target DESIGN §11
+    // holds the renderer to.
+    @location(6) local_pos: vec3<f32>,
 };
 
 @vertex
@@ -193,6 +228,12 @@ fn vs_main(
     // Y — i.e. weighted almost to nothing — and "where this fragment actually
     // is" is the only thing a shading input called `world_pos` can mean.
     out.world_pos = world.xyz;
+    // `local`, not `pos`: the *displaced* vertex, so that `local_pos` and
+    // `world_pos` are one point in two bases and never two points. A wave
+    // surface asking for `F_LOCAL_SPACE` would otherwise get a pattern that
+    // slides along the swell by exactly the displacement — the very artifact the
+    // bit exists to remove, reintroduced in the one variant that moves geometry.
+    out.local_pos = local;
     // Rotating the normal by the model matrix is exact for the uniform-scale
     // transforms the engine places entities with; non-uniform scale would want
     // the cofactor matrix (`cross` of the column pairs — no inverse needed).
@@ -394,7 +435,13 @@ fn live_sample(q: vec3<f32>, dqx: vec3<f32>, dqy: vec3<f32>, lod: vec2<f32>) -> 
             let dlen = length(d);
             var dir = vec3<f32>(0.0);
             if (dlen > 1.0e-4) {
-                dir = d / dlen;
+                // Negated: `d` points away from the nearest feature point, but
+                // dndx/dndy are a height gradient and cell centres are the
+                // relief's high points, so uphill is *toward* the feature
+                // point. See `TextureSpec::sample_at`'s matching comment in
+                // texture.rs for the full argument — the two are held to the
+                // same sign by `tests/live_texture.rs`.
+                dir = -d / dlen;
             }
             // Byte for byte the bake's weight — `amplitude · freq · edge · w ·
             // strength`. Only the *step* differs: the bake walks a fixed
@@ -616,6 +663,59 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         albedo = albedo * in.color;
     }
 
+    // ---- The sampling basis (`F_LOCAL_SPACE`) -----------------------------
+    //
+    // One decision, both texture paths. "Which point is this fragment sampling
+    // at" is a single question whether the answer goes on to index a triplanar
+    // tile (`F_TEXTURE`) or to be evaluated as a 3D field (`F_LIVE_TEX`), so it
+    // is asked once here rather than twice below — a second copy is a second
+    // thing to forget when a third texture path lands.
+    //
+    // World is the default and the original's (`MaterialVariant::TEXTURE`), and
+    // it is right for terrain: a hillside's grass should not restart at every
+    // brush boundary. It is wrong for anything that *moves*, because the pattern
+    // then belongs to the world and the surface travels through it — the
+    // "sliding marble" that kept the port's player untextured (see
+    // `MaterialVariant::LOCAL_SPACE`).
+    //
+    // A `const if` and not `select(in.world_pos, in.local_pos, F_LOCAL_SPACE)`.
+    // `select` is an expression and both of its arms survive into the emitted
+    // module for the backend to fold; a `const bool` branch is folded by naga
+    // before a backend sees it, so a draw without the bit generates the
+    // instructions it generated before this existed. That distinction is a scar,
+    // not a preference — `MaterialVariant::SHADOW` records a runtime branch
+    // around the key term moving lit pixels by one LSB *with its feature off*,
+    // purely by perturbing the driver's scheduling.
+    //
+    // # Feature size follows the object's scale, and that is the answer
+    //
+    // Local units are the model matrix's scale away from metres, so the same
+    // material on a 0.5× entity draws half-size features. Nothing here divides
+    // that out, and the reason is not cost — a `length(m0.xyz)` and a divide in
+    // the vertex stage would do it, per vertex, with no new instance data.
+    //
+    // It is that normalizing would make the picture on a mesh a function of the
+    // *instance* rather than of (mesh, material). Two entities sharing both would
+    // then wear two different pictures, and — the part that actually decides it —
+    // an entity **animating** its scale would have its pattern crawl across its
+    // own surface by exactly the scale ratio, frame over frame. That is the
+    // sliding artifact this bit exists to remove, reintroduced along the one axis
+    // world-space sampling never had a problem with. Raw local units are also the
+    // only definition that stays coherent under a *non-uniform* model matrix,
+    // where there is no single scale to divide by and picking one axis's would
+    // silently distort along the other two.
+    //
+    // So the contract is the strong, simple one: the pattern is painted on the
+    // mesh, and paint scales with the thing it is painted on. An author who wants
+    // metre-fixed feature size on a scaled object already has that — it is this
+    // bit turned off — and one who wants a different feature size for a
+    // particular material has `TextureSpec::world_scale`, which costs a re-bake
+    // and nothing else.
+    var p_source = in.world_pos;
+    if (F_LOCAL_SPACE) {
+        p_source = in.local_pos;
+    }
+
     // `F_LIVE_TEX` supersedes `F_TEXTURE`: live evaluates the spec and never
     // reads the bake, so running both would be one of them for nothing. The
     // draw list makes the two mutually exclusive (`draw::resolve_variant`);
@@ -626,17 +726,57 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         // fragment, in uniform control flow — because the octave loop may not
         // call `dpdx`/`dpdy` and would want the un-scaled world step anyway.
         // Exactly the hoist the baked path does for its `Grad`s.
+        //
+        // **Two pairs, and they are not interchangeable.** `dpx`/`dpy` span the
+        // pixel in *world* space and are what `perturb_normal` builds its
+        // tangent frame from — that frame is crossed with `n`, which is a world
+        // normal, so a local-space step there would mix two bases and lean the
+        // relief in a direction that rotates with the object. `dsx`/`dsy` span
+        // the pixel in the *sampling* basis and are what the height derivative
+        // needs, because `dndx` is `d(height)/d(screen x)` and the height is a
+        // function of `q`. Under `F_LOCAL_SPACE` the two differ by the model
+        // matrix's rotation and scale; without it they are the same expression
+        // and the const branch folds the second pair away entirely.
         let dpx = dpdx(in.world_pos);
         let dpy = dpdy(in.world_pos);
+        var dsx = dpx;
+        var dsy = dpy;
+        if (F_LOCAL_SPACE) {
+            dsx = dpdx(in.local_pos);
+            dsy = dpdy(in.local_pos);
+        }
 
         let cells_per_metre = tex.config.w;
-        let q = in.world_pos * cells_per_metre + tex.live_seed.xyz;
-        let dqx = dpx * cells_per_metre;
-        let dqy = dpy * cells_per_metre;
+        let q = p_source * cells_per_metre + tex.live_seed.xyz;
+        let dqx = dsx * cells_per_metre;
+        let dqy = dsy * cells_per_metre;
 
         // The mip substitute: how many octave-0 cells this pixel covers decides
         // how many octaves are worth evaluating (see `live_octave_window`).
-        let footprint = max(length(dqx), length(dqy));
+        // Combining the two screen axes into one scalar has three candidates:
+        //  - `max(len_x, len_y)` (what this was): never under-resolves either
+        //    axis, so it never aliases — but a surface at a grazing angle has
+        //    one axis's world-space derivative explode while the other stays
+        //    modest (the ground is nearly edge-on to the camera; a wall beside
+        //    it at the same distance is not), and `max` picks that worst axis
+        //    for *both*. The ground then loses every octave while the wall
+        //    keeps two, which is a fade that visibly disagrees between two
+        //    surfaces the player has no reason to think are different.
+        //  - `min(len_x, len_y)`: the opposite failure — sharp on the good axis
+        //    but keeps octaves the bad axis cannot resolve, which is exactly
+        //    the point-sampled shimmer a mip chain exists to prevent and this
+        //    window is the live path's only defence against.
+        //  - `sqrt(len_x * len_y)` (geometric mean): the standard anisotropic-
+        //    filtering compromise between the two — it under-blurs relative to
+        //    `max` and under-sharpens relative to `min`, on both axes at once,
+        //    which is why a mip selector reaches for it when it cannot afford a
+        //    true anisotropic footprint. Chosen here for the same reason.
+        // `max(len_x * len_y, 0.0)` guards a `sqrt` of a product that should
+        // never be negative (`length()` cannot return one) but would produce a
+        // NaN that propagates through the whole fBm sum if it ever were.
+        let len_x = length(dqx);
+        let len_y = length(dqy);
+        let footprint = sqrt(max(len_x * len_y, 0.0));
         let lod = live_octave_window(footprint, tex.live.x, tex.live.y);
 
         let r = live_sample(q, dqx, dqy, lod);
@@ -653,17 +793,40 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         let world_scale = tex.config.x;
         let sharpness = tex.config.y;
         let anti_tiling = tex.config.z > 0.5;
-        let p = in.world_pos * world_scale;
+        let p = p_source * world_scale;
         // The three planes' derivatives, taken here — at the top of the
         // fragment, in uniform control flow — because `dpdx`/`dpdy` may not be
         // called from inside the anti-tiling loop, and because the loop wants
         // the derivative of the *un-offset* UV anyway. `world_scale` is a
-        // uniform, so this is the world-space derivative scaled once.
+        // uniform, so this is the sampling basis's derivative scaled once — and
+        // it needs no `F_LOCAL_SPACE` case of its own, because it is taken from
+        // `p` and `p` is already in whichever basis the bit chose.
         let g_xy = Grad(dpdx(p.xy), dpdy(p.xy));
         let g_xz = Grad(dpdx(p.xz), dpdy(p.xz));
         let g_yz = Grad(dpdx(p.yz), dpdy(p.yz));
         // The weight-to-plane mapping is the original's: the Z-normal weight
         // drives the XY plane, Y drives XZ, X drives YZ.
+        //
+        // **This stays the world normal under `F_LOCAL_SPACE`, and that is a
+        // known and bounded incompleteness.** The plane *coordinates* above have
+        // moved into object space, so the pattern no longer slides — which is the
+        // artifact the bit exists to kill, and the dominant one. The plane
+        // *weights* have not, so a surface whose world normal turns will
+        // cross-fade between the three projections as it turns, which reads as a
+        // slow dissolve rather than as a slide. Translation is therefore exact
+        // (a moving platform, a carried boulder: the normal does not change), and
+        // rotation is exact for any turn that leaves `abs(n)` alone — a Z-spin of
+        // a +Z-facing sheet, which `tests/local_space.rs` measures.
+        //
+        // Fixing it wants a *second* interpolated `vec3` (the pre-transform
+        // normal) on every draw in the engine, and then the whiteout blend below
+        // would have to carry its per-plane offsets back into world space, which
+        // needs the model matrix's rotation in the fragment stage — the very
+        // thing `VSOut::local_pos`'s comment rejects. `F_LIVE_TEX` has no
+        // triplanar projection at all (a 3D field is defined everywhere), so the
+        // live path is exact under any rigid transform and is what a rotating
+        // object should ask for. That is a recommendation with a cost attached
+        // rather than a second varying spent on every draw for one case.
         let blend = triplanar_blend(n, sharpness);
 
         let c_xy = plane_tap(t_albedo, p.xy, g_xy, anti_tiling);

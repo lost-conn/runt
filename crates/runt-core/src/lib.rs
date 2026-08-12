@@ -837,6 +837,18 @@ impl Renderer {
         &self.textures
     }
 
+    /// The registry, mutably — for the doors that take one
+    /// ([`TextureRegistry::retain_baked`](bake::TextureRegistry::retain_baked),
+    /// [`remove`](bake::TextureRegistry::remove)).
+    ///
+    /// Residency itself is not reachable through here: making a texture resident
+    /// needs the device, the queue and the baker, which is
+    /// [`bake_texture`](Renderer::bake_texture)'s whole job. What this is for is
+    /// the other direction, where the registry alone is the thing that changes.
+    pub fn textures_mut(&mut self) -> &mut bake::TextureRegistry {
+        &mut self.textures
+    }
+
     /// Bake `spec` at `resolution` if it is not already resident, consulting
     /// (and filling) `store` on the way.
     ///

@@ -33,6 +33,8 @@ use runt_core::registry::{MeshHandle, MeshLibrary};
 use runt_core::texture::{self, TextureLibrary, TextureSpec, LIVE_LOD_CELL_PIXELS};
 use runt_core::{Lighting, MaterialVariant, NoopCache, Renderer};
 
+mod common;
+
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const SIZE: u32 = 256;
 
@@ -40,13 +42,13 @@ const SIZE: u32 = 256;
 ///
 /// Small on purpose: the pixel footprint has to stay well under the finest
 /// octave's cell so the live octave window leaves every octave at full weight
-/// (see the module docs). 2 m over 256 px against `grass`'s 0.087 m finest cell
+/// (see the module docs). 2 m over 256 px against the fine fixture's 0.087 m finest cell
 /// is roughly an order of magnitude of headroom.
 const SPAN: f32 = 2.0;
 
 /// The lower-left corner of the viewport in world space.
 ///
-/// The middle of `grass`'s 27.8 m tile, so that the *baked* comparison below
+/// The middle of the fine fixture's 27.8 m tile, so that the *baked* comparison below
 /// (`the_live_field_is_the_baked_field`) samples the tile's interior where the
 /// seamless wrap is the identity and the two fields must agree exactly.
 fn origin(spec: &TextureSpec) -> f32 {
@@ -283,7 +285,7 @@ fn the_probe_window_leaves_every_octave_on() {
     // compare against. If SPAN or SIZE ever moves far enough to break this, the
     // divergence tests would start failing for a reason that has nothing to do
     // with the shader.
-    for (name, spec) in [("grass", texture::grass()), ("rock", texture::rock())] {
+    for (name, spec) in common::both() {
         let footprint = SPAN / SIZE as f32 * spec.live_cells_per_metre();
         let (min, max) = spec.live_octave_window(footprint, LIVE_LOD_CELL_PIXELS);
         let last = spec.octave_plan().len() as f32 - 1.0;
@@ -310,16 +312,16 @@ fn the_live_field_is_the_baked_tile_where_the_wrap_is_the_identity() {
     // approximately — and that is only true because `live_seed_offset` folds
     // the offset back into the tile first.
     //
-    // `grass` is the material this holds for and `rock` is the one it cannot:
-    // rock's coarsest octave puts two cells across its tile, so the lattice
+    // `fine` is the fixture this holds for and `coarse` is the one it cannot:
+    // coarse's base octave puts two cells across its tile, so the lattice
     // neighbourhood spans the whole tile and the wrap is active everywhere.
     // Both are asserted, because "no window" is a fact about that material's
     // tiling and not a hole in this test.
-    let spec = texture::grass();
+    let spec = common::fine();
     let (lo, hi) = spec.live_agreement_window();
     assert!(
         hi.x - lo.x > 0.3 && hi.y - lo.y > 0.3,
-        "grass's agreement window collapsed to {lo:?}..{hi:?}"
+        "fine's agreement window collapsed to {lo:?}..{hi:?}"
     );
 
     const N: u32 = 64;
@@ -339,7 +341,7 @@ fn the_live_field_is_the_baked_tile_where_the_wrap_is_the_identity() {
     }
     let total = (N * N) as usize;
     println!(
-        "grass: agreement window {:.3}..{:.3} × {:.3}..{:.3} — \
+        "fine: agreement window {:.3}..{:.3} × {:.3}..{:.3} — \
          {differing}/{total} points differ at all, worst {worst:.5}",
         lo.x, hi.x, lo.y, hi.y
     );
@@ -356,7 +358,7 @@ fn the_live_field_is_the_baked_tile_where_the_wrap_is_the_identity() {
     // two; this is measuring how often the bake's precision shows.
     assert!(
         differing * 200 < total,
-        "grass: {differing}/{total} points differ; that is a different field, \
+        "fine: {differing}/{total} points differ; that is a different field, \
          not a boundary tail"
     );
     // A flip at octave 4 moves the fBm by its amplitude over the normalizing
@@ -365,16 +367,16 @@ fn the_live_field_is_the_baked_tile_where_the_wrap_is_the_identity() {
     // bit of a hash input.
     assert!(
         worst < 0.05,
-        "grass: worst difference {worst} is a coarse-octave flip, not a boundary"
+        "fine: worst difference {worst} is a coarse-octave flip, not a boundary"
     );
 
-    // rock's window is empty, and the arithmetic says so rather than the test
-    // quietly skipping it. A retune that gave rock a denser base octave would
+    // coarse's window is empty, and the arithmetic says so rather than the test
+    // quietly skipping it. A fixture with a denser base octave would
     // open one, and this line is where that would be noticed.
-    let (rlo, rhi) = texture::rock().live_agreement_window();
+    let (rlo, rhi) = common::coarse().live_agreement_window();
     assert!(
         rhi.x <= rlo.x,
-        "rock's base octave got denser; the window is now {rlo:?}..{rhi:?} and \
+        "the coarse fixture's base octave got denser; the window is now {rlo:?}..{rhi:?} and \
          this test should start checking it"
     );
 
@@ -399,7 +401,7 @@ fn both_modes_of_a_material_paint_the_same_colours() {
     // colours. A live path that had lost the ramp, drifted off the contrast
     // curve, or normalized its fBm differently would show up as a shifted mean
     // here even where a point-for-point comparison is impossible.
-    for (name, spec) in [("grass", texture::grass()), ("rock", texture::rock())] {
+    for (name, spec) in common::both() {
         let mean = |mut sample: Box<dyn FnMut(u32) -> Vec3>| {
             let mut sum = Vec3::ZERO;
             let mut lo = Vec3::splat(f32::MAX);
@@ -448,7 +450,7 @@ fn both_modes_of_a_material_paint_the_same_colours() {
         // Both stay inside the ramp the material authored. Not "the same
         // extremes": a tile is one wrapped period of the field and the live
         // window here is nine of them, so live legitimately reaches further
-        // into the ramp's ends — `rock`'s tile holds two cells of its coarsest
+        // into the ramp's ends — `coarse`'s tile holds two cells of its base
         // octave and simply cannot show the tails. What must hold is that
         // neither mode leaves the gradient, which is what the clamp before the
         // lookup is for.
@@ -476,7 +478,7 @@ fn live_eval_matches_the_cpu_twin() {
     let Some(mut renderer) = renderer() else {
         return;
     };
-    let spec = texture::grass();
+    let spec = common::fine();
     let pixels = render(&mut renderer, &spec, MaterialVariant::LIVE_TEX);
     let errors = divergence(&spec, &pixels, 4000);
     let (median, p99, max) = report("live WGSL vs CPU, 5 octaves (authored)", &errors);
@@ -523,7 +525,7 @@ fn live_eval_matches_the_cpu_twin_on_a_two_octave_spec() {
     };
     let spec = TextureSpec {
         octaves: 2,
-        ..texture::grass()
+        ..common::fine()
     };
     let pixels = render(&mut renderer, &spec, MaterialVariant::LIVE_TEX);
     let errors = divergence(&spec, &pixels, 4000);
@@ -533,17 +535,17 @@ fn live_eval_matches_the_cpu_twin_on_a_two_octave_spec() {
 }
 
 #[test]
-fn live_eval_matches_the_cpu_twin_for_rock() {
-    // `rock` is the other authored material and it differs in every way that
+fn live_eval_matches_the_cpu_twin_for_the_coarse_fixture() {
+    // The coarse fixture differs from the fine one in every way that
     // matters to this code path: `ToEdge` normals, a different lattice density,
     // and a lacunarity that quantizes badly enough to bend the octave window.
     let Some(mut renderer) = renderer() else {
         return;
     };
-    let spec = texture::rock();
+    let spec = common::coarse();
     let pixels = render(&mut renderer, &spec, MaterialVariant::LIVE_TEX);
     let errors = divergence(&spec, &pixels, 4000);
-    let (median, p99, _) = report("live WGSL vs CPU, rock", &errors);
+    let (median, p99, _) = report("live WGSL vs CPU, coarse", &errors);
     assert!(median <= 1.0 / 255.0, "median {median}");
     assert!(p99 <= 2.0 / 255.0, "p99 {p99}");
 }
@@ -558,7 +560,7 @@ fn the_live_normal_perturbs_without_changing_the_albedo() {
     let Some(mut renderer) = renderer() else {
         return;
     };
-    let spec = texture::grass();
+    let spec = common::fine();
     let plain = render(&mut renderer, &spec, MaterialVariant::LIVE_TEX);
     let crinkled = render(
         &mut renderer,
@@ -576,7 +578,7 @@ fn the_live_normal_actually_bends_the_light() {
     let Some(mut renderer) = renderer() else {
         return;
     };
-    let spec = texture::rock();
+    let spec = common::coarse();
     let o = origin(&spec);
 
     let mut library = MeshLibrary::new();
@@ -674,7 +676,7 @@ fn the_octave_window_closes_as_the_footprint_grows() {
     // of an octave-0 cell resolves every octave; a pixel covering ten cells
     // resolves none of them, and the window says so rather than evaluating five
     // Voronoi loops of noise the screen cannot show.
-    let spec = texture::grass();
+    let spec = common::fine();
     let octaves = spec.octave_plan().len();
 
     let close = spec.live_octave_window(0.001, LIVE_LOD_CELL_PIXELS);
@@ -684,9 +686,18 @@ fn the_octave_window_closes_as_the_footprint_grows() {
     );
 
     let far = spec.live_octave_window(10.0, LIVE_LOD_CELL_PIXELS);
+    // Not "resolves nothing": `top` floors at `1.0` so octave 0 never fades,
+    // however large the footprint gets (see the doc comment on
+    // `TextureSpec::live_octave_window` for the arithmetic). A pixel covering
+    // ten cells lands on the floor and keeps exactly one octave.
     assert!(
-        far.1 <= 0.0,
-        "a pixel covering ten cells resolves nothing, got {far:?}"
+        (far.1 - 1.0).abs() < 1e-5,
+        "a pixel covering ten cells should floor at exactly one octave, got {far:?}"
+    );
+    assert_eq!(
+        runt_core::noise::octave_weight(0, far.0, far.1),
+        1.0,
+        "the floored window must still give octave 0 full weight"
     );
 
     // Monotone in between, and the fade is exactly one octave wide so it can
@@ -708,12 +719,65 @@ fn the_octave_window_closes_as_the_footprint_grows() {
 }
 
 #[test]
+fn a_grazing_angle_keeps_more_octaves_under_the_geometric_mean_than_under_max() {
+    // `shader.wgsl`'s `F_LIVE_TEX` branch used to combine a fragment's two
+    // screen axes with `max(length(dqx), length(dqy))`. `dqx`/`dqy` are
+    // `dpdx`/`dpdy` of the world position scaled to cells-per-metre, and a
+    // surface seen edge-on has one axis's derivative explode while the other
+    // stays modest — the ground is nearly edge-on to the camera at distance,
+    // an adjacent wall is not. `max` picked the exploded axis for both, so the
+    // ground lost every octave while the wall beside it kept two: the
+    // non-uniform fade this fixes. The replacement, `sqrt(len_x * len_y)`, is
+    // the geometric mean.
+    //
+    // There is no separate WGSL-only combiner function to call from Rust — the
+    // combining happens inline in `shader.wgsl` because only the fragment
+    // shader has screen derivatives to combine — so this pins the *effect* on
+    // the CPU twin of what it feeds: `TextureSpec::live_octave_window` takes
+    // whichever scalar footprint the combiner produced, and a gentler
+    // footprint must resolve a strictly wider window.
+    let spec = common::fine();
+
+    // A 100:1 aspect ratio: one axis nearly resolved (a fine `dqx`), the other
+    // blown out (a coarse `dqy`) — the grazing-angle shape the bug report
+    // described. Kept small in absolute terms (rather than, say, 0.05/5.0) so
+    // neither combiner's window has already hit fix (1)'s octave-0 floor —
+    // that floor guarantees a *minimum* window, and this test is about the
+    // combiner widening it well past that minimum, not about the floor doing
+    // the work.
+    let (len_x, len_y) = (0.001_f32, 0.1_f32);
+    let max_footprint = len_x.max(len_y);
+    let mean_footprint = (len_x * len_y).sqrt();
+    assert!(
+        mean_footprint < max_footprint,
+        "sanity: the geometric mean must sit strictly between min and max"
+    );
+
+    let (_, max_top) = spec.live_octave_window(max_footprint, LIVE_LOD_CELL_PIXELS);
+    let (_, mean_top) = spec.live_octave_window(mean_footprint, LIVE_LOD_CELL_PIXELS);
+    println!(
+        "max combiner: footprint {max_footprint} -> window top {max_top:.3}; \
+         geometric mean: footprint {mean_footprint} -> window top {mean_top:.3}"
+    );
+    assert!(
+        max_top > 1.0 && mean_top > 1.0,
+        "sanity: this comparison is only meaningful above the octave-0 floor, got \
+         max {max_top:.3}, mean {mean_top:.3}"
+    );
+    assert!(
+        mean_top > max_top + 1.0,
+        "the geometric mean should resolve at least one more octave than max at a 100:1 \
+         aspect ratio: {mean_top:.3} vs {max_top:.3}"
+    );
+}
+
+#[test]
 fn a_faded_out_fragment_still_lands_inside_the_ramp() {
     // The fBm normalization divides by the amplitude actually used, so dropping
     // octaves must cost detail and never brightness (`noise::FbmAccum`). At
     // one octave the field is coarser; it is not darker, and it is not outside
     // the ramp. That is what lets the window fade without a visible band.
-    let spec = texture::grass();
+    let spec = common::fine();
     let full = spec.live_albedo_at(Vec3::new(13.0, 9.0, 0.0));
     let ramp_min = spec.ramp.iter().map(|(_, c)| c.y).fold(f32::MAX, f32::min);
     let ramp_max = spec.ramp.iter().map(|(_, c)| c.y).fold(0.0f32, f32::max);
@@ -721,7 +785,7 @@ fn a_faded_out_fragment_still_lands_inside_the_ramp() {
 
     let coarse = TextureSpec {
         octaves: 1,
-        ..texture::grass()
+        ..common::fine()
     };
     let one = coarse.live_albedo_at(Vec3::new(13.0, 9.0, 0.0));
     assert!(one.y >= ramp_min - 1e-5 && one.y <= ramp_max + 1e-5, "{one:?}");

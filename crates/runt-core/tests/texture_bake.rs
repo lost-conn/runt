@@ -1,7 +1,7 @@
 //! The texture bake pass, on a real GPU (DESIGN §7).
 //!
 //! The load-bearing test here is `the_bake_matches_the_cpu_twin`: it renders
-//! grass with the WGSL library and holds real texels against
+//! a fixture spec with the WGSL library and holds real texels against
 //! `runt_core::texture`'s Rust evaluator. That is the same contract
 //! `headless_screenshot.rs` enforces between `sky.wgsl` and `sky.rs` — change
 //! one copy of the noise and the other goes red — and it is what makes the CPU
@@ -13,8 +13,10 @@
 //! timings at 512/1024/2048 and the measured WGSL-vs-CPU divergence.
 
 use glam::Vec2;
-use runt_core::texture::{self, TextureSpec};
+use runt_core::texture::TextureSpec;
 use runt_core::{NoopCache, Renderer};
+
+mod common;
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
@@ -118,7 +120,7 @@ fn the_bake_matches_the_cpu_twin() {
     let spec = TextureSpec {
         octaves: 2,
         base_resolution: N,
-        ..texture::grass()
+        ..common::fine()
     };
     let (albedo, _) = bake(&mut renderer, &spec, N);
     let errors = albedo_divergence(&spec, &albedo, N, 4000);
@@ -153,7 +155,7 @@ fn the_full_octave_stack_agrees_where_it_is_sampled() {
     const N: u32 = 256;
     let spec = TextureSpec {
         base_resolution: N,
-        ..texture::grass()
+        ..common::fine()
     };
     let (albedo, _) = bake(&mut renderer, &spec, N);
     let errors = albedo_divergence(&spec, &albedo, N, 4000);
@@ -190,7 +192,7 @@ fn the_normal_map_matches_the_cpu_twin() {
     const N: u32 = 128;
     let spec = TextureSpec {
         base_resolution: N,
-        ..texture::rock()
+        ..common::coarse()
     };
     let (_, normal) = bake(&mut renderer, &spec, N);
 
@@ -227,7 +229,7 @@ fn a_normal_free_spec_bakes_a_flat_normal_map() {
     let spec = TextureSpec {
         normal: None,
         base_resolution: N,
-        ..texture::grass()
+        ..common::fine()
     };
     let (_, normal) = bake(&mut renderer, &spec, N);
     for y in (0..N).step_by(9) {
@@ -251,7 +253,7 @@ fn baking_twice_is_bit_identical() {
     const N: u32 = 128;
     let spec = TextureSpec {
         base_resolution: N,
-        ..texture::grass()
+        ..common::fine()
     };
 
     let (a_albedo, a_normal) = bake(&mut renderer, &spec, N);
@@ -278,7 +280,7 @@ fn the_baked_tile_is_seamless_at_the_wrap() {
     const N: u32 = 256;
     let spec = TextureSpec {
         base_resolution: N,
-        ..texture::grass()
+        ..common::fine()
     };
     let (albedo, _) = bake(&mut renderer, &spec, N);
 
@@ -314,7 +316,7 @@ fn two_qualities_share_an_identity_but_not_a_bake() {
     let Some(mut renderer) = renderer() else {
         return;
     };
-    let spec = texture::grass();
+    let spec = common::fine();
 
     // DESIGN §7/§11: the tier picks the *resolution*, and a texture's content is
     // scale-free, so the spec's identity must not move with it.
@@ -361,7 +363,7 @@ fn baking_is_idempotent_per_handle() {
     let Some(mut renderer) = renderer() else {
         return;
     };
-    let spec = texture::grass();
+    let spec = common::fine();
     let a = renderer.bake_texture(&spec, 128, &NoopCache);
     let b = renderer.bake_texture(&spec, 128, &NoopCache);
     assert_eq!(a, b);
@@ -399,7 +401,7 @@ fn a_bake_carries_a_full_chain_down_to_one_texel() {
     const N: u32 = 256;
     let spec = TextureSpec {
         base_resolution: N,
-        ..texture::rock()
+        ..common::coarse()
     };
     let handle = renderer.bake_texture(&spec, N, &NoopCache);
     let gpu = renderer.textures().get(handle).expect("just baked");
@@ -442,7 +444,7 @@ fn every_albedo_mip_is_the_box_average_of_the_level_above() {
     const N: u32 = 128;
     let spec = TextureSpec {
         base_resolution: N,
-        ..texture::rock()
+        ..common::coarse()
     };
     let handle = renderer.bake_texture(&spec, N, &NoopCache);
     let gpu = renderer.textures().get(handle).expect("just baked");
@@ -494,7 +496,7 @@ fn every_normal_mip_is_a_unit_vector_pointing_the_average_way() {
     const N: u32 = 128;
     let spec = TextureSpec {
         base_resolution: N,
-        ..texture::rock()
+        ..common::coarse()
     };
     let handle = renderer.bake_texture(&spec, N, &NoopCache);
     let gpu = renderer.textures().get(handle).expect("just baked");
@@ -545,7 +547,7 @@ fn bake_timings_at_every_tier() {
     let Some(mut renderer) = renderer() else {
         return;
     };
-    let spec = texture::grass();
+    let spec = common::fine();
     for resolution in [512u32, 1024, 2048] {
         let mut spec = spec.clone();
         // A distinct seed per size, so nothing is served out of the registry.

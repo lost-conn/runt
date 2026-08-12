@@ -139,6 +139,53 @@ impl Engine {
         );
     }
 
+    /// Drop every resident bake the scene's
+    /// [`TextureLibrary`](crate::texture::TextureLibrary) no longer lists;
+    /// returns how many went.
+    ///
+    /// The inverse of [`bake_scene_textures`](Engine::bake_scene_textures), and
+    /// the other half of treating the registry as a *cache* of the library
+    /// rather than a second record of it: that call makes the library's entries
+    /// resident, this one makes residency stop where the library does.
+    ///
+    /// # Why it is a reconcile and not an eviction call
+    ///
+    /// Baked handles are content addresses, so an entry is never wrong, only
+    /// unreferenced — and what references a texture is the world, which the
+    /// library is the declaration of. So the caller does not name what to drop;
+    /// it edits the library (`remove`/`retain`) and calls this, and the two can
+    /// never disagree about which bakes are wanted. Atlases and render targets
+    /// are not in the library at all and are protected by provenance rather than
+    /// by this method remembering to skip them — see
+    /// [`TextureOrigin`](crate::bake::TextureOrigin).
+    ///
+    /// # When to call it
+    ///
+    /// After anything that supersedes a spec — which today means live authoring,
+    /// where a slider drag mints a fresh handle per value and leaves the
+    /// previous bake resident with nothing pointing at it. Not on a schedule and
+    /// not every frame: it is O(resident textures) and a scene that never edits a
+    /// spec has nothing for it to find.
+    ///
+    /// Getting it wrong costs a fragment pass, never a wrong frame. A draw whose
+    /// texture was swept re-bakes it lazily to byte-identical pixels
+    /// ([`TextureRegistry::retain_baked`](crate::bake::TextureRegistry::retain_baked)
+    /// argues that in full).
+    pub fn sweep_baked_textures(&mut self) -> usize {
+        let Engine { sim, renderer, .. } = self;
+        let library = sim.texture_library();
+        let dropped = renderer
+            .textures_mut()
+            .retain_baked(|handle| library.contains(handle));
+        if dropped > 0 {
+            log::info!(
+                "swept {dropped} superseded bake(s), {} resident",
+                renderer.textures().len()
+            );
+        }
+        dropped
+    }
+
     /// Whether textured draws evaluate their spec per pixel (DESIGN §7's live
     /// path) instead of sampling its bake.
     pub fn live_textures(&self) -> bool {

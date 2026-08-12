@@ -26,9 +26,9 @@ const SIZE: u32 = 384;
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_textured_scene_parses_and_says_what_the_port_spec_says() {
+fn the_textured_scene_says_what_its_own_comments_say() {
     let desc = scene::textured_scene();
-    assert_eq!(desc.textures.len(), 2, "grass and rock");
+    assert_eq!(desc.textures.len(), 2, "the demo scene's two surfaces");
 
     let by_name = |name: &str| {
         desc.textures
@@ -39,10 +39,39 @@ fn the_textured_scene_parses_and_says_what_the_port_spec_says() {
             .clone()
     };
 
-    // The file and `runt_core::texture`'s reference data must agree, or one of
-    // them is a lie. Both are ports of the same authored Godot material.
-    assert_eq!(by_name("grass"), texture::grass());
-    assert_eq!(by_name("rock"), texture::rock());
+    // This used to compare the file against `texture::grass()` and
+    // `texture::rock()` — two `pub fn`s the engine shipped, on the argument that
+    // a scene file naming them made them reference data. They are gone: the
+    // engine defines texture *types* and a game defines their uniforms, so the
+    // only copy of these numbers on this side of the line is the file itself,
+    // and what is worth asserting is that the file agrees with the prose written
+    // beside it. A .ron whose comment says `frequency 0.21` and whose value says
+    // otherwise is the failure this catches, and it is the one that used to hide
+    // behind the two being compared to each other.
+    let grass = by_name("grass");
+    assert_eq!(grass.frequency, 0.21);
+    assert_eq!(grass.octaves, 5);
+    assert_eq!(grass.gain, 0.562);
+    assert_eq!(grass.world_scale, 0.036);
+    assert_eq!(grass.base_resolution, 1024);
+    assert_eq!(grass.ramp.len(), 3);
+    let gn = grass.normal.expect("the floor is crinkled");
+    assert_eq!(gn.edge_width, 0.52);
+    assert_eq!(gn.strength, 5.106);
+
+    let rock = by_name("rock");
+    assert_eq!(rock.frequency, 0.046);
+    assert_eq!(rock.octaves, 5);
+    assert_eq!(rock.gain, 0.543);
+    assert_eq!(rock.world_scale, 0.025);
+    assert_eq!(rock.triplanar_sharpness, 1.0);
+    let rn = rock.normal.expect("stone is faceted");
+    assert_eq!(rn.edge_width, 0.351);
+    assert_eq!(rn.strength, 29.605);
+
+    // …and the two are different surfaces, which is the only thing about them
+    // the *engine* has an opinion on: one bake each.
+    assert_ne!(grass.param_key(), rock.param_key());
 }
 
 #[test]
@@ -91,7 +120,13 @@ fn a_material_without_a_texture_keeps_the_variant_it_always_had() {
 
 #[test]
 fn naming_a_texture_sets_the_bits_and_carrying_the_handle() {
-    let handle = runt_core::TextureHandle(texture::grass().content_key(512));
+    let grass = scene::textured_scene()
+        .textures
+        .into_iter()
+        .find(|t| t.name == "grass")
+        .expect("the demo scene's floor")
+        .spec;
+    let handle = runt_core::TextureHandle(grass.content_key(512));
 
     let with_normals = MaterialDesc {
         texture: Some("grass".into()),
@@ -511,6 +546,145 @@ fn a_second_render_changes_nothing_about_residency() {
 }
 
 #[test]
+fn a_sweep_drops_the_bake_a_spec_edit_superseded_and_nothing_else() {
+    // The live-authoring lifecycle at the GPU. Editing a spec cannot mutate a
+    // bake in place — the handle *is* the params — so an edit leaves the old
+    // texture pair resident with nothing pointing at it, and a slider drag is
+    // dozens of those. `Engine::sweep_baked_textures` is the reconcile that
+    // stops it being a leak, and this pins the two claims that make it safe to
+    // call: it drops exactly what the library stopped listing, and it cannot
+    // touch a texture it could not re-bake.
+    let Some(mut engine) = pollster::block_on(Engine::headless_with_config(
+        FORMAT,
+        SimConfig::default().with_scene(runt_core::TEXTURED_SCENE_RON),
+    ))
+    .ok() else {
+        eprintln!("SKIP (no GPU adapter)");
+        return;
+    };
+    assert_eq!(engine.renderer().textures().len(), 2, "grass and rock, baked");
+
+    // Nothing has been superseded, so a sweep is a no-op — the registry and the
+    // library already agree.
+    assert_eq!(engine.sweep_baked_textures(), 0);
+    assert_eq!(engine.renderer().textures().len(), 2);
+
+    // An atlas and a render target, neither of which the library knows about.
+    // The atlas is the load-bearing one: its handle is content-shaped, so only
+    // provenance separates it from a bake.
+    let atlas = runt_core::TextureHandle(0x5151_5151);
+    let (device, queue) = (engine.device().clone(), engine.queue().clone());
+    engine
+        .renderer_mut()
+        .textures_mut()
+        .insert_image(&device, &queue, atlas, 1, 1, &[9, 9, 9, 255]);
+    let target_handle = runt_core::TextureHandle::render_target(7);
+    let color = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 8,
+            height: 8,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    engine
+        .renderer_mut()
+        .textures_mut()
+        .insert_render_target(&device, &queue, target_handle, color);
+    assert_eq!(engine.renderer().textures().len(), 4);
+
+    // Now the edit: one spec gains a contrast nudge, so it is a new handle, and
+    // the entry it replaced comes out of the library.
+    let (old_handle, edited, resolution) = {
+        let library = engine.sim().texture_library();
+        let (handle, spec, resolution) = library.iter().next().expect("two entries");
+        (
+            handle,
+            TextureSpec {
+                contrast: spec.contrast + 0.25,
+                ..spec.clone()
+            },
+            resolution,
+        )
+    };
+    let new_handle = {
+        let mut library = engine
+            .sim_mut()
+            .world_mut()
+            .resource_mut::<TextureLibrary>();
+        let new_handle = library.insert(edited, resolution);
+        assert!(library.remove(old_handle));
+        new_handle
+    };
+    assert_ne!(new_handle, old_handle);
+
+    // The superseded bake is still resident (nothing has swept yet) and the new
+    // one is not (nothing has drawn it yet) — which is exactly the state the
+    // sweep exists for.
+    assert!(engine.renderer().textures().contains(old_handle));
+    assert!(!engine.renderer().textures().contains(new_handle));
+
+    assert_eq!(engine.sweep_baked_textures(), 1, "one superseded bake");
+    assert!(!engine.renderer().textures().contains(old_handle));
+    assert!(
+        engine.renderer().textures().contains(atlas),
+        "the sweep ate an atlas it cannot rebuild"
+    );
+    assert!(
+        engine.renderer().textures().contains(target_handle),
+        "the sweep ate a live render target"
+    );
+    assert_eq!(engine.renderer().textures().len(), 3);
+
+    // And it is idempotent: the two records agree again.
+    assert_eq!(engine.sweep_baked_textures(), 0);
+}
+
+#[test]
+fn a_swept_texture_rebakes_to_the_same_pixels() {
+    // Why being wrong about a sweep costs a fragment pass and never a frame: a
+    // dropped bake is a content address that is still true, so resolving it
+    // again is byte-identical rather than merely similar.
+    let Some(mut engine) = pollster::block_on(Engine::headless_with_config(
+        FORMAT,
+        SimConfig::default().with_scene(runt_core::TEXTURED_SCENE_RON),
+    ))
+    .ok() else {
+        eprintln!("SKIP (no GPU adapter)");
+        return;
+    };
+    let (handle, spec, resolution) = {
+        let library = engine.sim().texture_library();
+        let (handle, spec, resolution) = library.iter().next().expect("a texture");
+        (handle, spec.clone(), resolution)
+    };
+    let read = |engine: &Engine| {
+        let gpu = engine.renderer().textures().get(handle).expect("resident");
+        runt_core::bake::read_target(engine.device(), engine.queue(), &gpu.albedo, resolution)
+            .expect("read the albedo back")
+    };
+    let first = read(&engine);
+
+    // Evict it behind the library's back — the library still lists it, so this
+    // is the "swept something that was still wanted" case rather than a
+    // reconcile.
+    assert!(engine.renderer_mut().textures_mut().remove(handle));
+    assert!(!engine.renderer().textures().contains(handle));
+
+    let again = engine
+        .renderer_mut()
+        .bake_texture(&spec, resolution, &runt_core::NoopCache);
+    assert_eq!(again, handle, "the content key did not round-trip");
+    assert_eq!(read(&engine), first, "the re-bake is not the same pixels");
+}
+
+#[test]
 fn the_untextured_demo_scene_still_binds_nothing() {
     // The other half of the compatibility claim, at the GPU: loading the
     // *demo* scene must leave the texture registry empty, so a scene that does
@@ -524,17 +698,22 @@ fn the_untextured_demo_scene_still_binds_nothing() {
 }
 
 #[test]
-fn a_spec_out_of_a_scene_file_bakes_to_the_same_pixels_as_the_reference() {
-    // The file and `texture::grass()` are the same spec (asserted above), so
-    // they must be the same *bake* — this catches a scene-file drift that the
-    // structural comparison would not, e.g. a field that serializes lossily.
+fn a_spec_out_of_a_scene_file_bakes_to_the_same_pixels_as_one_built_in_code() {
+    // A spec that came through RON and the identical spec built in Rust must be
+    // the same *bake* — which catches the failure a structural `assert_eq!`
+    // cannot see: a field that serializes lossily, so that two specs comparing
+    // equal as values disagree as pixels.
     let a = scene::textured_scene()
         .textures
         .into_iter()
         .find(|t| t.name == "grass")
         .expect("grass")
         .spec;
-    let b: TextureSpec = texture::grass();
+    // Round-trip it in code rather than comparing to a hand-written twin: the
+    // engine no longer ships a spec to compare against, and the claim is about
+    // the *encoding*, so re-encoding is the sharper test of it.
+    let b: TextureSpec = ron::from_str(&ron::ser::to_string(&a).expect("encode")).expect("decode");
+    assert_eq!(a, b, "a spec did not survive its own encoding");
     assert_eq!(a.content_key(512), b.content_key(512));
     assert_eq!(a.octave_plan(), b.octave_plan());
     assert_eq!(a.albedo_at(Vec2::new(0.31, 0.62)), b.albedo_at(Vec2::new(0.31, 0.62)));

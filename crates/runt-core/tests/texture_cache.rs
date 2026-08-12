@@ -22,8 +22,10 @@ use std::sync::Mutex;
 
 use runt_core::bake::TextureData;
 use runt_core::cache::{CacheStore, NativeDiskCache, NoopCache};
-use runt_core::texture::{self, TextureSpec};
+use runt_core::texture::TextureSpec;
 use runt_core::Renderer;
+
+mod common;
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Small enough that a handful of bakes and readbacks stay quick, large enough
@@ -43,7 +45,7 @@ fn renderer() -> Option<Renderer> {
 fn spec() -> TextureSpec {
     TextureSpec {
         base_resolution: RES,
-        ..texture::grass()
+        ..common::fine()
     }
 }
 
@@ -221,11 +223,12 @@ fn an_entry_that_does_not_match_its_spec_is_refused() {
     let store = Recording::default();
     let spec = spec();
 
-    // File *rock* under *grass*'s key: the right size, the wrong material. A
+    // File the *coarse* fixture under the *fine* one's key: the right size,
+    // the wrong spec. A
     // store is untrusted input, and a key collision must not repaint terrain.
     let wrong = TextureSpec {
         base_resolution: RES,
-        ..texture::rock()
+        ..common::coarse()
     };
     let handle = runt_core::TextureHandle(spec.content_key(RES));
     store.store_texture(
@@ -434,7 +437,7 @@ fn the_disk_store_round_trips_an_entry() {
     assert!(!back.matches(&spec(), 8), "resolution is part of the match");
     assert_eq!(back.albedo.len(), 3, "4x4 is three levels");
     assert!(
-        !back.matches(&texture::rock(), 4),
+        !back.matches(&common::coarse(), 4),
         "the spec is part of the match"
     );
 

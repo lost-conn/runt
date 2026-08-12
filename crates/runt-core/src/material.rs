@@ -280,6 +280,46 @@ impl MaterialVariant {
     /// [`TEXTURE`]: MaterialVariant::TEXTURE
     /// [`UNLIT`]: MaterialVariant::UNLIT
     pub const SHADOW: MaterialVariant = MaterialVariant(1 << 14);
+    /// Sample the procedural texture in the entity's **own** space instead of
+    /// the world's: the pattern is painted on the object and travels with it.
+    ///
+    /// Both texture paths honour it and there is exactly one decision in the
+    /// shader — `shader.wgsl`'s `p_source` — because "which point are we
+    /// sampling at" is one question whether the answer feeds a triplanar tile
+    /// lookup ([`TEXTURE`]) or a per-pixel field evaluation ([`LIVE_TEX`]).
+    ///
+    /// # The read it exists to fix
+    ///
+    /// Without it a moving textured object is a hole cut in a pattern nailed to
+    /// the world, and the pattern slides across the surface as the object goes
+    /// past — the "sliding marble". The port's player is the standing case:
+    /// `3dimenshift-runt/shift/src/model.rs`'s `spawn` doc comment records that
+    /// the ball was left untextured for exactly this reason and that
+    /// `model.rs`'s `mottled()` — a hashed patch brightness baked into vertex
+    /// colours — is the stand-in it settled for. Carried boulders and moving
+    /// platforms are the same problem with fewer axes.
+    ///
+    /// # What it costs
+    ///
+    /// One interpolated `vec3` on **every** draw, including the ones that never
+    /// read it, because a WGSL varying cannot be conditional — see `VSOut`'s
+    /// `local_pos` in `shader.wgsl` for the whole argument and for why reusing
+    /// `world_pos` was rejected. The fragment side is free: the basis choice is
+    /// a `const` branch that folds, so a draw without the bit compiles to the
+    /// instructions it always had.
+    ///
+    /// # Feature size scales with the object, on purpose
+    ///
+    /// Object-local units are the model matrix's scale away from metres, so the
+    /// same material on a half-scale entity gets half-size features. That is
+    /// kept rather than divided out; `shader.wgsl`'s `p_source` comment carries
+    /// the argument, the short form of which is that normalizing would make the
+    /// picture on a mesh a function of the *instance*, and an entity animating
+    /// its scale would then slide along the axis this bit exists to nail down.
+    ///
+    /// [`TEXTURE`]: MaterialVariant::TEXTURE
+    /// [`LIVE_TEX`]: MaterialVariant::LIVE_TEX
+    pub const LOCAL_SPACE: MaterialVariant = MaterialVariant(1 << 15);
 
     /// Every declared flag, with the WGSL `const` it maps to. The order here is
     /// the order the preprocessor emits, so generated sources are stable.
@@ -289,7 +329,7 @@ impl MaterialVariant {
     /// `F_TWO_SIDED`: this list is the *declaration* of the key space, and a bit
     /// missing from it would be a key the preprocessor silently could not
     /// describe.
-    pub const FLAGS: [(&'static str, MaterialVariant); 15] = [
+    pub const FLAGS: [(&'static str, MaterialVariant); 16] = [
         ("F_VERTEX_COLOR", MaterialVariant::VERTEX_COLOR),
         ("F_TEXTURE", MaterialVariant::TEXTURE),
         ("F_RAMP", MaterialVariant::RAMP),
@@ -305,6 +345,7 @@ impl MaterialVariant {
         ("F_VERTEX_WAVE", MaterialVariant::VERTEX_WAVE),
         ("F_TWO_SIDED", MaterialVariant::TWO_SIDED),
         ("F_SHADOW", MaterialVariant::SHADOW),
+        ("F_LOCAL_SPACE", MaterialVariant::LOCAL_SPACE),
     ];
 
     /// The two blend bits, as one mask: the draws that leave the opaque
@@ -328,7 +369,8 @@ impl MaterialVariant {
             | MaterialVariant::EMISSIVE_SWEEP.0
             | MaterialVariant::VERTEX_WAVE.0
             | MaterialVariant::TWO_SIDED.0
-            | MaterialVariant::SHADOW.0,
+            | MaterialVariant::SHADOW.0
+            | MaterialVariant::LOCAL_SPACE.0,
     );
 
     /// The four bits that each *replace* the lighting term rather than feeding

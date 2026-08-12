@@ -211,7 +211,7 @@ pub struct TextureUniform {
     /// octave plan is — so the shader has no rounding rule of its own.
     pub config: [f32; 4],
     /// x: `log2` of the quantized lacunarity, y:
-    /// [`LIVE_LOD_CELL_PIXELS`](crate::texture::LIVE_LOD_CELL_PIXELS), zw: pad.
+    /// [`TextureSpec::live_cell_pixels`], zw: pad.
     pub live: [f32; 4],
     /// xyz: [`TextureSpec::live_seed_offset`], w: pad.
     ///
@@ -236,7 +236,7 @@ impl TextureUniform {
             ],
             live: [
                 spec.log2_lacunarity(),
-                crate::texture::LIVE_LOD_CELL_PIXELS,
+                spec.live_cell_pixels,
                 0.0,
                 0.0,
             ],
@@ -751,6 +751,37 @@ pub fn read_chain(
 // The GPU registry
 // ---------------------------------------------------------------------------
 
+/// Which door a resident texture came in through — and therefore who is allowed
+/// to evict it.
+///
+/// The registry holds three unrelated lifetimes under one handle space, and
+/// until this existed it could not tell them apart. That was fine while nothing
+/// evicted anything; it stops being fine the moment a sweep wants to drop
+/// superseded bakes, because a predicate over bare handles would cheerfully
+/// throw away the font atlas ([`TextureRegistry::insert_image`] hands out
+/// ordinary content-shaped handles) along with them.
+///
+/// So provenance is recorded at insert time rather than guessed at eviction
+/// time. [`TextureHandle::is_reserved`] separates render targets from the rest
+/// and would have covered *that* case on its own; it says nothing about the
+/// other two, which is the whole reason for the enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextureOrigin {
+    /// [`TextureRegistry::resolve`] baked it from a
+    /// [`TextureSpec`](crate::texture::TextureSpec) — so the
+    /// [`TextureLibrary`](crate::texture::TextureLibrary) is its declaration and
+    /// re-baking it is always possible. The only kind a sweep may drop.
+    Baked,
+    /// [`TextureRegistry::insert_image`] uploaded pixels the caller already had
+    /// (a UI or font atlas). Nothing in the engine can reconstruct them, so
+    /// only whoever supplied them may drop one.
+    Image,
+    /// [`TextureRegistry::insert_render_target`] named a target the caller
+    /// renders into. Its contents change every frame and its handle is a name
+    /// rather than a hash; [`TextureRegistry::remove`] is its exit.
+    RenderTarget,
+}
+
 /// One resident baked texture: both maps, their sampling params, and the bind
 /// group `@group(2)` of the material shader wants.
 pub struct GpuTexture {
@@ -758,6 +789,9 @@ pub struct GpuTexture {
     pub normal: wgpu::Texture,
     pub params: wgpu::Buffer,
     pub bind_group: wgpu::BindGroup,
+    /// Who put it here — see [`TextureOrigin`]. Set once at insert and never
+    /// changed: a texture does not change what kind of thing it is.
+    pub origin: TextureOrigin,
 }
 
 /// Handle → GPU textures. The texture-side twin of
@@ -1011,6 +1045,7 @@ impl TextureRegistry {
                 normal,
                 params,
                 bind_group,
+                origin: TextureOrigin::Image,
             },
         );
     }
@@ -1063,18 +1098,58 @@ impl TextureRegistry {
                 normal,
                 params,
                 bind_group,
+                origin: TextureOrigin::RenderTarget,
             },
         );
     }
 
-    /// Forget `handle`, dropping its GPU textures with it.
+    /// Forget `handle`, dropping its GPU textures with it, whatever kind it is.
     ///
-    /// Only ever right for a handle whose contents are a *name* rather than a
-    /// hash — a dropped render target. Removing a baked texture would be
-    /// removing something the content address says is still true, and the next
-    /// draw that named it would silently bake it again.
+    /// The unconditional door, and therefore the caller's problem: it will drop
+    /// a font atlas nothing can rebuild as readily as it drops a render target.
+    /// What it is *for* is the second of those — a handle whose contents are a
+    /// name rather than a hash, whose target the host has stopped rendering
+    /// into.
+    ///
+    /// For superseded **bakes** reach for
+    /// [`retain_baked`](TextureRegistry::retain_baked) instead. Removing one by
+    /// hand is not wrong — the content address stays true and the next draw that
+    /// names it bakes it again — but "again" is a fragment pass a sweep against
+    /// the library would not have paid.
     pub fn remove(&mut self, handle: TextureHandle) -> bool {
         self.textures.remove(&handle).is_some()
+    }
+
+    /// Drop every [`Baked`](TextureOrigin::Baked) texture `keep` answers `false`
+    /// for; returns how many went. Images and render targets are never offered
+    /// to the predicate and never dropped.
+    ///
+    /// This is the eviction path live authoring needs. A
+    /// [`TextureSpec`](crate::texture::TextureSpec) edit cannot mutate a bake in
+    /// place, because the handle *is* the params — so an edited spec is a new
+    /// handle and the old texture pair stays resident with nothing pointing at
+    /// it. One slider drag is dozens of those.
+    ///
+    /// The predicate is over handles rather than over
+    /// [`GpuTexture`]s because the answer never depends on the pixels: what
+    /// decides whether a bake is still wanted is whether anything in the world
+    /// still names it, which is what
+    /// [`TextureLibrary`](crate::texture::TextureLibrary) is the record of. See
+    /// [`Engine::sweep_baked_textures`], which is that reconcile and is what
+    /// callers should normally use.
+    ///
+    /// Dropping a bake is always *safe* rather than merely tolerable: the
+    /// content address stays true, so a draw that names an evicted handle
+    /// re-bakes it through [`resolve`](TextureRegistry::resolve) and gets
+    /// byte-identical pixels. The cost of being wrong here is a fragment pass,
+    /// never a wrong frame.
+    ///
+    /// [`Engine::sweep_baked_textures`]: crate::Engine::sweep_baked_textures
+    pub fn retain_baked(&mut self, mut keep: impl FnMut(TextureHandle) -> bool) -> usize {
+        let before = self.textures.len();
+        self.textures
+            .retain(|handle, gpu| gpu.origin != TextureOrigin::Baked || keep(*handle));
+        before - self.textures.len()
     }
 
     /// Resolve `spec` at `resolution` to a resident texture, in this order:
@@ -1152,6 +1227,7 @@ impl TextureRegistry {
                 normal,
                 params,
                 bind_group,
+                origin: TextureOrigin::Baked,
             },
         );
         handle
@@ -1214,4 +1290,44 @@ fn create_bind_group(
             },
         ],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::texture::LIVE_LOD_CELL_PIXELS;
+
+    #[test]
+    fn a_default_spec_uploads_todays_live_lod_cell_pixels() {
+        // `live_cell_pixels` replaced a `const` that reached the shader through
+        // this same slot (`TextureUniform::live.y`). A scene file written
+        // before the field existed deserializes with the serde default, and
+        // that default has to land in the uniform as the exact number the
+        // shader used to read straight off `LIVE_LOD_CELL_PIXELS` — otherwise
+        // every already-authored material's live fade would silently change
+        // the day this field shipped.
+        let spec = TextureSpec::default();
+        assert_eq!(spec.live_cell_pixels, LIVE_LOD_CELL_PIXELS);
+        let uniform = TextureUniform::from_spec(&spec);
+        assert_eq!(uniform.live[1], LIVE_LOD_CELL_PIXELS);
+    }
+
+    #[test]
+    fn a_material_specific_live_cell_pixels_reaches_the_uniform_untouched() {
+        // The whole point of moving this off the `const`: two materials with
+        // different values must upload different numbers, through the same
+        // struct field the constant used to occupy.
+        let coarse = TextureSpec {
+            live_cell_pixels: 8.0,
+            ..TextureSpec::default()
+        };
+        let fine = TextureSpec {
+            live_cell_pixels: 0.5,
+            ..TextureSpec::default()
+        };
+        assert_eq!(TextureUniform::from_spec(&coarse).live[1], 8.0);
+        assert_eq!(TextureUniform::from_spec(&fine).live[1], 0.5);
+        assert_ne!(coarse.content_key(64), fine.content_key(64), "a spec that changes the \
+            live fade must not share a resident texture's uniform with one that doesn't");
+    }
 }

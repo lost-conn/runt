@@ -123,7 +123,13 @@ fn bake_sample(uv: vec2<f32>) -> BakeResult {
             let dlen = length(d);
             var dir = vec3<f32>(0.0);
             if (dlen > 1.0e-4) {
-                dir = d / dlen;
+                // Negated: `d` points away from the nearest feature point, but
+                // dndx/dndy are a height gradient and cell centres are the
+                // relief's high points, so uphill is *toward* the feature
+                // point. See `TextureSpec::sample_at`'s matching comment in
+                // texture.rs for the full argument — `fs_normal` below packs
+                // the result the same way `packed_normal_at` does.
+                dir = -d / dlen;
             }
             // Derivative-of-fBm: an octave's contribution scales with
             // amplitude * frequency, exactly as in the original.
