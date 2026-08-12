@@ -3162,3 +3162,436 @@ fn floor_snap_still_holds_a_body_to_every_slope_it_may_stand_on() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Point containment
+// ---------------------------------------------------------------------------
+//
+// `CollisionWorld::contains_point` is the query the overlaps cannot express.
+// An overlap is a *surface* test — which feature of the collider is the shape
+// penetrating — and a [`Trimesh`]'s features are its triangles, so a shape
+// swallowed whole by a closed soup overlaps nothing at all and reads exactly
+// like open air. The convex shapes have no such hole, which is why the first
+// caller to notice was one that had only ever been pointed at an OBB.
+//
+// So the load-bearing test below is `a_point_deep_inside_a_trimesh_box_is_inside_it`:
+// it asserts *both* halves, the empty overlap and the answered containment, on
+// the same geometry.
+
+/// A **closed** box as a triangle soup — twelve triangles, wound outward, which
+/// is what a CSG bake emits for a solid and what an `overlap_*` call can only
+/// see the skin of.
+///
+/// The winding is exact rather than incidental: the +X face's two triangles
+/// share the diagonal `(+,−,−) → (+,+,+)`, whose midpoint is the centre of the
+/// face — so the +X ray from the box's own centre lands exactly on a shared
+/// edge, and the same is true on the other two axes. That is the parity trap
+/// [`runt_core::collide::CONTAINMENT_MERGE`] exists for, and it is the *default*
+/// configuration for axis-aligned geometry rather than an unlucky one.
+fn box_soup(half: Vec3) -> (Vec<Vec3>, Vec<u32>) {
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x * half.x, y * half.y, z * half.z);
+    let verts = vec![
+        v(-1.0, -1.0, -1.0), // 0
+        v(1.0, -1.0, -1.0),  // 1
+        v(1.0, -1.0, 1.0),   // 2
+        v(-1.0, -1.0, 1.0),  // 3
+        v(-1.0, 1.0, -1.0),  // 4
+        v(1.0, 1.0, -1.0),   // 5
+        v(1.0, 1.0, 1.0),    // 6
+        v(-1.0, 1.0, 1.0),   // 7
+    ];
+    #[rustfmt::skip]
+    let indices = vec![
+        0, 1, 2,  0, 2, 3, // −Y
+        4, 6, 5,  4, 7, 6, // +Y
+        0, 4, 5,  0, 5, 1, // −Z
+        3, 2, 6,  3, 6, 7, // +Z
+        0, 3, 7,  0, 7, 4, // −X
+        1, 5, 6,  1, 6, 2, // +X
+    ];
+    (verts, indices)
+}
+
+/// An **L-shaped** prism: the 6-gon `(0,0) (4,0) (4,1.5) (1.5,1.5) (1.5,4)
+/// (0,4)` in XY, extruded to `z = ±2`. One closed surface, no coincident faces,
+/// and one reentrant corner — so the square `x > 1.5, y > 1.5` is inside the
+/// shape's bounding box and outside the shape.
+///
+/// The caps are a fan from the first vertex, which for this polygon is a valid
+/// triangulation and adds no vertex the side quads do not also have: a cap
+/// triangulated with extra points would leave a T-junction, and a crack in a
+/// closed surface is exactly what a parity count cannot survive.
+fn l_prism() -> (Vec<Vec3>, Vec<u32>) {
+    const POLY: [[f32; 2]; 6] = [
+        [0.0, 0.0],
+        [4.0, 0.0],
+        [4.0, 1.5],
+        [1.5, 1.5],
+        [1.5, 4.0],
+        [0.0, 4.0],
+    ];
+    const DEPTH: f32 = 2.0;
+    let n = POLY.len() as u32;
+    let mut verts = Vec::with_capacity(POLY.len() * 2);
+    for p in POLY {
+        verts.push(Vec3::new(p[0], p[1], DEPTH));
+    }
+    for p in POLY {
+        verts.push(Vec3::new(p[0], p[1], -DEPTH));
+    }
+
+    let mut indices = Vec::new();
+    for i in 1..n - 1 {
+        // Front cap, +Z; back cap, −Z, the same fan reversed.
+        indices.extend([0, i, i + 1]);
+        indices.extend([n, n + i + 1, n + i]);
+    }
+    for i in 0..n {
+        let j = (i + 1) % n;
+        // Outward, for a polygon wound counter-clockwise seen from +Z.
+        indices.extend([i, i + n, j + n]);
+        indices.extend([i, j + n, j]);
+    }
+    (verts, indices)
+}
+
+#[test]
+fn a_point_inside_a_convex_collider_is_the_collider_it_is_inside() {
+    let mut level = Level::new();
+    let sphere = level.sphere(Vec3::new(0.0, 2.0, 0.0), 1.5);
+    let geometry = level.snapshot();
+
+    assert_eq!(
+        geometry.contains_point(Vec3::new(0.0, 2.0, 0.0), ALL_LAYERS),
+        Some(sphere),
+        "the centre of a sphere is inside it"
+    );
+    // Inclusive on the shell, and outside a millimetre past it.
+    assert_eq!(
+        geometry.contains_point(Vec3::new(0.0, 3.5, 0.0), ALL_LAYERS),
+        Some(sphere)
+    );
+    assert_eq!(
+        geometry.contains_point(Vec3::new(0.0, 3.501, 0.0), ALL_LAYERS),
+        None
+    );
+
+    let mut level = Level::new();
+    let floor = with_floor(&mut level);
+    let geometry = level.snapshot();
+    assert_eq!(
+        geometry.contains_point(Vec3::new(4.0, -0.5, -7.0), ALL_LAYERS),
+        Some(floor),
+        "a point buried in the floor slab is inside it"
+    );
+    assert_eq!(
+        geometry.contains_point(Vec3::new(4.0, 0.001, -7.0), ALL_LAYERS),
+        None,
+        "…and a millimetre above its top face is not"
+    );
+    assert_eq!(
+        geometry.contains_point(Vec3::new(26.0, -0.5, 0.0), ALL_LAYERS),
+        None,
+        "…nor is a point beyond its edge at the same depth"
+    );
+}
+
+#[test]
+fn a_rotated_box_contains_the_points_its_own_frame_says_it_does() {
+    // PORT_SPEC's PhaseWall: 0.5 m thick, yawed −98°. A slab that thin is the
+    // shape a world-axis test would get wrong — 0.2 m along the wall's own
+    // normal is inside it, and 0.2 m along world X is 8° off that and outside.
+    let (_, geometry, wall) = phase_level();
+    let centre = Vec3::new(4.5556774, 2.0, 14.4808);
+    let normal = phase_wall_normal();
+
+    assert_eq!(geometry.contains_point(centre, ALL_LAYERS), Some(wall));
+    assert_eq!(
+        geometry.contains_point(centre + normal * 0.2, ALL_LAYERS),
+        Some(wall),
+        "0.2 m along the wall's own normal is inside a 0.25 m half-thickness"
+    );
+    assert_eq!(
+        geometry.contains_point(centre + normal * 0.3, ALL_LAYERS),
+        None,
+        "…and 0.3 m along it is out the other side"
+    );
+    // Along the wall's length instead: 3.9 m of the 4 m half-length, still in.
+    let along = Quat::from_rotation_y(-98f32.to_radians()) * Vec3::Z;
+    assert_eq!(
+        geometry.contains_point(centre + along * 3.9, ALL_LAYERS),
+        Some(wall)
+    );
+    assert_eq!(
+        geometry.contains_point(centre + along * 4.1, ALL_LAYERS),
+        None
+    );
+}
+
+#[test]
+fn a_point_deep_inside_a_trimesh_box_is_inside_it() {
+    // The bug this query exists for, stated as the two halves of one geometry:
+    // an 8 m cube as a closed soup, and a standing capsule at the middle of it.
+    let mut level = Level::new();
+    let block = level.bare();
+    let mut geometry = level.snapshot();
+    let (verts, indices) = box_soup(Vec3::splat(4.0));
+    let mesh = Trimesh::build_from_soup(&verts, &indices);
+    push_trimesh(&mut geometry, block, Vec3::ZERO, &mesh, 1);
+
+    // Half of it: the surface query sees nothing at all. The capsule's segment
+    // reaches 1.0 m from its centre and the nearest triangle is 4 m away, so
+    // there is no contact to report — which is indistinguishable, to every
+    // caller of `overlap_body`, from standing in an empty field.
+    let body = standing();
+    assert_eq!(
+        geometry.overlap_body(&body, Vec3::ZERO),
+        Vec::new(),
+        "a capsule swallowed by a soup overlaps none of its triangles"
+    );
+    // …and at the top face, where it straddles the surface, the same query
+    // answers immediately. The guard built on it therefore works within about a
+    // capsule radius of a surface and nowhere else.
+    let straddling = geometry.overlap_body(&body, Vec3::new(0.0, 4.0, 0.0));
+    assert_eq!(straddling.len(), 1, "at the face: {straddling:?}");
+    assert_eq!(straddling[0].entity, block);
+    // A segment running *through* a triangle is zero distance from it, so the
+    // depth saturates at the capsule's radius however far past the face the
+    // body has gone. That is the shape of the hole in one number: "how deep am
+    // I in it" stops meaning anything the moment the surface is behind you.
+    assert!((straddling[0].depth - 0.35).abs() < 1e-3, "{straddling:?}");
+
+    // The other half: containment answers everywhere inside the body.
+    assert_eq!(
+        geometry.contains_point(Vec3::ZERO, ALL_LAYERS),
+        Some(block),
+        "the centre of a closed soup is inside it"
+    );
+    for point in [
+        Vec3::new(3.9, 3.9, 3.9),
+        Vec3::new(-3.9, 0.0, 2.0),
+        Vec3::new(0.0, -3.9, 0.0),
+        Vec3::new(1.75, -2.5, -3.25),
+    ] {
+        assert_eq!(
+            geometry.contains_point(point, ALL_LAYERS),
+            Some(block),
+            "{point} is inside the box"
+        );
+    }
+    for point in [
+        // Just outside a face, on the axis a ray leaves along.
+        Vec3::new(0.0, 4.001, 0.0),
+        Vec3::new(4.001, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, -4.001),
+        // Well outside, on the far side of a face — the "through the wall"
+        // case, where a lone ray back through the box crosses twice.
+        Vec3::new(0.0, 12.0, 0.0),
+        Vec3::new(-9.0, 0.0, 0.0),
+        // Outside a corner, where all three rays miss.
+        Vec3::new(6.0, 6.0, 6.0),
+    ] {
+        assert_eq!(
+            geometry.contains_point(point, ALL_LAYERS),
+            None,
+            "{point} is outside the box"
+        );
+    }
+}
+
+#[test]
+fn the_notch_of_a_concave_soup_is_outside_it() {
+    // The same claim the game's recharge polygon test makes, one dimension up:
+    // a concave body's bounding box is not the body. The L's reentrant square
+    // is `x > 1.5, y > 1.5`, and a parity count is the reason it can be told
+    // apart from the arm beside it.
+    let mut level = Level::new();
+    let block = level.bare();
+    let mut geometry = level.snapshot();
+    let (verts, indices) = l_prism();
+    let mesh = Trimesh::build_from_soup(&verts, &indices);
+    push_trimesh(&mut geometry, block, Vec3::ZERO, &mesh, 1);
+
+    for point in [
+        Vec3::new(0.75, 0.75, 0.0),  // the corner both arms share
+        Vec3::new(3.0, 0.75, 1.9),   // the horizontal arm, near the +Z cap
+        Vec3::new(0.75, 3.0, -1.9),  // the vertical arm, near the −Z cap
+    ] {
+        assert_eq!(
+            geometry.contains_point(point, ALL_LAYERS),
+            Some(block),
+            "{point} is in the solid"
+        );
+    }
+    for point in [
+        Vec3::new(3.0, 3.0, 0.0),   // the notch, dead centre
+        Vec3::new(1.6, 1.6, 0.0),   // the notch, a hair off the reentrant corner
+        Vec3::new(3.9, 3.9, 1.9),   // the notch's far corner, inside the bounds
+        Vec3::new(2.0, 2.0, 2.1),   // past the +Z cap, above the arm
+    ] {
+        assert_eq!(
+            geometry.contains_point(point, ALL_LAYERS),
+            None,
+            "{point} is in the notch, not the solid"
+        );
+    }
+}
+
+#[test]
+fn an_open_surface_contains_nothing_even_from_underneath() {
+    // A `grid_soup` is a *sheet*: it has no inside, and the honest answer under
+    // it is "outside" rather than "inside the half-space below". One axis says
+    // otherwise — the +Y ray crosses the sheet exactly once — and the other two
+    // outvote it, which is what the three-axis rule buys beyond the shared-edge
+    // case it was written for.
+    let mut level = Level::new();
+    let sheet = level.bare();
+    let mut geometry = level.snapshot();
+    let (verts, indices) = grid_soup(6.0, 8, bumpy);
+    let mesh = Trimesh::build_from_soup(&verts, &indices);
+    push_trimesh(&mut geometry, sheet, Vec3::ZERO, &mesh, 1);
+
+    for y in [-4.0f32, -0.5, 0.5, 4.0] {
+        for (x, z) in [(0.0f32, 0.0f32), (2.5, -1.5), (-3.0, 3.0)] {
+            assert_eq!(
+                geometry.contains_point(Vec3::new(x, y, z), ALL_LAYERS),
+                None,
+                "an open sheet contains nothing, and ({x}, {y}, {z}) is nothing"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_capsule_resting_on_a_trimesh_floor_has_its_whole_segment_outside_it() {
+    // The property the phase guard's tolerance depends on, restated for the new
+    // query: the medial segment `CharacterBody::segment` hands out is a full
+    // radius inside the capsule, so a body standing *on* a surface never has a
+    // segment point inside it — no matter how deep into the contact margin the
+    // solver has let it settle.
+    let mut level = Level::new();
+    let ground = level.bare();
+    let mut geometry = level.snapshot();
+    let (verts, indices) = box_soup(Vec3::new(12.0, 2.0, 12.0));
+    let mesh = Trimesh::build_from_soup(&verts, &indices);
+    // Top face at y = 0.
+    push_trimesh(&mut geometry, ground, Vec3::new(0.0, -2.0, 0.0), &mesh, 1);
+
+    let (body, position) = drop_onto(&geometry, Vec3::new(1.0, 6.0, -2.0), 180);
+    assert!(body.on_floor, "the capsule never landed");
+    let (lo, hi) = body.segment(position);
+    for point in [lo, (lo + hi) * 0.5, hi] {
+        assert_eq!(
+            geometry.contains_point(point, ALL_LAYERS),
+            None,
+            "{point} of a resting capsule reads as inside the floor"
+        );
+    }
+    // And the feet themselves — the sole, a radius below `lo` — are the point
+    // that *would* be ambiguous: it sits on the face, and the query is
+    // inclusive there. Which is the whole reason the caller samples the
+    // segment.
+    let sole = position - Vec3::Y * 1.0;
+    assert!(sole.y.abs() < 2e-3, "the capsule settled at {}", sole.y);
+}
+
+#[test]
+fn the_mask_hides_a_collider_from_the_containment_query() {
+    let mut level = Level::new();
+    let block = level.bare();
+    let mut geometry = level.snapshot();
+    let (verts, indices) = box_soup(Vec3::splat(4.0));
+    let mesh = Trimesh::build_from_soup(&verts, &indices);
+    // Layer 1 alone, as `phase_level` tags its wall.
+    push_trimesh(&mut geometry, block, Vec3::ZERO, &mesh, 1 << 1);
+
+    assert_eq!(geometry.contains_point(Vec3::ZERO, ALL_LAYERS), Some(block));
+    assert_eq!(geometry.contains_point(Vec3::ZERO, 1 << 1), Some(block));
+    assert_eq!(
+        geometry.contains_point(Vec3::ZERO, ALL_LAYERS & !(1 << 1)),
+        None,
+        "a mask that cannot see the collider cannot be inside it"
+    );
+    assert_eq!(geometry.contains_point(Vec3::ZERO, 0), None);
+}
+
+#[test]
+fn overlapping_colliders_answer_with_the_lowest_entity_every_time() {
+    // DESIGN §3's tie-break, which for a query that answers with one entity out
+    // of several candidates is the whole of its determinism. "Lowest" is
+    // `Entity`'s own `Ord` — the key `CollisionWorld` sorts its snapshot by —
+    // and not spawn order, which this bevy's inverted entity index makes the
+    // reverse of it.
+    let point = Vec3::new(0.5, 0.0, 0.0);
+    let mut level = Level::new();
+    let big = level.aabb(Vec3::ZERO, Vec3::splat(2.0));
+    let offset = level.aabb(Vec3::new(1.0, 0.0, 0.0), Vec3::splat(2.0));
+    let ball = level.sphere(point, 2.0);
+    let geometry = level.snapshot();
+    let lowest = [big, offset, ball].into_iter().min().expect("three");
+    for _ in 0..8 {
+        assert_eq!(
+            geometry.contains_point(point, ALL_LAYERS),
+            Some(lowest),
+            "three colliders contain the point; the lowest entity wins, and \
+             wins again on every repeat of the same query"
+        );
+    }
+
+    // Take that winner out of the mask and the next one up answers.
+    let mut level = Level::new();
+    let a = level.aabb(Vec3::ZERO, Vec3::splat(2.0));
+    let b = level.aabb(Vec3::new(1.0, 0.0, 0.0), Vec3::splat(2.0));
+    let (low, high) = if a < b { (a, b) } else { (b, a) };
+    level.layers(low, CollisionLayers::layer(1));
+    let geometry = level.snapshot();
+    assert_eq!(geometry.contains_point(point, ALL_LAYERS), Some(low));
+    assert_eq!(
+        geometry.contains_point(point, ALL_LAYERS & !(1 << 1)),
+        Some(high),
+        "masking the lower entity out hands the answer to the higher one"
+    );
+}
+
+#[test]
+fn a_point_below_the_analytic_field_is_inside_the_terrain() {
+    // The height field has no volume to test against, so containment is the
+    // question the field itself answers: below the surface at that XZ, and
+    // inside the patch's footprint. Sampled, never tessellated — so the two
+    // quality tiers agree, exactly as the raycast does.
+    let mut coarse = terrain_sim(0.3);
+    let mut fine = terrain_sim(1.0);
+    let a = CollisionWorld::from_world(coarse.world_mut());
+    let b = CollisionWorld::from_world(fine.world_mut());
+    let patch = a.terrain()[0];
+
+    let mut inside = 0;
+    for i in -5..=5 {
+        for j in -5..=5 {
+            let (x, z) = (i as f32 * 3.0, j as f32 * 3.0);
+            let h = patch.surface.height_world(patch.origin, x, z);
+            let under = Vec3::new(x, h - 1.0, z);
+            let over = Vec3::new(x, h + 1.0, z);
+            assert_eq!(a.contains_point(under, ALL_LAYERS), Some(patch.entity));
+            assert_eq!(a.contains_point(over, ALL_LAYERS), None);
+            assert_eq!(
+                a.contains_point(under, ALL_LAYERS),
+                b.contains_point(under, ALL_LAYERS),
+                "the tiers disagree under ({x}, {z})"
+            );
+            inside += 1;
+        }
+    }
+    assert_eq!(inside, 121);
+
+    // Outside the 80 × 80 patch, at any depth.
+    assert_eq!(
+        a.contains_point(Vec3::new(60.0, -50.0, 0.0), ALL_LAYERS),
+        None
+    );
+    // …and the mask hides it like any other collider.
+    assert_eq!(
+        a.contains_point(Vec3::new(0.0, -20.0, 0.0), ALL_LAYERS & !1),
+        None
+    );
+}

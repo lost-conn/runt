@@ -19,7 +19,12 @@
 //! move_and_slide(&world, &mut body, p, v, dt) -> MoveResult
 //! world.overlap_sphere / overlap_capsule  → Vec<OverlapHit>
 //! world.raycast                           → Option<RayHit>
+//! world.contains_point                    → Option<Entity>
 //! ```
+//!
+//! The last of those is the one that is not a surface test: an overlap asks what
+//! a shape is *penetrating*, and a shape swallowed whole by a closed
+//! [`Trimesh`] penetrates nothing. See [`CollisionWorld::contains_point`].
 //!
 //! ## Shapes
 //!
@@ -3185,6 +3190,228 @@ impl CollisionWorld {
         });
         best
     }
+
+    /// The collider a **point** is inside, or `None`. Ties go to the lowest
+    /// [`Entity`], as everything else in this file does.
+    ///
+    /// This is the question the overlap queries cannot answer. `overlap_*` is a
+    /// *surface* test — it asks which of a collider's features the query shape
+    /// is penetrating — and for a [`Trimesh`] the features are its triangles. A
+    /// shape deep inside a closed soup touches none of them and the overlap is
+    /// empty, which reads exactly like open air. The convex shapes do not have
+    /// that hole (a box or a sphere has an interior the contact routine knows
+    /// about), so a caller that only ever met an [`ObbCollider`] never noticed
+    /// it was asking the narrower question. `contains_point` states the wider
+    /// one, and a guard that has to hold *anywhere* inside a body asks both.
+    ///
+    /// Per shape:
+    ///
+    /// | shape | test |
+    /// |---|---|
+    /// | [`ColliderShape::Sphere`] | distance to the centre |
+    /// | [`ColliderShape::Aabb`] / [`ColliderShape::Obb`] | slab test in the box's own frame, the point inverse-rotated first exactly as [`ray_box`] does |
+    /// | [`ColliderShape::Trimesh`] | ray parity, three axes, majority vote — below |
+    /// | [`TerrainSurface`] | inside the patch and below the sampled height |
+    ///
+    /// Boundaries are **inclusive**: a point exactly on a face, on the sphere's
+    /// shell, or exactly at the field's height is inside. Nothing here is a
+    /// tolerance — a caller that wants clearance from a surface asks about a
+    /// point that has it (which is what [`CharacterBody::segment`] hands you: the
+    /// capsule's medial segment is a full radius inside its own shape).
+    ///
+    /// ## Trimesh containment: parity along +X, +Y and +Z
+    ///
+    /// A ray from the point crosses a closed surface an odd number of times iff
+    /// it started inside it. The count runs over the same BVH and the same
+    /// [`ray_triangle`] the raycast uses — the only difference is the walk, which
+    /// counts *everything* along an infinite ray instead of pruning to the
+    /// nearest hit. Three axes are counted and the majority wins.
+    ///
+    /// The vote is there because a single parity count has failure modes, all of
+    /// them at the boundary of the crossing test rather than in its middle:
+    ///
+    /// - **A ray through a shared edge or a vertex hits every triangle that
+    ///   meets there.** Möller–Trumbore's `u`/`v` bounds are inclusive, so a
+    ///   crossing exactly on the diagonal of a triangulated quad is reported
+    ///   twice and flips the parity the wrong way. This one is not left to the
+    ///   vote, because on axis-aligned geometry it is *systematic* rather than
+    ///   unlucky — the +X ray from the centre of a box hits the centre of its +X
+    ///   face, which is the midpoint of the diagonal, and the same is true on all
+    ///   three axes at once. So crossings are counted by **position along the
+    ///   ray**, not by triangle: hits within [`CONTAINMENT_MERGE`] of one another
+    ///   are one crossing, which is what they geometrically are. What the vote
+    ///   then covers is the residue — a ray that *grazes* a silhouette edge
+    ///   without passing through the surface also merges to one, and reads as a
+    ///   crossing that never happened.
+    /// - **An exactly-coplanar triangle is not a crossing.** [`ray_triangle`]'s
+    ///   `det.abs() < 1e-12` guard already drops it, which is the right answer
+    ///   for a ray running along a face and is why a point on a face's plane can
+    ///   still get a clean count on the other two axes.
+    /// - **A point exactly on the surface** reads `t == 0`, which counts. It is
+    ///   therefore inside, consistent with the inclusive rule above.
+    ///
+    /// Three axes and a majority is the mitigation this file commits to; there
+    /// is deliberately no fourth mechanism layered on top of it.
+    ///
+    /// ## Triggers
+    ///
+    /// Reported like every other query reports them — a [`Trigger`] volume the
+    /// mask can see is a collider the point can be inside of. A caller that wants
+    /// solids only says so with the mask, which is the only lever a query
+    /// returning a bare [`Entity`] leaves it.
+    pub fn contains_point(&self, point: Vec3, mask: u16) -> Option<Entity> {
+        let mut best: Option<Entity> = None;
+        // One buffer for every trimesh walk in the scan, as `overlap_segment`
+        // keeps one candidate list for every soup it visits.
+        let mut crossings: Vec<f32> = Vec::new();
+
+        self.for_each(mask, |entry| {
+            // The scan is in `Entity` order, so the first collider that contains
+            // the point is already the lowest-`Entity` one and the rest of the
+            // list cannot beat it.
+            if best.is_some() {
+                return;
+            }
+            let inside = match &entry.shape {
+                ColliderShape::Sphere { radius } => {
+                    (point - entry.center).length_squared() <= radius * radius
+                }
+                ColliderShape::Aabb { half_extents } => {
+                    box_contains(point, entry.center, Quat::IDENTITY, *half_extents)
+                }
+                ColliderShape::Obb {
+                    half_extents,
+                    rotation,
+                } => box_contains(point, entry.center, *rotation, *half_extents),
+                ColliderShape::Trimesh(mesh) => {
+                    trimesh_contains(mesh, entry.center, point, &mut crossings)
+                }
+            };
+            if inside {
+                best = Some(entry.entity);
+            }
+        });
+
+        self.for_each_terrain(mask, |entry| {
+            // Terrain is a second Entity-ordered list, so the winner across the
+            // two is a comparison rather than a first-match.
+            if best.is_some_and(|found| found < entry.entity) {
+                return;
+            }
+            if entry.surface.contains_world(entry.origin, point.x, point.z)
+                && point.y <= entry.surface.height_world(entry.origin, point.x, point.z)
+            {
+                best = Some(entry.entity);
+            }
+        });
+
+        best
+    }
+}
+
+/// Two containment crossings closer together than this along one ray are the
+/// **same** crossing, in metres.
+///
+/// 0.01 mm — a tenth of [`WELD_GRID`], so two surfaces the welder was willing to
+/// keep apart are still two crossings, and every triangle that meets at one
+/// welded edge or vertex reports the one crossing it geometrically is. See
+/// [`CollisionWorld::contains_point`] for why a parity count has to merge at all.
+pub const CONTAINMENT_MERGE: f32 = 1.0e-5;
+
+/// Is `point` inside a box? The slab test in the box's own frame, inclusive on
+/// the faces.
+fn box_contains(point: Vec3, center: Vec3, rotation: Quat, half: Vec3) -> bool {
+    let local = if rotation == Quat::IDENTITY {
+        point - center
+    } else {
+        rotation.inverse() * (point - center)
+    };
+    local.abs().cmple(half).all()
+}
+
+/// Is `point` inside a closed triangle soup? Three-axis ray parity with a
+/// majority vote — see [`CollisionWorld::contains_point`] for the reasoning and
+/// the traps.
+fn trimesh_contains(mesh: &Trimesh, center: Vec3, point: Vec3, scratch: &mut Vec<f32>) -> bool {
+    let Some((min, max)) = mesh.bounds() else {
+        return false;
+    };
+    let local = point - center;
+    // A point outside the root's own box is outside every triangle under it, and
+    // this is what keeps the three walks off the colliders the point is nowhere
+    // near — the same job `query_aabb`'s root test does for the overlap path.
+    if local.cmplt(min).any() || local.cmpgt(max).any() {
+        return false;
+    }
+    let mut odd = 0u32;
+    for axis in 0..3 {
+        let mut dir = Vec3::ZERO;
+        dir[axis] = 1.0;
+        if crossings_along(mesh, local, dir, scratch) % 2 == 1 {
+            odd += 1;
+        }
+    }
+    odd >= 2
+}
+
+/// How many times an infinite ray from `origin` crosses the soup's surface.
+///
+/// The traversal is [`ray_trimesh`]'s stack discipline with its pruning removed:
+/// a containment count has no running best to bound the far subtree with, so
+/// every node the ray's slab test admits is visited and every triangle in it is
+/// tested. Order therefore cannot matter — the result is a *count* — and the
+/// children go on the stack in the fixed order [`Trimesh::query_aabb`] uses.
+///
+/// Hits are then sorted and merged: every triangle meeting at one welded edge or
+/// vertex reports the same point on the ray, and that point is one crossing. The
+/// sort is by [`f32::total_cmp`] so the merge is a pure function of the hit set
+/// rather than of the order the leaves came out in.
+fn crossings_along(mesh: &Trimesh, origin: Vec3, dir: Vec3, hits: &mut Vec<f32>) -> usize {
+    hits.clear();
+    if mesh.nodes.is_empty() {
+        return 0;
+    }
+    let inv_dir = Vec3::new(safe_recip(dir.x), safe_recip(dir.y), safe_recip(dir.z));
+
+    let mut stack = [0u32; BVH_STACK_DEPTH];
+    let mut depth = 0usize;
+    stack[depth] = 0;
+    depth += 1;
+
+    while depth > 0 {
+        depth -= 1;
+        let node = &mesh.nodes[stack[depth] as usize];
+        if ray_aabb_enter(origin, inv_dir, f32::INFINITY, node.min, node.max).is_none() {
+            continue;
+        }
+        if node.is_leaf() {
+            for index in node.first..node.first + node.count {
+                let [a, b, c] = mesh.triangle(index);
+                if let Some(t) = ray_triangle(origin, dir, a, b, c) {
+                    hits.push(t);
+                }
+            }
+            continue;
+        }
+        assert!(
+            depth + 2 <= BVH_STACK_DEPTH,
+            "BVH traversal exceeded its fixed stack — the tree is not balanced"
+        );
+        stack[depth] = node.right;
+        stack[depth + 1] = node.first;
+        depth += 2;
+    }
+
+    hits.sort_unstable_by(f32::total_cmp);
+    let mut count = 0usize;
+    let mut last = 0.0f32;
+    for &t in hits.iter() {
+        if count == 0 || t - last > CONTAINMENT_MERGE {
+            count += 1;
+            last = t;
+        }
+    }
+    count
 }
 
 /// Slab test in the box's own frame. Exact.
