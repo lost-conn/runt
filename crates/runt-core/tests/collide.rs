@@ -3553,6 +3553,186 @@ fn overlapping_colliders_answer_with_the_lowest_entity_every_time() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// contains_point_rejecting — the classification hole in the tie rule
+// ---------------------------------------------------------------------------
+//
+// `overlapping_colliders_answer_with_the_lowest_entity_every_time` above
+// proves the tie rule is right for "which one collider is this point in."
+// `contains_point_rejecting`'s whole reason to exist is that the rule is the
+// wrong one for "is this point in anything I have to treat as solid" the
+// moment a collider can answer `mask` for one reason and still be something
+// the caller wants to ignore — pulling the answering bit out of `mask` cannot
+// help, because the collider is not on `mask` *because of* that bit, it is on
+// `mask` for an unrelated one it also carries. `reject` is checked against the
+// collider's own memberships instead, so it removes exactly the candidates it
+// means to and nothing hides behind an accident of `Entity` order.
+
+#[test]
+fn a_rejected_lower_entity_no_longer_hides_a_real_one_behind_it() {
+    // Two colliders, both containing `point`, both answering the same query
+    // bit — `PHASE_BIT` — the way `rocks::ROCK_MEMBERSHIPS` answers
+    // `PHASED_MASK` in `3dimenshift-runt` whether or not the rock is also
+    // tagged holdable. `holdable` additionally carries `REJECT_BIT`, standing
+    // in for `layers::HOLDABLE`; `solid` carries only `PHASE_BIT`, standing in
+    // for a genuinely solid phaseable body.
+    const PHASE_BIT: u16 = 1 << 1;
+    const REJECT_BIT: u16 = 1 << 5;
+    let point = Vec3::ZERO;
+    let mut level = Level::new();
+    let a = level.aabb(point, Vec3::splat(4.0));
+    let b = level.aabb(point, Vec3::splat(4.0));
+    // This bevy's entity index does not preserve spawn order (see
+    // `overlapping_colliders_answer_with_the_lowest_entity_every_time`), so
+    // the regression needs the *actual* lower `Entity` picked out after the
+    // fact rather than assumed from spawn order — it is `holdable` that has
+    // to be the one the old tie rule would have committed to and stopped on.
+    let (holdable, solid) = if a < b { (a, b) } else { (b, a) };
+    level.layers(
+        holdable,
+        CollisionLayers::DEFAULT.with_memberships(PHASE_BIT | REJECT_BIT),
+    );
+    level.layers(solid, CollisionLayers::DEFAULT.with_memberships(PHASE_BIT));
+    let geometry = level.snapshot();
+
+    // Baseline: plain `contains_point` — `reject = 0` — answers the lower
+    // entity, same as the tie-rule test above. This is the behaviour the bug
+    // relied on.
+    assert_eq!(geometry.contains_point(point, PHASE_BIT), Some(holdable));
+
+    // The naive fix does not work: `holdable` is on `mask` through `PHASE_BIT`,
+    // not through `REJECT_BIT`, so subtracting `REJECT_BIT` from the query
+    // mask changes nothing about which colliders `mask_accepts` sees.
+    assert_eq!(
+        geometry.contains_point(point, PHASE_BIT & !REJECT_BIT),
+        Some(holdable),
+        "masking the reject bit out of the query mask cannot exclude a \
+         collider that answers the query on a different bit entirely"
+    );
+
+    // The regression this whole thing is about: with the old one-`Entity`
+    // behaviour (no `reject` parameter at all) this could not even be asked;
+    // `contains_point_rejecting` asks it by checking `reject` against each
+    // collider's own memberships, inside the scan, before either the surface
+    // test or the tie rule ever runs — so a rejected collider is skipped
+    // outright and the real one behind it wins. This is also
+    // "rejection wins when a collider matches both masks": `holdable` matches
+    // `mask` (`PHASE_BIT`) and `reject` (`REJECT_BIT`) at once, and losing is
+    // what that match costs it.
+    assert_eq!(
+        geometry.contains_point_rejecting(point, PHASE_BIT, REJECT_BIT),
+        Some(solid),
+        "a rejected lower-entity collider must not hide a real one behind it"
+    );
+}
+
+#[test]
+fn contains_point_rejecting_at_reject_zero_is_contains_point() {
+    // `reject = 0` matches nothing (`mask_accepts` is `query & memberships`,
+    // and `0 & anything == 0`), so every collider that would answer
+    // `contains_point` answers `contains_point_rejecting` too, entity for
+    // entity — not merely "usually agrees," the same tie-broken answer on
+    // every query the existing suite already runs through `contains_point`.
+    let point = Vec3::new(0.5, 0.0, 0.0);
+    let mut level = Level::new();
+    level.aabb(Vec3::ZERO, Vec3::splat(2.0));
+    level.aabb(Vec3::new(1.0, 0.0, 0.0), Vec3::splat(2.0));
+    level.sphere(point, 2.0);
+    let geometry = level.snapshot();
+    assert_eq!(
+        geometry.contains_point_rejecting(point, ALL_LAYERS, 0),
+        geometry.contains_point(point, ALL_LAYERS),
+    );
+
+    // And the empty case: nothing here at all, still `None` either way.
+    let empty = CollisionWorld::default();
+    assert_eq!(empty.contains_point_rejecting(point, ALL_LAYERS, 0), None);
+    assert_eq!(empty.contains_point(point, ALL_LAYERS), None);
+}
+
+#[test]
+fn a_point_inside_only_a_rejected_collider_is_none() {
+    let point = Vec3::ZERO;
+    let mut level = Level::new();
+    let block = level.aabb(point, Vec3::splat(4.0));
+    level.layers(block, CollisionLayers::layer(1));
+    let geometry = level.snapshot();
+    assert_eq!(
+        geometry.contains_point_rejecting(point, ALL_LAYERS, 1 << 1),
+        None,
+        "the only collider containing the point is exactly the one rejected"
+    );
+    // The mask-only exclusion agrees here, because this collider's one
+    // membership bit really is the bit being excluded — the case that made
+    // the naive fix look like it worked before `a_rejected_lower_entity_…`
+    // showed where it stops.
+    assert_eq!(geometry.contains_point(point, ALL_LAYERS & !(1 << 1)), None);
+}
+
+#[test]
+fn rejection_reaches_the_terrain_field_the_same_way_it_reaches_a_collider() {
+    // The two halves of `contains_point_rejecting`'s scan — the collider loop
+    // and the terrain-field loop — have to agree on `reject`, or a body could
+    // be un-holdable on the ground and still holdable off it (or the other
+    // way round) purely because of which loop happened to notice it first.
+    let mut sim = terrain_sim(1.0);
+    let patch = CollisionWorld::from_world(sim.world_mut()).terrain()[0];
+    let (x, z) = (0.0, 0.0);
+    let h = patch.surface.height_world(patch.origin, x, z);
+    let under = Vec3::new(x, h - 1.0, z);
+
+    const REJECT_BIT: u16 = 1 << 5;
+
+    // A block at the same point, disjoint `Entity` order from the terrain
+    // patch either way — `reject` has to win regardless of which one the tie
+    // rule would otherwise have preferred.
+    let block = sim
+        .world_mut()
+        .spawn((
+            Transform::from_translation(under),
+            AabbCollider {
+                half_extents: Vec3::splat(4.0),
+            },
+        ))
+        .id();
+
+    // Reject the terrain: only the block is left, whichever `Entity` order
+    // they were in.
+    sim.world_mut()
+        .entity_mut(patch.entity)
+        .insert(CollisionLayers::DEFAULT.with_memberships(1 | REJECT_BIT));
+    let geometry = CollisionWorld::from_world(sim.world_mut());
+    assert_eq!(
+        geometry.contains_point_rejecting(under, ALL_LAYERS, REJECT_BIT),
+        Some(block),
+        "a rejected terrain patch must not out-rank a real collider"
+    );
+
+    // Reject the block instead: the terrain is what is left standing.
+    sim.world_mut()
+        .entity_mut(patch.entity)
+        .insert(CollisionLayers::DEFAULT);
+    sim.world_mut()
+        .entity_mut(block)
+        .insert(CollisionLayers::DEFAULT.with_memberships(1 | REJECT_BIT));
+    let geometry = CollisionWorld::from_world(sim.world_mut());
+    assert_eq!(
+        geometry.contains_point_rejecting(under, ALL_LAYERS, REJECT_BIT),
+        Some(patch.entity),
+        "a rejected collider must not out-rank the terrain field behind it"
+    );
+
+    // And rejecting both leaves nothing.
+    sim.world_mut()
+        .entity_mut(patch.entity)
+        .insert(CollisionLayers::DEFAULT.with_memberships(1 | REJECT_BIT));
+    let geometry = CollisionWorld::from_world(sim.world_mut());
+    assert_eq!(
+        geometry.contains_point_rejecting(under, ALL_LAYERS, REJECT_BIT),
+        None
+    );
+}
+
 #[test]
 fn a_point_below_the_analytic_field_is_inside_the_terrain() {
     // The height field has no volume to test against, so containment is the

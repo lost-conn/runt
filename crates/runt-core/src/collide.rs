@@ -3260,6 +3260,41 @@ impl CollisionWorld {
     /// solids only says so with the mask, which is the only lever a query
     /// returning a bare [`Entity`] leaves it.
     pub fn contains_point(&self, point: Vec3, mask: u16) -> Option<Entity> {
+        self.contains_point_rejecting(point, mask, 0)
+    }
+
+    /// [`contains_point`](Self::contains_point), with a second mask: any
+    /// collider whose memberships also match `reject` is not a candidate at
+    /// all, as if it were not in the world — `reject = 0` is exactly
+    /// [`contains_point`](Self::contains_point), since nothing matches the
+    /// empty mask.
+    ///
+    /// ## Why this cannot be the caller's job
+    ///
+    /// `contains_point` answers with **one** [`Entity`], chosen by an internal
+    /// tie rule (lowest wins) over candidates the caller never sees. A caller
+    /// that wants "inside anything on `mask`, except a particular
+    /// classification of collider" cannot get there by calling
+    /// `contains_point` and then discarding an unwanted answer: if the
+    /// winning, lowest-`Entity` collider happens to be the one it wants to
+    /// ignore, the *other* candidate — a genuinely solid body the point is
+    /// also inside of — is invisible behind it, and no mask the caller can
+    /// construct up front says "match `mask`, but if you would have picked
+    /// one of these, keep looking instead of giving up." This is not
+    /// hypothetical: a downstream game crate's phase guard is exactly this
+    /// caller, over a membership bit that marks a collider as "hold this
+    /// instead of blocking on it" — a body carrying that bit resting inside a
+    /// body that does not is exactly this case, and the tie rule that is
+    /// correct for "which one collider is this point in" is the wrong rule
+    /// for "is this point in anything I have to treat as solid." Only the
+    /// scan itself, before it commits to an answer, can tell the two apart.
+    /// So the exclusion has to be a second mask threaded through the same
+    /// scan `mask` already is, not a filter bolted on after.
+    ///
+    /// Rejection beats acceptance: a collider matching both `mask` and
+    /// `reject` is excluded, the same way [`mask_accepts`] alone would have
+    /// accepted it.
+    pub fn contains_point_rejecting(&self, point: Vec3, mask: u16, reject: u16) -> Option<Entity> {
         let mut best: Option<Entity> = None;
         // One buffer for every trimesh walk in the scan, as `overlap_segment`
         // keeps one candidate list for every soup it visits.
@@ -3270,6 +3305,12 @@ impl CollisionWorld {
             // the point is already the lowest-`Entity` one and the rest of the
             // list cannot beat it.
             if best.is_some() {
+                return;
+            }
+            // A rejected collider is skipped, not merely deprioritized: the
+            // scan carries on to the next `Entity`, which is what lets a
+            // solid body *behind* a rejected one still win.
+            if mask_accepts(reject, entry.memberships) {
                 return;
             }
             let inside = match &entry.shape {
@@ -3293,6 +3334,13 @@ impl CollisionWorld {
         });
 
         self.for_each_terrain(mask, |entry| {
+            // Same exclusion, and the same reason the two scans have to agree
+            // on it: a rejected patch must not out-rank a solid collider from
+            // the loop above just because it happens to have the lower
+            // `Entity`, and it must not itself become `best` either.
+            if mask_accepts(reject, entry.memberships) {
+                return;
+            }
             // Terrain is a second Entity-ordered list, so the winner across the
             // two is a comparison rather than a first-match.
             if best.is_some_and(|found| found < entry.entity) {
