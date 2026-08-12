@@ -52,6 +52,21 @@
 //! [`crate::tweak_panel`]'s doctrine on carets), and a control that cannot be
 //! driven is better shown read-only than invented badly.
 //!
+//! [`Widget::Color`] is deliberately **not** in this table: the walk never
+//! produces one. The one reflected field this codebase has that is a colour —
+//! `color: Option<Vec3>` on [`GeneratorSpec`](crate::gen::GeneratorSpec)'s
+//! variants — is optional, so it is a [`Widget::Variant`] of `None`/`Some`
+//! before it is ever a vector at all; teaching the walk to reach past that
+//! wrapper and *also* recognise the field by name would be a second
+//! name-based rule stacked on the one `seed` already is, for a shape that
+//! only ever shows up wrapped in `Option` and never bare. The two fields a
+//! game actually wants a swatch for — a gradient's `Vec<(f32, Vec3)>` ramp and
+//! a material's `Vec4` tint — are both `#[reflect(ignore)]` and unreachable
+//! from any walk regardless (see [`Widget::Color`]'s own doc comment). So
+//! `Color` stays what the module doc above already says every hand-authored
+//! game panel needs sometimes: a widget a game builds directly, not one the
+//! reflected walk infers.
+//!
 //! # Ranges are advisory here — the opposite of `tweak`
 //!
 //! Bounds come off `#[reflect(@FieldRange…)]` exactly as tweak reads them, with
@@ -226,6 +241,61 @@ pub enum Widget {
         components: Vec<VectorComponent>,
         range: FieldRange,
     },
+    /// A colour: like [`Vector`](Widget::Vector), a header row that flattens
+    /// into one editable [`Float`](Widget::Float) per channel via
+    /// [`push_rows`](Widget::push_rows) — but the header also draws a filled
+    /// swatch ([`inspect_panel`](crate::inspect_panel)'s `draw`), because a
+    /// colour is the one small float aggregate a person actually wants to
+    /// *see* rather than read three numbers for.
+    ///
+    /// # rgb, not rgba — and always hand-built
+    ///
+    /// Two real values could have driven this: the procedural texture's
+    /// gradient stops (`TextureSpec::ramp: Vec<(f32, Vec3)>`, rgb) and a
+    /// material's tint (`MaterialDesc::base_color: Vec4`, rgba). Neither is
+    /// reachable from [`build_at`]'s reflected walk, and for two different
+    /// reasons that both predate this widget: the ramp's `Vec3` is buried
+    /// inside a `Vec` of tuples, which `#[reflect(remote = …)]` cannot reach
+    /// through (`ramp`'s own doc comment, `crate::texture::TextureSpec`);
+    /// `Vec4` has no remote definition to reach through at all, because on
+    /// this glam it is one opaque SIMD register with no `x`/`y`/`z`/`w`
+    /// fields to delegate to (`crate::reflect`'s "glam remote definitions"
+    /// section explains why `Vec4` alone has none). Both fields carry
+    /// `#[reflect(ignore)]` for exactly that reason. So every `Color` in this
+    /// engine is, and will stay, something a game builds by hand from a value
+    /// it already has — the way the ramp's rows are hand-built today
+    /// (`ramp_rows` in the game's `materials.rs`), now with a swatch because
+    /// there is finally a widget for one.
+    ///
+    /// Because it is always hand-built there is no single call site that
+    /// must commit to "three channels" or "four": `components` holds however
+    /// many the caller has, in `r, g, b[, a]` order, exactly as `Vector`'s
+    /// `components` holds however many axes it has. The swatch itself is
+    /// always rgb — alpha has no pixel to blend against in a debug-overlay
+    /// quad, and drawing it as translucency would read as "this swatch is
+    /// hard to see," which is the one thing a colour preview must never be.
+    /// An `a` channel, when present, is still an ordinary [`Float`](Widget::Float)
+    /// row underneath, edited the same way `r`, `g` and `b` are.
+    Color {
+        label: String,
+        path: FieldPath,
+        /// The swatch colour, rgb. `f32`, unlike every other widget value's
+        /// `f64`: its only reader is [`inspect_panel`](crate::inspect_panel)'s
+        /// draw, which writes it straight into a
+        /// [`UiQuad`](crate::ui::UiQuad)'s `f32` color, and carrying `f64`
+        /// this far would be a cast nobody needs. **Not clamped** — see
+        /// `range`, below; the draw clamps for display, once, at paint time.
+        value: [f32; 3],
+        /// `r`, `g`, `b`, and `a` if this colour has one — the channels
+        /// [`push_rows`](Widget::push_rows) turns into `Float` rows, the way
+        /// `Vector`'s `components` do.
+        components: Vec<VectorComponent>,
+        /// **Advisory**, the same as every other range in this module — see
+        /// the module docs' "Ranges are advisory" section. Channel values are
+        /// not clamped to it: a channel past 1.0 is how this renderer, which
+        /// has no emission channel, spells "blown out."
+        range: FieldRange,
+    },
     /// A struct that is not a vector: a heading and its fields.
     Group {
         label: String,
@@ -258,6 +328,7 @@ impl Widget {
             | Widget::Choice { label, .. }
             | Widget::Variant { label, .. }
             | Widget::Vector { label, .. }
+            | Widget::Color { label, .. }
             | Widget::Group { label, .. }
             | Widget::Unsupported { label, .. } => label,
         }
@@ -272,6 +343,7 @@ impl Widget {
             | Widget::Choice { path, .. }
             | Widget::Variant { path, .. }
             | Widget::Vector { path, .. }
+            | Widget::Color { path, .. }
             | Widget::Group { path, .. }
             | Widget::Unsupported { path, .. } => path,
         }
@@ -285,7 +357,10 @@ impl Widget {
     /// [`Float`](Widget::Float) row per component, carrying the vector's range —
     /// so the panel has exactly one idea of "edit a number" and a colour's
     /// channels are edited the way tweak already edits them, not through a
-    /// second, vector-shaped code path.
+    /// second, vector-shaped code path. [`Color`](Widget::Color) shares this
+    /// arm outright rather than duplicating it: a colour *is* a vector that
+    /// also draws a swatch, and giving it its own flattening would be the
+    /// second code path the sentence above already argues against.
     pub fn rows(&self) -> Vec<(usize, Widget)> {
         let mut out = Vec::new();
         self.push_rows(0, &mut out);
@@ -300,9 +375,7 @@ impl Widget {
                     f.push_rows(depth + 1, out);
                 }
             }
-            Widget::Vector {
-                components, range, ..
-            } => {
+            Widget::Vector { components, range, .. } | Widget::Color { components, range, .. } => {
                 for c in components {
                     out.push((
                         depth + 1,
@@ -992,6 +1065,49 @@ mod tests {
         let Widget::Float { range, .. } = x_row else { unreachable!() };
         assert_eq!(*range, FieldRange::new(1.0, 256.0));
         assert_eq!(*depth, 3, "root → params → size → x");
+    }
+
+    /// `Color` is never produced by the walk (see the module docs), so this
+    /// pins the one thing it shares with `Vector`: [`Widget::push_rows`]
+    /// flattens a hand-built one exactly the same way, channel order and all.
+    #[test]
+    fn a_color_flattens_into_its_channel_rows_in_order() {
+        let path = FieldPath::root().field("tint");
+        let component = |name: &str, value: f64| VectorComponent {
+            label: name.to_string(),
+            path: path.field(name),
+            value,
+        };
+        let widget = Widget::Color {
+            label: "tint".into(),
+            path: path.clone(),
+            value: [0.2, 0.4, 0.8],
+            components: vec![
+                component("r", 0.2),
+                component("g", 0.4),
+                component("b", 0.8),
+                component("a", 1.0),
+            ],
+            range: FieldRange::new(0.0, 1.0),
+        };
+
+        let rows = widget.rows();
+        assert!(matches!(&rows[0], (0, Widget::Color { .. })), "the header comes first, at its own depth");
+        let channels: Vec<(&str, f64, usize)> = rows[1..]
+            .iter()
+            .map(|(depth, w)| {
+                let Widget::Float { label, value, range, .. } = w else {
+                    panic!("a channel row is a Float: {w:?}");
+                };
+                assert_eq!(*range, FieldRange::new(0.0, 1.0), "the channel carries the colour's range");
+                (label.as_str(), *value, *depth)
+            })
+            .collect();
+        assert_eq!(
+            channels,
+            vec![("r", 0.2, 1), ("g", 0.4, 1), ("b", 0.8, 1), ("a", 1.0, 1)],
+            "r, g, b, a — in that order, one below the header",
+        );
     }
 
     #[test]

@@ -131,8 +131,10 @@ impl InspectPanel {
 ///
 /// The keys are the tweak panel's: Up/Down move, Left/Right step or cycle
 /// (Shift coarse, Ctrl fine), Enter is the row's own verb — toggle a bool,
-/// cycle a choice or a variant, **reroll a seed**. Group and vector header
-/// rows are selectable and inert, like a folded thought.
+/// cycle a choice or a variant, **reroll a seed**. Group, vector and colour
+/// header rows are selectable and inert, like a folded thought: a swatch is a
+/// preview, not a picker, and inventing "Enter opens a colour dialog" here
+/// would be exactly the kind of control this panel has never had one of.
 ///
 /// The caller applies the returned edit with [`inspect::apply`] and rebuilds
 /// the tree; this function never sees the value.
@@ -362,14 +364,17 @@ pub fn draw(
             batch.solid([left + 1.0, y - 1.0, WIDTH - 2.0, pitch], SELECTED);
         }
         let indent = x + 8.0 * *depth as f32;
+        // A colour header is a heading like `Group`/`Vector`: the swatch is
+        // the row's content, the label is only naming it, so it dims the same
+        // way "nested" or "size" do.
         let color = match widget {
-            Widget::Group { .. } | Widget::Vector { .. } | Widget::Unsupported { .. } => DIM,
+            Widget::Group { .. } | Widget::Vector { .. } | Widget::Color { .. } | Widget::Unsupported { .. } => DIM,
             _ => TEXT,
         };
         font.text(batch, indent, y, widget.label(), SCALE, color);
 
+        let right = left + WIDTH - PAD;
         if let Some(text) = value_text(widget) {
-            let right = left + WIDTH - PAD;
             font.text(batch, right - font.width(&text, SCALE), y, &text, SCALE, color);
             match widget {
                 Widget::Float { value, range, .. } => tweak_panel::value_bar(
@@ -390,6 +395,11 @@ pub fn draw(
                 ),
                 _ => {}
             }
+        } else if let Widget::Color { value, .. } = widget {
+            // No text to leave room for, unlike a numeric row's bar — the
+            // swatch fills the whole value column, flush with the right edge
+            // every other row's text is flush with.
+            color_swatch(batch, *value, right - BAR_WIDTH, y, pitch);
         }
         y += pitch;
     }
@@ -411,14 +421,65 @@ fn value_text(widget: &Widget) -> Option<String> {
             Some(format!("< {selected} >"))
         }
         Widget::Unsupported { .. } => Some("-".to_string()),
-        Widget::Vector { .. } | Widget::Group { .. } => None,
+        // `Color` draws a swatch instead of a value column, the way `Vector`
+        // and `Group` draw nothing there: it is a heading with its content
+        // below it, not a leaf with a reading next to it.
+        Widget::Vector { .. } | Widget::Group { .. } | Widget::Color { .. } => None,
     }
+}
+
+/// Clamp one channel for **display only**.
+///
+/// Channel values are never clamped in the data — see
+/// [`inspect::Widget::Color`]'s doc comment for why an out-of-range channel
+/// is a real, meaningful number in this renderer (no emission channel, so a
+/// colour past white is how "blown out" is spelled) — but a quad's fill
+/// colour has to be *some* finite `[0, 1]` number or it paints noise instead
+/// of a swatch. NaN clamps to `0.0` rather than propagating: `f32::clamp`
+/// itself returns NaN unchanged (it is unordered against both bounds), and a
+/// black square is a far better failure than a quad whose colour silently
+/// isn't one.
+fn display_channel(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// The preview beside a [`Color`](Widget::Color) row's label.
+///
+/// `BAR_WIDTH` wide, the same box a numeric row's
+/// [`tweak_panel::value_bar`] fills, so a colour and a number agree about
+/// where the value column starts — the same reuse-not-invent rule the rest
+/// of this module's spacing follows.
+///
+/// Drawn with a one-pixel [`RIM`] border rather than flush against
+/// [`BACKDROP`]: the backdrop is already very dark
+/// (`[0.05, 0.05, 0.07, 0.88]`), so a near-black *authored* colour with no
+/// border would draw as a gap in the panel — exactly the "reads as a hole"
+/// failure a swatch must not have. A chequer behind it would say the same
+/// thing with a second texture and a shader branch a debug overlay has no
+/// other reason to own; one extra quad in a colour the panel's own outline
+/// already uses is simpler and gives the same read, "this is a filled thing."
+fn color_swatch(batch: &mut UiBatch, rgb: [f32; 3], x: f32, y: f32, pitch: f32) {
+    let h = (pitch - 6.0).max(2.0);
+    let top = y + (pitch - h) * 0.5 - 1.0;
+    batch.solid([x - 1.0, top - 1.0, BAR_WIDTH + 2.0, h + 2.0], RIM);
+    let fill = [
+        display_channel(rgb[0]),
+        display_channel(rgb[1]),
+        display_channel(rgb[2]),
+        1.0,
+    ];
+    batch.solid([x, top, BAR_WIDTH, h], fill);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::input::{InputEvent, TouchPhase};
+    use crate::inspect::VectorComponent;
     use crate::reflect::FieldRange;
 
     fn float(label: &str, value: f64) -> Widget {
@@ -427,6 +488,24 @@ mod tests {
             path: FieldPath::root().field(label),
             value,
             range: FieldRange::new(0.0, 10.0),
+        }
+    }
+
+    /// A hand-built `Color`, the way a game builds one — see
+    /// [`inspect::Widget::Color`]'s doc comment for why the walk never does.
+    fn color(label: &str, rgb: [f32; 3]) -> Widget {
+        let path = FieldPath::root().field(label);
+        let component = |name: &str, v: f32| VectorComponent {
+            label: name.to_string(),
+            path: path.field(name),
+            value: v as f64,
+        };
+        Widget::Color {
+            label: label.to_string(),
+            path: path.clone(),
+            value: rgb,
+            components: vec![component("r", rgb[0]), component("g", rgb[1]), component("b", rgb[2])],
+            range: FieldRange::new(0.0, 1.0),
         }
     }
 
@@ -599,6 +678,38 @@ mod tests {
         }
     }
 
+    /// Mirrors [`a_group_row_is_selectable_and_inert`]: a swatch is a preview,
+    /// not a control, so its header has no verb either.
+    #[test]
+    fn a_color_row_is_selectable_and_inert() {
+        let mut panel = InspectPanel::new();
+        panel.open = true;
+        let rows = vec![(0, color("tint", [0.2, 0.4, 0.8]))];
+        panel.cursor = 0;
+        for key in [Key::Enter, Key::Right, Key::Left] {
+            assert_eq!(
+                decide(&mut panel, &rows, &tick([InputEvent::KeyDown(key)]), view()),
+                None
+            );
+        }
+    }
+
+    /// `Widget::rows` flattens a `Color` exactly the way it flattens a
+    /// `Vector` (they share the match arm — `inspect.rs`'s `push_rows`); this
+    /// pins the panel's own view of that: the header at its own depth, then
+    /// one channel row per component, in order, one level deeper.
+    #[test]
+    fn a_color_flattens_into_its_channel_rows_in_order() {
+        let rows = color("tint", [0.2, 0.4, 0.8]).rows();
+        assert!(matches!(&rows[0], (0, Widget::Color { .. })), "the header comes first");
+        let channels: Vec<(usize, &str)> = rows[1..].iter().map(|(depth, w)| (*depth, w.label())).collect();
+        assert_eq!(
+            channels,
+            vec![(1, "r"), (1, "g"), (1, "b")],
+            "r, g, b — in order, one below the header",
+        );
+    }
+
     #[test]
     fn a_tap_selects_the_row_and_a_drag_sweeps_its_value() {
         let mut panel = InspectPanel::new();
@@ -711,5 +822,32 @@ mod tests {
 
         draw(&mut panel, &rows(), &mut batch, &BlockFont, view(), "TORUS");
         assert!(!batch.is_empty(), "an open panel with rows draws");
+    }
+
+    /// `inspect::apply` never clamps a channel (the module docs' advisory-range
+    /// argument), so a `Color` the panel is asked to draw can carry a channel
+    /// past `[0, 1]` or, if a drag or a scene file ever produced one, NaN. The
+    /// draw must turn that into a swatch, not a panic and not a quad the GPU
+    /// would choke on.
+    #[test]
+    fn an_out_of_range_or_nan_channel_draws_a_finite_swatch_not_a_panic() {
+        let mut panel = InspectPanel::new();
+        panel.open = true;
+        let rows = vec![(0, color("blown", [5.0, -2.0, f32::NAN]))];
+        let mut batch = UiBatch::new();
+        draw(&mut panel, &rows, &mut batch, &BlockFont, view(), "MATERIAL");
+        assert!(!batch.is_empty(), "the rim and the swatch still draw");
+        for quad in &batch.quads {
+            assert!(
+                quad.rect.iter().all(|v| v.is_finite()),
+                "geometry must stay finite even off-range: {:?}",
+                quad.rect
+            );
+            assert!(
+                quad.color.iter().all(|v| v.is_finite()),
+                "a NaN channel must not reach the GPU colour: {:?}",
+                quad.color
+            );
+        }
     }
 }
