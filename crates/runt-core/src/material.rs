@@ -404,6 +404,83 @@ impl MaterialVariant {
     /// [`TEXTURE`]: MaterialVariant::TEXTURE
     /// [`UNLIT`]: MaterialVariant::UNLIT
     pub const PHASE_NO_DISCARD: MaterialVariant = MaterialVariant(1 << 17);
+    /// Slide the point a procedural texture is sampled at along the render
+    /// clock, so the pattern **travels** across a surface that is standing still.
+    ///
+    /// One authored scalar, [`Material::params`]`.w`, in **world units per
+    /// second**: the sample point walks `speed` along the basis's X and
+    /// `speed · SCROLL_CROSS_SPEED` along its Z. The original is
+    /// `3dimenshift/shaders/fx/water.gdshader:35`, verbatim —
+    ///
+    /// ```text
+    /// uv = world_pos.xz · noise_scale + vec2(TIME·scroll_speed, TIME·scroll_speed·0.7)
+    /// ```
+    ///
+    /// — and the `0.7` is a constant in the original rather than a uniform, so
+    /// it is a constant here too (`SCROLL_CROSS_SPEED` in `shader.wgsl`, beside
+    /// [`VERTEX_WAVE`]'s own pair). What it buys is the same thing the crossed
+    /// sines buy: a single-axis drift reads as a conveyor belt, and two axes at
+    /// an irrational-looking ratio read as a current.
+    ///
+    /// # A vector was the obvious shape and is the wrong one
+    ///
+    /// Three of `params`' four slots are [`VERTEX_WAVE`]'s and the fourth is
+    /// this, which is exactly enough for the one number an author has ever
+    /// wanted — the surfaces that scroll are water, and water scrolls *one way
+    /// at one rate*. A free `vec2` (let alone a `vec3`) would need slots the
+    /// uniform does not have, and would buy the ability to author a ratio whose
+    /// only correct value is the one the original fixed. The rule
+    /// [`WAVE_CROSS_FREQ`] set is that a shape constant stays a constant and
+    /// only the *rate* is authored; this follows it.
+    ///
+    /// # Both texture paths, one decision
+    ///
+    /// The offset is added to `shader.wgsl`'s `p_source` — after
+    /// [`LOCAL_SPACE`] has chosen the basis and before either texture branch
+    /// reads it — so [`TEXTURE`]'s three plane taps and [`LIVE_TEX`]'s field
+    /// evaluation move together and by the same amount. That is why the number
+    /// is in world units rather than in tile units: the two paths scale
+    /// `p_source` by different factors (`world_scale` against
+    /// `live_cells_per_metre`), so a tile-space rate would make one authored
+    /// number mean two different speeds either side of §7's live gate, and the
+    /// A/B toggle would stop being a comparison.
+    ///
+    /// Under [`LOCAL_SPACE`] the walk is along the *object's* X and Z, which is
+    /// the only reading that keeps the pattern the object's own — a world-axis
+    /// drift on an object-space pattern would slide it across the surface,
+    /// which is the artifact that bit exists to remove.
+    ///
+    /// Inert with no texture bound, like [`LOCAL_SPACE`] and [`NORMAL_MAP`]:
+    /// it moves a sampling point, and a draw that samples nothing has no point
+    /// to move.
+    ///
+    /// # It is a render-clock effect and nothing else
+    ///
+    /// [`FrameUniform::time`]`.x` is host wall seconds and is never a
+    /// simulation input (DESIGN §4). This moves *which texel is under a
+    /// fragment* and touches no vertex, no normal and no bound — so unlike
+    /// [`VERTEX_WAVE`] it cannot even push geometry past a culler's AABB. There
+    /// is no CPU half of this bit and there is nothing for one to do.
+    ///
+    /// # The slot is shared with [`EMISSIVE_SWEEP`], and that is the rule
+    ///
+    /// `params.w` is the sweep's "swept gain". Slot sharing across variants is
+    /// already how this block works — "whichever variant reads the slot gets the
+    /// number the author put there" — and the two are not a collision but a
+    /// caller describing one surface as two looks: a wire that wipes is not a
+    /// pond that drifts, and nothing in the port authors both on one draw. Said
+    /// out loud here rather than left to the table below, because a shared slot
+    /// discovered later reads as a bug.
+    ///
+    /// [`FrameUniform::time`]: crate::FrameUniform::time
+    /// [`VERTEX_WAVE`]: MaterialVariant::VERTEX_WAVE
+    /// [`WAVE_CROSS_FREQ`]: MaterialVariant::VERTEX_WAVE
+    /// [`LOCAL_SPACE`]: MaterialVariant::LOCAL_SPACE
+    /// [`NORMAL_MAP`]: MaterialVariant::NORMAL_MAP
+    /// [`TEXTURE`]: MaterialVariant::TEXTURE
+    /// [`LIVE_TEX`]: MaterialVariant::LIVE_TEX
+    /// [`EMISSIVE_SWEEP`]: MaterialVariant::EMISSIVE_SWEEP
+    pub const TEXTURE_SCROLL: MaterialVariant = MaterialVariant(1 << 18);
 
     /// The two bits that name *which way* [`PHASE_CIRCLE`] cuts, as one mask.
     ///
@@ -427,7 +504,7 @@ impl MaterialVariant {
     /// `F_TWO_SIDED`: this list is the *declaration* of the key space, and a bit
     /// missing from it would be a key the preprocessor silently could not
     /// describe.
-    pub const FLAGS: [(&'static str, MaterialVariant); 18] = [
+    pub const FLAGS: [(&'static str, MaterialVariant); 19] = [
         ("F_VERTEX_COLOR", MaterialVariant::VERTEX_COLOR),
         ("F_TEXTURE", MaterialVariant::TEXTURE),
         ("F_RAMP", MaterialVariant::RAMP),
@@ -446,6 +523,7 @@ impl MaterialVariant {
         ("F_LOCAL_SPACE", MaterialVariant::LOCAL_SPACE),
         ("F_PHASE_INVERT", MaterialVariant::PHASE_INVERT),
         ("F_PHASE_NO_DISCARD", MaterialVariant::PHASE_NO_DISCARD),
+        ("F_TEXTURE_SCROLL", MaterialVariant::TEXTURE_SCROLL),
     ];
 
     /// The two blend bits, as one mask: the draws that leave the opaque
@@ -472,7 +550,8 @@ impl MaterialVariant {
             | MaterialVariant::SHADOW.0
             | MaterialVariant::LOCAL_SPACE.0
             | MaterialVariant::PHASE_INVERT.0
-            | MaterialVariant::PHASE_NO_DISCARD.0,
+            | MaterialVariant::PHASE_NO_DISCARD.0
+            | MaterialVariant::TEXTURE_SCROLL.0,
     );
 
     /// The four bits that each *replace* the lighting term rather than feeding
@@ -587,6 +666,7 @@ pub struct Material {
     /// | [`FRESNEL`] | — | rim power | — | — |
     /// | [`EMISSIVE_SWEEP`] | un-swept gain | progress | fade width | swept gain |
     /// | [`VERTEX_WAVE`] | amplitude | frequency | speed | — |
+    /// | [`TEXTURE_SCROLL`] | — | — | — | scroll speed, m/s |
     ///
     /// These are numbers an author **tunes**. A choice between a fixed set of
     /// behaviours is not one of those and does not belong here: it goes in the
@@ -606,14 +686,18 @@ pub struct Material {
     /// rule is "whichever variant reads the slot gets the number the author put
     /// there". What changed is that the set of readers is now only ever
     /// *authored* numbers, so two of them on one draw is a caller describing one
-    /// surface as two looks, not a mode colliding with a tuning value. The rest
-    /// is reserved for ramp threshold/softness/… as those variants land.
-    /// Uploaded whole from the start so a new variant never changes the uniform
-    /// layout.
+    /// surface as two looks, not a mode colliding with a tuning value. `w` is the
+    /// second such pair — [`EMISSIVE_SWEEP`]'s swept gain and
+    /// [`TEXTURE_SCROLL`]'s speed — and it is deliberately *not* the exception
+    /// the phase mode was: both are tuned numbers, a wire that wipes is not a
+    /// pond that drifts, and no draw in the port is both. The rest is reserved
+    /// for ramp threshold/softness/… as those variants land. Uploaded whole from
+    /// the start so a new variant never changes the uniform layout.
     ///
     /// [`FRESNEL`]: MaterialVariant::FRESNEL
     /// [`EMISSIVE_SWEEP`]: MaterialVariant::EMISSIVE_SWEEP
     /// [`VERTEX_WAVE`]: MaterialVariant::VERTEX_WAVE
+    /// [`TEXTURE_SCROLL`]: MaterialVariant::TEXTURE_SCROLL
     /// [`PHASE_CIRCLE`]: MaterialVariant::PHASE_CIRCLE
     /// [`PHASE_INVERT`]: MaterialVariant::PHASE_INVERT
     /// [`PHASE_NO_DISCARD`]: MaterialVariant::PHASE_NO_DISCARD

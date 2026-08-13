@@ -119,6 +119,13 @@ struct TexParams {
 const WAVE_CROSS_FREQ: f32 = 1.3;
 const WAVE_CROSS_SPEED: f32 = 0.85;
 
+// `F_TEXTURE_SCROLL`'s cross ratio, the same kind of number one line up:
+// `fx/water.gdshader:35` offsets its sample by `vec2(TIME·s, TIME·s·0.7)`, and
+// the `0.7` is a literal there rather than a uniform. Keeping it a constant is
+// what makes the authored value a *rate* — one number, one current — instead of
+// a free direction whose only right answer is this one.
+const SCROLL_CROSS_SPEED: f32 = 0.7;
+
 struct VSOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
@@ -737,6 +744,31 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     var p_source = in.world_pos;
     if (F_LOCAL_SPACE) {
         p_source = in.local_pos;
+    }
+
+    // ---- The clock on the tap (`F_TEXTURE_SCROLL`) ------------------------
+    //
+    // `fx/water.gdshader:35`: the sample point walks along the basis's X and Z
+    // so the mottling *travels* across a surface that is standing still. Applied
+    // here, to `p_source`, for the same reason the basis choice is asked once —
+    // it is one question ("which point is this fragment sampling at"), and both
+    // branches below read the answer. So a scrolled draw moves identically on
+    // the baked tile and in the live field, which is what keeps §7's A/B toggle
+    // a comparison of two modes rather than of two speeds.
+    //
+    // In *world* units per second, deliberately: the two branches scale
+    // `p_source` by `world_scale` and by `cells_per_metre` respectively, so an
+    // offset applied after either scaling would mean two different speeds either
+    // side of the gate for one authored number. Applied before, it means metres.
+    //
+    // The derivatives are untouched by construction — the offset is uniform over
+    // the whole frame, so `dpdx(p_source + k)` is `dpdx(p_source)` — which is why
+    // this needs no case in either branch's gradient hoist. Nothing else is
+    // touched either: no vertex, no normal, no bound. See
+    // `MaterialVariant::TEXTURE_SCROLL`.
+    if (F_TEXTURE_SCROLL) {
+        let drift = in.params.w * frame.time.x;
+        p_source = p_source + vec3<f32>(drift, 0.0, drift * SCROLL_CROSS_SPEED);
     }
 
     // `F_LIVE_TEX` supersedes `F_TEXTURE`: live evaluates the spec and never

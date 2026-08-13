@@ -56,6 +56,30 @@ const LOCAL_SPACE_REACH: [MaterialVariant; 4] = [
     MaterialVariant::VERTEX_WAVE,
 ];
 
+/// `TEXTURE_SCROLL`'s whole reach, as [`LOCAL_SPACE_REACH`]'s twin — and for the
+/// same measured reason, since appending a sixteenth branching bit to
+/// [`SHADER_BITS`] would take 256 modules to 512 and nine seconds to twenty-one.
+///
+/// The two bits are in fact the *same* reach, because they are two decisions
+/// about one value: `shader.wgsl` picks the sampling basis with `F_LOCAL_SPACE`
+/// and then slides it with `F_TEXTURE_SCROLL`, both writing `p_source` and
+/// neither touching anything else. So what has to be crossed is what reads
+/// `p_source` — the two texture branches and `NORMAL_MAP`, which takes a
+/// derivative pair inside one of them — plus `LOCAL_SPACE` itself, which is the
+/// only flag that can change *what* is being slid.
+///
+/// [`VERTEX_WAVE`](MaterialVariant::VERTEX_WAVE) is deliberately absent where
+/// `LOCAL_SPACE_REACH` has it: that pairing is about a varying the vertex stage
+/// mutates, and this bit is read only in the fragment stage and only after the
+/// varying has arrived. If the scroll ever grows a vertex-side half, it belongs
+/// in that list instead.
+const TEXTURE_SCROLL_REACH: [MaterialVariant; 4] = [
+    MaterialVariant::TEXTURE,
+    MaterialVariant::LIVE_TEX,
+    MaterialVariant::NORMAL_MAP,
+    MaterialVariant::LOCAL_SPACE,
+];
+
 /// The three phase modes, as keys — the same narrow-product argument
 /// [`LOCAL_SPACE_REACH`] makes, for the pair of bits that carry the mode.
 ///
@@ -137,6 +161,7 @@ fn variant_source_declares_every_flag_with_the_right_value() {
     assert!(src.contains("const F_LOCAL_SPACE: bool = false;"));
     assert!(src.contains("const F_PHASE_INVERT: bool = false;"));
     assert!(src.contains("const F_PHASE_NO_DISCARD: bool = false;"));
+    assert!(src.contains("const F_TEXTURE_SCROLL: bool = false;"));
     assert!(src.ends_with(material::BASE_SHADER), "base source is appended verbatim");
 
     let none = material::variant_source(material::BASE_SHADER, MaterialVariant::NONE);
@@ -213,6 +238,8 @@ fn variant_keys_behave_as_bitflags() {
     // moves.
     assert_eq!(MaterialVariant::PHASE_INVERT.bits(), 1 << 16);
     assert_eq!(MaterialVariant::PHASE_NO_DISCARD.bits(), 1 << 17);
+    // The clock on the texture tap, appended like every look before it.
+    assert_eq!(MaterialVariant::TEXTURE_SCROLL.bits(), 1 << 18);
 
     // The flag list and the bits agree, so no key can be generated that the
     // preprocessor would not emit a const for.
@@ -221,7 +248,7 @@ fn variant_keys_behave_as_bitflags() {
         assert!(!union.contains(flag), "duplicate flag bit {:#06b}", flag.bits());
         union |= flag;
     }
-    assert_eq!(union.bits(), 0b11_1111_1111_1111_1111);
+    assert_eq!(union.bits(), 0b111_1111_1111_1111_1111);
 
     // The four looks that replace the lighting term rather than feeding it.
     // Exactly one wins per fragment; the mask is what says which four they are.
@@ -508,6 +535,69 @@ fn every_local_space_texture_combination_compiles() {
     // space that had quietly masked `LOCAL_SPACE` off — the way
     // `resolve_variant` masks the two texture bits — would show up here as
     // sixteen pipelines instead of thirty-two.
+    assert_eq!(
+        renderer.pipeline_count(),
+        keys.len(),
+        "one pipeline per key, and the bit is part of the key"
+    );
+}
+
+/// The scroll compiled against every flag that reads the point it slides.
+///
+/// [`TEXTURE_SCROLL_REACH`] carries the argument for why this is a thirty-two
+/// key list rather than a sixteenth bit in [`SHADER_BITS`]. The key worth naming
+/// is `TEXTURE_SCROLL | LOCAL_SPACE | LIVE_TEX | NORMAL_MAP`: there the offset is
+/// written into a `p_source` that a `const` branch has already replaced, and the
+/// value then feeds two `dpdx` pairs inside another one. A build where the offset
+/// had been applied *after* the basis choice — or inside a branch that made the
+/// derivatives non-uniform — fails here and nowhere else.
+#[test]
+fn every_texture_scroll_combination_compiles() {
+    let mut renderer = match pollster::block_on(Renderer::headless(FORMAT)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("SKIP (no GPU adapter): {e}");
+            return;
+        }
+    };
+
+    let mut keys = Vec::new();
+    for scroll in [MaterialVariant::NONE, MaterialVariant::TEXTURE_SCROLL] {
+        for bits in 0..(1u32 << TEXTURE_SCROLL_REACH.len()) {
+            let mut variant = scroll;
+            for (i, flag) in TEXTURE_SCROLL_REACH.iter().enumerate() {
+                if bits & (1 << i) != 0 {
+                    variant |= *flag;
+                }
+            }
+            keys.push(variant);
+        }
+    }
+    assert_eq!(keys.len(), 32, "two halves of a four-bit product");
+
+    for variant in &keys {
+        let scope = renderer
+            .device()
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let _module = renderer
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("texture-scroll variant under test"),
+                source: wgpu::ShaderSource::Wgsl(
+                    material::variant_source(material::BASE_SHADER, *variant).into(),
+                ),
+            });
+        let err = pollster::block_on(scope.pop());
+        assert!(
+            err.is_none(),
+            "variant {:#021b} failed to compile: {err:?}",
+            variant.bits()
+        );
+        renderer.ensure_pipeline(*variant);
+    }
+
+    // Half of these differ from the other half in bit 18 alone, so a key space
+    // that had quietly masked the scroll off would show sixteen pipelines here.
     assert_eq!(
         renderer.pipeline_count(),
         keys.len(),
