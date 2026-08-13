@@ -29,6 +29,7 @@ use glam::{Quat, Vec3};
 use runt_core::collide::{
     self, move_and_slide, CharacterBody, CharacterShape, ColliderEntry, ColliderShape,
     CollisionLayers, CollisionWorld, ContactKind, MoveResult, ObbCollider, Trimesh, ALL_LAYERS,
+    WELD_GRID,
 };
 use runt_core::physics::{AabbCollider, SphereCollider, Trigger, Velocity};
 use runt_core::{Sim, SimConfig, Transform};
@@ -1953,6 +1954,223 @@ fn a_shared_edge_is_a_seam_unless_the_surface_turns_a_corner_at_it() {
 }
 
 #[test]
+fn two_positions_inside_the_weld_grid_are_one_vertex_wherever_they_sit() {
+    // The welder used to be a single `HashMap` probe on `round(p / WELD_GRID)`,
+    // which is a quantisation and not a proximity test: two positions a tenth of
+    // the tolerance apart, either side of a cell boundary, landed on different
+    // keys and came out as two vertices. Two names for one corner is an edge key
+    // the triangles on either side of it can never agree on — 14 030 of the
+    // playground bake's 65 900 vertices had a twin it had failed to merge.
+    //
+    // Each probe is one triangle whose first two corners are `gap` apart, placed
+    // at a different sub-grid phase and four metres from its neighbours so the
+    // probes cannot interfere. If the pair welds, the triangle has a repeated
+    // corner and is dropped; if it does not, the triangle survives. So the whole
+    // claim reads off the triangle count.
+    const PROBES: u32 = 64;
+    for (gap, welds) in [(WELD_GRID * 0.9, true), (WELD_GRID * 1.5, false)] {
+        let mut soup: Vec<Vec3> = Vec::new();
+        for i in 0..PROBES {
+            // 0.37 of a grid per step walks every phase within a cell, including
+            // straddling one, over the 23 grids the sweep covers.
+            let base = Vec3::new(0.37 * WELD_GRID * i as f32, 0.0, 4.0 * i as f32);
+            soup.extend([base, base + Vec3::X * gap, base + Vec3::Y]);
+        }
+        let indices: Vec<u32> = (0..soup.len() as u32).collect();
+        let mesh = Trimesh::build_from_soup(&soup, &indices);
+
+        let (tris, verts) = if welds {
+            (0, 2 * PROBES)
+        } else {
+            (PROBES, 3 * PROBES)
+        };
+        assert_eq!(
+            mesh.triangle_count() as u32,
+            tris,
+            "a gap of {gap} m: {} of {PROBES} probe triangles survived, wanted \
+             {tris} — a pair {} the tolerance welded the wrong way",
+            mesh.triangle_count(),
+            if welds { "inside" } else { "outside" }
+        );
+        assert_eq!(
+            mesh.vertex_count() as u32,
+            verts,
+            "a gap of {gap} m: {} vertices, wanted {verts}",
+            mesh.vertex_count()
+        );
+    }
+}
+
+/// A closed block over `x ∈ [-12, 12]`, `z ∈ [-30, 30]`, two metres deep with
+/// its top at `y = 0`, whose top face is two quads meeting along `x = 0` — and,
+/// when `cut`, with the **right** one divided at `z = 0` and the left one left
+/// whole.
+///
+/// That is a T-junction and nothing else: the left quad's edge runs the whole
+/// depth of the block, the right side's runs it in two halves, and the vertex
+/// where they meet sits in the middle of an edge no other triangle carries. It
+/// is what a CSG boolean leaves every time it cuts one face of a joint and not
+/// the face across from it, and it is the shape of the 5 072 broken edges the
+/// playground bake had. The cut propagates once more, to the `x = 12` face,
+/// exactly as a real one does.
+///
+/// Closed rather than a bare sheet for the reason [`slab`] gives: a snap probe
+/// under a sheet meets the boundary of the surface it was standing on, which
+/// reads as a wall.
+fn t_junction_block(cut: bool) -> (Vec<Vec3>, Vec<u32>) {
+    let (top, bot, z0, z1) = (0.0f32, -2.0f32, -30.0f32, 30.0f32);
+    let mut verts: Vec<Vec3> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let mut quad = |p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3| {
+        let base = verts.len() as u32;
+        verts.extend([p0, p1, p2, p3]);
+        indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+    let p = |x: f32, y: f32, z: f32| Vec3::new(x, y, z);
+
+    // Top, looking up. The left half is always one quad — it is the face whose
+    // edge the cut orphans.
+    quad(p(-12.0, top, z0), p(-12.0, top, z1), p(0.0, top, z1), p(0.0, top, z0));
+    if cut {
+        quad(p(0.0, top, z0), p(0.0, top, 0.0), p(12.0, top, 0.0), p(12.0, top, z0));
+        quad(p(0.0, top, 0.0), p(0.0, top, z1), p(12.0, top, z1), p(12.0, top, 0.0));
+    } else {
+        quad(p(0.0, top, z0), p(0.0, top, z1), p(12.0, top, z1), p(12.0, top, z0));
+    }
+
+    // Bottom, looking down, and the two z faces — halved at `x = 0` so that the
+    // uncut block is genuinely seamless and the only unpaired edges in the cut
+    // one are the ones the cut made.
+    quad(p(-12.0, bot, z0), p(0.0, bot, z0), p(0.0, bot, z1), p(-12.0, bot, z1));
+    quad(p(0.0, bot, z0), p(12.0, bot, z0), p(12.0, bot, z1), p(0.0, bot, z1));
+    quad(p(-12.0, top, z0), p(0.0, top, z0), p(0.0, bot, z0), p(-12.0, bot, z0));
+    quad(p(0.0, top, z0), p(12.0, top, z0), p(12.0, bot, z0), p(0.0, bot, z0));
+    quad(p(-12.0, top, z1), p(-12.0, bot, z1), p(0.0, bot, z1), p(0.0, top, z1));
+    quad(p(0.0, top, z1), p(0.0, bot, z1), p(12.0, bot, z1), p(12.0, top, z1));
+
+    // The two x faces, whole. The left one matches the top's left quad; the
+    // right one is what the cut orphans a second time.
+    quad(p(-12.0, top, z0), p(-12.0, bot, z0), p(-12.0, bot, z1), p(-12.0, top, z1));
+    quad(p(12.0, top, z0), p(12.0, top, z1), p(12.0, bot, z1), p(12.0, bot, z0));
+    (verts, indices)
+}
+
+/// Every edge of `mesh` that exactly one triangle carries.
+///
+/// On a closed solid there are none, by definition: each edge is where two faces
+/// meet. One that has no partner is an edge `mark_exposed_edges` will find no
+/// neighbour for, mark exposed with no ridge to clamp a contact into, and hand
+/// the solver the raw direction to as a surface normal.
+fn unpaired_edges(mesh: &Trimesh) -> Vec<(u32, u32)> {
+    let mut carriers: std::collections::HashMap<(u32, u32), u32> =
+        std::collections::HashMap::new();
+    for tri in mesh.tris() {
+        for k in 0..3usize {
+            let (a, b) = (tri[k], tri[(k + 1) % 3]);
+            *carriers.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+        }
+    }
+    let mut lonely: Vec<(u32, u32)> = carriers
+        .iter()
+        .filter(|(_, count)| **count == 1)
+        .map(|(key, _)| *key)
+        .collect();
+    lonely.sort_unstable();
+    lonely
+}
+
+#[test]
+fn a_face_cut_on_one_side_of_a_seam_leaves_no_edge_without_a_neighbour() {
+    // The data-structure half of the CSG cutout bug. The cut block describes the
+    // same solid as the uncut one, and the build has to end up saying so: every
+    // edge carried by two triangles, and — the thing the solver actually reads —
+    // no exposed edge without a ridge normal, which is the state that makes a
+    // contact report the direction to the edge instead of the face.
+    for cut in [false, true] {
+        let (verts, indices) = t_junction_block(cut);
+        let mesh = Trimesh::build_from_soup(&verts, &indices);
+        assert_eq!(
+            unpaired_edges(&mesh),
+            Vec::new(),
+            "the {} block has edges no second triangle carries",
+            if cut { "cut" } else { "whole" }
+        );
+
+        let unbounded = mesh
+            .edge_flags()
+            .iter()
+            .zip(mesh.edge_ridges())
+            .map(|(flags, ridges)| {
+                (0..3usize)
+                    .filter(|k| flags & (1 << k) != 0 && ridges[*k] == Vec3::ZERO)
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(
+            unbounded, 0,
+            "the {} block has {unbounded} exposed edges with no ridge to clamp \
+             a contact into — on a closed solid every exposed edge is a ridge \
+             between two faces",
+            if cut { "cut" } else { "whole" }
+        );
+
+        // And the repair is a re-cut, not a rebuild: it invents no vertex, so
+        // the solid's corners are the ones the soup was written with.
+        assert!(
+            mesh.verts()
+                .iter()
+                .all(|v| indices.iter().any(|i| verts[*i as usize] == *v)),
+            "the build produced a vertex the soup never had"
+        );
+    }
+
+    // The cost is part of the claim: a cut vertex costs exactly one triangle,
+    // in the one triangle whose edge it lies on. The whole block is ten quads,
+    // the cut one eleven, and the repair adds two — one for the top-left quad's
+    // long edge, one for the `x = 12` face's.
+    let (whole_verts, whole_indices) = t_junction_block(false);
+    let (cut_verts, cut_indices) = t_junction_block(true);
+    let whole = Trimesh::build_from_soup(&whole_verts, &whole_indices);
+    let cut = Trimesh::build_from_soup(&cut_verts, &cut_indices);
+    assert_eq!((whole.triangle_count(), cut.triangle_count()), (20, 24));
+}
+
+#[test]
+fn building_what_a_build_produced_changes_nothing() {
+    // `build` is idempotent, and that is a contract rather than an accident:
+    // 3dimenshift's bake cache stores a *built* collider's welded verts and
+    // triangles and calls `build_from_soup` on them again on a warm start, so a
+    // build that added one more triangle the second time round would make a
+    // cached level a different level from an uncached one. It is also the
+    // property that decides the shape of the T-junction pass — see
+    // `split_t_junctions`, which refuses a cut that would need cleaning up after
+    // rather than making one and dropping it, because the make-and-drop pair
+    // does not converge.
+    for (name, (verts, indices)) in [
+        ("a bumpy grid", grid_soup(6.0, 9, bumpy)),
+        ("a cut block", t_junction_block(true)),
+        ("a whole block", t_junction_block(false)),
+    ] {
+        let once = Trimesh::build_from_soup(&verts, &indices);
+        let soup: Vec<u32> = once.tris().iter().flatten().copied().collect();
+        let twice = Trimesh::build_from_soup(once.verts(), &soup);
+        assert_eq!(
+            (twice.vertex_count(), twice.triangle_count()),
+            (once.vertex_count(), once.triangle_count()),
+            "{name}: rebuilding a built soup changed its size"
+        );
+        assert_eq!(twice.verts(), once.verts(), "{name}: the vertices moved");
+        assert_eq!(twice.tris(), once.tris(), "{name}: the triangles changed");
+        assert_eq!(
+            twice.edge_flags(),
+            once.edge_flags(),
+            "{name}: the edge tables changed"
+        );
+        assert_eq!(twice.nodes(), once.nodes(), "{name}: the tree changed");
+    }
+}
+
+#[test]
 fn building_the_same_soup_twice_produces_identical_arrays() {
     // DESIGN §9a: the BVH is built once at load and *deterministically*. Median
     // index split plus a `(axis value, original index)` sort key means there is
@@ -2935,6 +3153,69 @@ fn crossing_a_joint_between_two_colliders_costs_no_speed_and_no_hop() {
                     (run.end.x * dir.x) > 2.5,
                     "{kind} {name} {dir}: the run ended at x = {}, still short \
                      of the far side",
+                    run.end.x
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn crossing_a_t_junction_seam_costs_no_speed_and_no_hop() {
+    // The third bug of this shape, and the one that is entirely inside one soup:
+    // "CSG cutout collision acts funky — the player gets suddenly snapped around
+    // on edges". A boolean cut one side of a seam and not the other, the two
+    // sides named the same surface with different vertices, and no edge key
+    // matched across it. `mark_exposed_edges` then had nothing to pair the long
+    // edge with, so it marked it exposed with no ridge — and an exposed edge
+    // with no ridge is the one case `trimesh_contact` cannot clamp: it reports
+    // the raw direction to the edge, which for a body a centimetre past it is a
+    // normal tilted backwards over the flat ground it is standing on.
+    //
+    // The cut and whole blocks are the same solid, so they have to drive the
+    // same. The whole one is the control: it says the harness would notice.
+    for cut in [false, true] {
+        let (verts, indices) = t_junction_block(cut);
+        let mesh = Trimesh::build_from_soup(&verts, &indices);
+        let mut level = Level::new();
+        let block = level.bare();
+        let mut geometry = level.snapshot();
+        push_trimesh(&mut geometry, block, Vec3::ZERO, &mesh, 1);
+
+        for (name, body, speed) in [
+            ("walk", walker(), 4.0f32),
+            ("run", walker(), 8.0),
+            ("roll", roller(), 12.0),
+        ] {
+            for dir in [Vec3::X, Vec3::NEG_X] {
+                // Straight over `x = 0` at `z = 0`, which is where the cut left
+                // its vertex sitting in the middle of the left face's edge.
+                let start = Vec3::new(-3.0 * dir.x, resting_offset(&body), 0.0);
+                let run = sweep_phases(&geometry, &body, start, dir, speed, 6.0);
+                let seam = if cut { "cut seam" } else { "whole top" };
+                assert!(
+                    run.speed_loss < NO_BUMP,
+                    "{seam} {name} {dir}: crossing took {} m/s of horizontal speed",
+                    run.speed_loss
+                );
+                assert!(
+                    run.kick < NO_BUMP,
+                    "{seam} {name} {dir}: crossing kicked the body up at {} m/s",
+                    run.kick
+                );
+                assert!(
+                    run.rise < NO_BUMP,
+                    "{seam} {name} {dir}: crossing lifted the body {} m",
+                    run.rise
+                );
+                assert_eq!(
+                    run.airborne, 0,
+                    "{seam} {name} {dir}: on_floor flickered off crossing a flat top"
+                );
+                assert!(
+                    (run.end.x * dir.x) > 2.5,
+                    "{seam} {name} {dir}: the run ended at x = {}, still short of \
+                     the far side",
                     run.end.x
                 );
             }

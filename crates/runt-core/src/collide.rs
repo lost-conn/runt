@@ -670,14 +670,92 @@ impl ShapeContact {
 // Static trimeshes (DESIGN §9a, 2026-08-04)
 // ---------------------------------------------------------------------------
 
-/// Grid the welder snaps positions onto, in metres.
+/// How close two positions have to be for the welder to call them one vertex,
+/// in metres.
 ///
-/// 0.1 mm: two vertices a CSG bake emitted separately for the same corner land
-/// on the same key, and two vertices a level author *meant* to keep apart never
-/// do. The quantised key is what the lookup is on; the vertex kept is the
-/// **first occurrence's exact position**, so welding never moves geometry by up
-/// to half a cell — it only ever discards duplicates.
+/// 0.1 mm: two vertices a CSG bake emitted separately for the same corner are
+/// merged, and two vertices a level author *meant* to keep apart never are. It
+/// is a **distance**, not a quantisation — the vertex kept is the first
+/// occurrence's exact position, so welding never moves geometry, it only ever
+/// discards duplicates.
+///
+/// It used to be a quantisation, and that was the bug: the lookup was a single
+/// `HashMap` probe on `round(p / WELD_GRID)`, so two positions a hair apart on
+/// opposite sides of a cell boundary landed on different keys and survived as
+/// two vertices. On the playground bake that left **14 030 of 65 900** welded
+/// vertices with another welded vertex within one grid of them, and every one of
+/// those pairs is an edge key two triangles fail to agree on — which is to say an
+/// interior edge that reads as an open boundary. See [`weld_positions`].
 pub const WELD_GRID: f32 = 1.0e-4;
+
+/// Cell the welder's hash grid buckets vertices into, in metres — eight
+/// [`WELD_GRID`]s.
+///
+/// The cell is deliberately *not* the tolerance. Make them equal and every
+/// lookup has to sweep all 27 neighbouring cells, because a match can always be
+/// one cell away on every axis. At eight times the tolerance a position is
+/// within reach of a neighbouring cell on a given axis only when it lies in the
+/// outermost eighth of the cell, so the sweep is `1..=2` cells per axis and
+/// **under two cells in the mean** — while the cell stays small enough (0.8 mm)
+/// that a bucket holds a handful of vertices at worst. The hard bound is
+/// geometric: no two welded vertices are within [`WELD_GRID`] of each other, so
+/// at most `9³` of them fit in one cell however dense the soup.
+const WELD_CELL: f32 = WELD_GRID * 8.0;
+
+/// How far off an edge a welded vertex may lie and still count as sitting *on*
+/// it — the T-junction test's tolerance, and [`WELD_GRID`] for a reason that is
+/// not the obvious one.
+///
+/// The obvious reading is that this is float slop, and by that reading it wants
+/// to be *bigger*: a T-junction vertex is one a CSG boolean put on the edge
+/// exactly and arithmetic then moved, at the playground's ±200 m coordinates an
+/// `f32` ulp is 15 µm, and BSP clipping compounds them. And a bigger tolerance
+/// does repair more — measured on the playground bake, which went in with 42 698
+/// edges no second triangle carried:
+///
+/// | tolerance | broken edges left | settles? |
+/// |---|---|---|
+/// | **1 × `WELD_GRID`** | **1 746** | **yes, on the 4th pass** |
+/// | 2 × | 1 528 | no |
+/// | 5 × | 1 311 | no |
+/// | 10 × | 1 077 | no |
+///
+/// The second column is the one that decides it. [`split_t_junctions`] cuts an
+/// edge at a vertex up to this far *off* it, so the two halves lie up to this far
+/// off the line the whole edge lay on — and a vertex that was outside the
+/// tolerance of the whole edge can be inside the tolerance of a half. Past one
+/// weld grid that second-order eligibility never runs out: the pass keeps finding
+/// new cuts, pass after pass, and the build never reaches a state that rebuilding
+/// would leave alone. At exactly one weld grid it does, on the fourth pass, and
+/// it has to: `3dimenshift`'s bake cache stores a *built* collider's soup and
+/// rebuilds it on a warm start, so `build(build(x))` must be `build(x)`.
+///
+/// Which is the tidier statement anyway. The tolerance is not a slop budget, it
+/// is the resolution the vertices themselves are held at — [`weld_positions`]
+/// guarantees no two are closer than this — and a repair that reasons below its
+/// own data's resolution is guessing.
+const T_JUNCTION_TOLERANCE: f32 = WELD_GRID;
+
+/// How many times the split pass may run before the build gives up on reaching a
+/// fixed point.
+///
+/// The loop exits the moment a pass makes no cut, which is the state that makes
+/// the build idempotent (see [`T_JUNCTION_TOLERANCE`]); the playground bake gets
+/// there on the fourth pass and eight is that with room. The cap is what makes
+/// termination a property of the *code* rather than of the geometry: a soup that
+/// would not settle costs a bounded amount of work and comes out correct but
+/// unsettled, rather than hanging a level load.
+const T_SPLIT_PASSES: u32 = 8;
+
+/// Cell the T-junction scan's hash grid buckets vertices into, in metres.
+///
+/// A quarter of a metre. Unlike [`WELD_CELL`] this one is not sized against a
+/// tolerance — the scan walks a *segment*, so what matters is that a triangle
+/// edge crosses a small number of cells (a baked triangle is centimetres to a
+/// metre across) while a cell holds a small number of vertices. It is a constant
+/// rather than something derived from the soup's density so that the structure,
+/// and therefore the split, is a pure function of the positions alone.
+const T_SPLIT_CELL: f32 = 0.25;
 
 /// Squared cross-product length below which a triangle is dropped as
 /// degenerate. Same threshold and the same reasoning as `runt_mesh`'s
@@ -754,23 +832,40 @@ impl BvhNode {
 ///
 /// ## What `build` does, and why each step is deterministic
 ///
-/// 1. **Weld** positions onto a [`WELD_GRID`] cell. The lookup is a `HashMap`,
-///    but the *output* order is the input's — vertices are appended on first
-///    occurrence, so nothing here iterates a hash container and two runs over
-///    the same soup produce the same `verts` array.
+/// 1. **Weld** positions within [`WELD_GRID`] of each other into one vertex
+///    ([`weld_positions`]). The lookup is a hash grid, but the *output* order is
+///    the input's — vertices are appended on first occurrence and a match is
+///    always resolved to the lowest index — so nothing here iterates a hash
+///    container and two runs over the same soup produce the same `verts` array.
 /// 2. **Drop degenerates** — a triangle with a repeated welded index, or a raw
-///    cross below [`DEGENERATE_AREA_SQ`]. A zero-area triangle has no normal,
-///    and a contact routine that divides by its length is a NaN generator.
-/// 3. **Face normals**, precomputed once. They are the contact normal the solver
+///    cross below [`DEGENERATE_AREA_SQ`] ([`is_solid`]). A zero-area triangle
+///    has no normal, and a contact routine that divides by its length is a NaN
+///    generator. It runs *before* step 3 as well as after because a sliver left
+///    in the soup is a false neighbour: it carries an edge key, so the broken
+///    edge it lies along looks shared and step 3 leaves it alone. Afterwards it
+///    has nothing to find — step 3 refuses to make a sliver rather than making
+///    one and leaving it here — and it stays as the gate that says so.
+/// 3. **Split T-junctions** ([`split_t_junctions`], run to a fixed point up to
+///    [`T_SPLIT_PASSES`] times). An edge no other triangle shares, with a welded
+///    vertex sitting in its interior, is one face a CSG boolean cut and its
+///    neighbour did not — the two sides describe the same surface with different
+///    vertices and no edge key can ever match. The triangle is re-cut so that
+///    vertex is a corner of it, which is the whole of the repair: no vertex is
+///    invented and no surface moves further than [`T_JUNCTION_TOLERANCE`].
+/// 4. **Face normals**, precomputed once. They are the contact normal the solver
 ///    reports on the face interior, so the surface a body stands on is the
 ///    surface the level author authored — not an average of whatever the
 ///    tessellator did nearby.
-/// 4. **Edge tables** (`mark_exposed_edges`): which of each triangle's edges
+/// 5. **Edge tables** (`mark_exposed_edges`): which of each triangle's edges
 ///    are seams and which are ridges the surface genuinely turns at, and — for
 ///    the ridges — the neighbour that says how far it turns. The first is what
 ///    keeps a tessellated floor from reading as a field of tiny walls; the
-///    second is what keeps the lip of a cliff from reading as one.
-/// 5. **BVH**, top-down: split at the *median index* of the triangles sorted by
+///    second is what keeps the lip of a cliff from reading as one. Steps 1 and 3
+///    exist to make this step's adjacency *complete*: an interior edge it cannot
+///    find a neighbour for is marked exposed with no ridge to clamp against, and
+///    a contact there reports the raw direction to the edge — a tilted normal in
+///    the middle of flat ground, which brakes and kicks the body.
+/// 6. **BVH**, top-down: split at the *median index* of the triangles sorted by
 ///    centroid along the longest axis of the node's centroid bounds, keyed
 ///    `(axis value, original triangle index)` so equal centroids still have one
 ///    order. Median-index (rather than median-value) split means the halves are
@@ -829,20 +924,10 @@ impl Trimesh {
     /// Build from bare slices, for geometry that never became a `MeshData`.
     pub fn build_from_soup(positions: &[Vec3], indices: &[u32]) -> Arc<Trimesh> {
         // -- weld ----------------------------------------------------------
-        let mut verts: Vec<Vec3> = Vec::new();
-        let mut welded: Vec<u32> = Vec::with_capacity(positions.len());
-        let mut grid: HashMap<[i64; 3], u32> = HashMap::with_capacity(positions.len());
-        for &p in positions {
-            let key = weld_key(p);
-            let index = *grid.entry(key).or_insert_with(|| {
-                verts.push(p);
-                (verts.len() - 1) as u32
-            });
-            welded.push(index);
-        }
+        let (verts, welded) = weld_positions(positions);
 
-        // -- triangles, degenerates dropped, normals precomputed ------------
-        let mut items: Vec<BuildTri> = Vec::with_capacity(indices.len() / 3);
+        // -- triangles, through the weld -----------------------------------
+        let mut tris: Vec<[u32; 3]> = Vec::with_capacity(indices.len() / 3);
         for face in indices.chunks_exact(3) {
             debug_assert!(
                 face.iter().all(|i| (*i as usize) < welded.len()),
@@ -851,30 +936,46 @@ impl Trimesh {
             if face.iter().any(|i| (*i as usize) >= welded.len()) {
                 continue;
             }
-            let tri = [
+            tris.push([
                 welded[face[0] as usize],
                 welded[face[1] as usize],
                 welded[face[2] as usize],
-            ];
-            if tri[0] == tri[1] || tri[1] == tri[2] || tri[0] == tri[2] {
-                continue;
+            ]);
+        }
+
+        // -- repair the adjacency ------------------------------------------
+        //
+        // The degenerate gate runs either side of the split: before, so a
+        // sliver cannot stand in as the neighbour of a broken edge and hide it;
+        // after, as the standing check that the split kept its side of the
+        // bargain and made none.
+        drop_degenerate_triangles(&verts, &mut tris);
+        for _ in 0..T_SPLIT_PASSES {
+            let (split, cuts) = split_t_junctions(&verts, tris);
+            tris = split;
+            if cuts == 0 {
+                break;
             }
+        }
+        drop_degenerate_triangles(&verts, &mut tris);
+
+        // -- normals precomputed -------------------------------------------
+        let mut items: Vec<BuildTri> = Vec::with_capacity(tris.len());
+        for tri in tris {
             let (a, b, c) = (
                 verts[tri[0] as usize],
                 verts[tri[1] as usize],
                 verts[tri[2] as usize],
             );
-            let cross = (b - a).cross(c - a);
-            if cross.length_squared() < DEGENERATE_AREA_SQ {
-                continue;
-            }
             let original = items.len() as u32;
             items.push(BuildTri {
                 centroid: (a + b + c) / 3.0,
                 min: a.min(b).min(c),
                 max: a.max(b).max(c),
                 tri,
-                normal: cross.normalize(),
+                // Non-degenerate by the gate above, so the cross has a length to
+                // divide by.
+                normal: (b - a).cross(c - a).normalize(),
                 edge_flags: 0b111,
                 edge_ridges: [Vec3::ZERO; 3],
                 original,
@@ -1001,13 +1102,460 @@ impl Trimesh {
     }
 }
 
-/// The quantised weld key. `round` rather than `floor` so a position sitting on
-/// a cell boundary is not split by an ulp of noise, and `i64` so a 32-bit world
-/// coordinate cannot overflow it.
+/// A uniform hash grid over vertex positions, with the vertices of a cell
+/// **chained** through one parallel array rather than held in a `Vec` per cell.
+///
+/// A bake's grid is tens of thousands of occupied cells holding one or two
+/// vertices each, and a `Vec` allocation for each of them is the entire cost of
+/// the structure. The chain is one `Vec<u32>` the length of the vertex array:
+/// `heads[cell]` is the newest vertex in that cell and `next[v]` is the one
+/// before it, [`CellGrid::END`] terminating the list.
+///
+/// Nothing here iterates the map — only chains reached from a key the caller
+/// computed — so every structure built on it is a pure function of the positions
+/// (DESIGN §3, §9a).
+struct CellGrid {
+    cell: f32,
+    heads: HashMap<[i64; 3], u32>,
+    next: Vec<u32>,
+}
+
+impl CellGrid {
+    const END: u32 = u32::MAX;
+
+    fn with_capacity(cell: f32, capacity: usize) -> CellGrid {
+        CellGrid {
+            cell,
+            heads: HashMap::with_capacity(capacity),
+            next: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// The cell a position falls in. `floor` rather than `round` so that "which
+    /// cells can hold a vertex within `r` of `p`" is the pair of floors of
+    /// `p ± r`, and `i64` so a 32-bit world coordinate cannot overflow it.
+    #[inline]
+    fn key(&self, p: Vec3) -> [i64; 3] {
+        let q = p / self.cell;
+        [
+            q.x.floor() as i64,
+            q.y.floor() as i64,
+            q.z.floor() as i64,
+        ]
+    }
+
+    /// Add the vertex whose index is `self.next.len()`, at `p`.
+    fn push(&mut self, p: Vec3) {
+        let key = self.key(p);
+        let index = self.next.len() as u32;
+        let previous = self.heads.insert(key, index).unwrap_or(CellGrid::END);
+        self.next.push(previous);
+    }
+
+    /// Every vertex index in one cell, newest first.
+    #[inline]
+    fn for_each_in(&self, key: [i64; 3], mut visit: impl FnMut(u32)) {
+        let mut node = self.heads.get(&key).copied().unwrap_or(CellGrid::END);
+        while node != CellGrid::END {
+            visit(node);
+            node = self.next[node as usize];
+        }
+    }
+
+    /// Every vertex index in the cells spanning `[lo, hi]`, in a fixed cell
+    /// order.
+    #[inline]
+    fn for_each_in_box(&self, lo: Vec3, hi: Vec3, mut visit: impl FnMut(u32)) {
+        let (lo, hi) = (self.key(lo), self.key(hi));
+        for x in lo[0]..=hi[0] {
+            for y in lo[1]..=hi[1] {
+                for z in lo[2]..=hi[2] {
+                    self.for_each_in([x, y, z], &mut visit);
+                }
+            }
+        }
+    }
+
+    /// Every vertex index in the cells spanning `[lo, hi]` on the two axes other
+    /// than `axis`, with `axis` **pinned** to the cell index `slab`.
+    ///
+    /// The pin is what makes a slab walk visit each cell exactly once: a cell
+    /// belongs to one slab, so no two slabs can offer the same vertex.
+    #[inline]
+    fn for_each_in_slab(
+        &self,
+        axis: usize,
+        slab: i64,
+        lo: Vec3,
+        hi: Vec3,
+        mut visit: impl FnMut(u32),
+    ) {
+        let (lo, hi) = (self.key(lo), self.key(hi));
+        let mut key = [0i64; 3];
+        key[axis] = slab;
+        let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+        for i in lo[u]..=hi[u] {
+            key[u] = i;
+            for j in lo[v]..=hi[v] {
+                key[v] = j;
+                self.for_each_in(key, &mut visit);
+            }
+        }
+    }
+}
+
+/// Merge positions within [`WELD_GRID`] of each other, keeping the **first
+/// occurrence's exact position**, and return the kept vertices plus the map from
+/// input position to kept vertex.
+///
+/// The whole subtlety is the one the old quantised lookup got wrong: two
+/// positions can be a tenth of the tolerance apart and still fall in different
+/// cells, so a single probe on the key is not a proximity test. This probes
+/// every cell the tolerance ball reaches — one or two per axis, because
+/// [`WELD_CELL`] is eight times the tolerance (see there for why that number)
+/// — and resolves a hit to the **lowest** matching index, so which cell the
+/// probe happened to find it in cannot change the answer.
+///
+/// Two properties fall out. The output order is the input's: a vertex is
+/// appended the first time a position that matches nothing appears. And no two
+/// kept vertices are within [`WELD_GRID`] of each other, by construction — which
+/// is the invariant every edge key downstream rests on, because two vertices
+/// closer than that are two names for one corner and the two triangles that
+/// picked different names never agree on the edge between them.
+///
+/// Welding is *not* transitive and is not meant to be: a chain of positions each
+/// a hair under the tolerance from the last stays a chain, because the kept
+/// vertex is an exact input position and merging along the chain would drag
+/// geometry. Only positions genuinely within the tolerance of a kept vertex
+/// merge into it.
+fn weld_positions(positions: &[Vec3]) -> (Vec<Vec3>, Vec<u32>) {
+    let mut verts: Vec<Vec3> = Vec::new();
+    let mut welded: Vec<u32> = Vec::with_capacity(positions.len());
+    let mut grid = CellGrid::with_capacity(WELD_CELL, positions.len());
+    let reach = Vec3::splat(WELD_GRID);
+    let tolerance_sq = WELD_GRID * WELD_GRID;
+    for &p in positions {
+        let mut found = CellGrid::END;
+        grid.for_each_in_box(p - reach, p + reach, |index| {
+            if index < found && verts[index as usize].distance_squared(p) <= tolerance_sq {
+                found = index;
+            }
+        });
+        let index = if found == CellGrid::END {
+            grid.push(p);
+            verts.push(p);
+            (verts.len() - 1) as u32
+        } else {
+            found
+        };
+        welded.push(index);
+    }
+    (verts, welded)
+}
+
+/// Has this triangle enough area to have a normal? A repeated welded index or a
+/// raw cross below [`DEGENERATE_AREA_SQ`] says no, and a contact routine that
+/// divides by that cross's length is a NaN generator.
 #[inline]
-fn weld_key(p: Vec3) -> [i64; 3] {
-    let q = p / WELD_GRID;
-    [q.x.round() as i64, q.y.round() as i64, q.z.round() as i64]
+fn is_solid(verts: &[Vec3], tri: [u32; 3]) -> bool {
+    if tri[0] == tri[1] || tri[1] == tri[2] || tri[0] == tri[2] {
+        return false;
+    }
+    let (a, b, c) = (
+        verts[tri[0] as usize],
+        verts[tri[1] as usize],
+        verts[tri[2] as usize],
+    );
+    (b - a).cross(c - a).length_squared() >= DEGENERATE_AREA_SQ
+}
+
+/// Drop the triangles [`is_solid`] refuses.
+fn drop_degenerate_triangles(verts: &[Vec3], tris: &mut Vec<[u32; 3]>) {
+    tris.retain(|tri| is_solid(verts, *tri));
+}
+
+/// Re-cut the triangles whose edges have welded vertices sitting in them, so
+/// that every such vertex is a corner of the triangle it lies on.
+///
+/// ## What it repairs
+///
+/// A CSG boolean cuts one face of a joint and leaves the face on the other side
+/// whole. The two sides then describe the same surface with different vertices:
+/// one long edge `a→b` on this side, a chain `a→v→b` on that one. No edge key
+/// can match across it, so [`mark_exposed_edges`] finds no neighbour, marks the
+/// long edge exposed with no ridge to clamp against, and a body that so much as
+/// grazes it takes the raw direction *to the edge* as its floor normal. That is
+/// a normal tilted by tens of degrees in the middle of ground that is visibly
+/// flat, and the solver projects velocity against every one of them: it brakes,
+/// and — because the tilt has a vertical component — it kicks. On the
+/// 3dimenshift playground bake it was **5 072** edges.
+///
+/// Splitting `a→b` at `v` makes both halves ordinary edges the chain on the
+/// other side matches, and the surface is unchanged: `v` is an existing welded
+/// vertex, so nothing is invented, and it lies within
+/// [`T_JUNCTION_TOLERANCE`] of the edge, so nothing moves further than the weld
+/// already moves things.
+///
+/// ## Which edges are candidates, and why that bounds the work
+///
+/// Only an edge **no other triangle carries**. An edge two triangles already
+/// agree on has the adjacency this pass exists to produce, and re-cutting it
+/// would have to be done identically on both sides or it would break what it
+/// found. Skipping them is also what keeps the pass affordable: the playground's
+/// soup has 325 k triangle edges and 43 k broken ones, and only the broken ones
+/// pay for a spatial query.
+///
+/// The consequence is a residue this pass deliberately does not chase: a vertex
+/// inside an edge that *is* shared, which is a third face butting into the
+/// middle of a joint rather than a boolean's leftovers. That is a genuine crease
+/// in the surface, not a tessellation artefact.
+///
+/// ## Termination and growth
+///
+/// The split points of a triangle are found once, up front, against its three
+/// original edges. Cutting at one of them yields two triangles that between them
+/// carry the rest — the new edge `v→c` they share is not rescanned, and does not
+/// need to be, because the two halves already agree on it. So a triangle with
+/// `n` points on its edges becomes at most `n + 1` triangles and the work list
+/// shrinks by one point every iteration: one call cannot cascade.
+///
+/// The *caller* runs it again until a call makes no cut, up to
+/// [`T_SPLIT_PASSES`], because a cut edge is a slightly different edge and the
+/// halves can have points the whole never did — see [`T_JUNCTION_TOLERANCE`],
+/// which is the constant that decides whether that ever runs out. On the
+/// playground bake it takes four calls, and the whole repair grows the terrain
+/// soup from 108 252 triangles to 116 665, **7.8%**.
+///
+/// A cut that would shear a sliver off a corner is **refused**, not made and then
+/// dropped by [`DEGENERATE_AREA_SQ`] downstream. That is not tidiness: a dropped
+/// sliver was a *neighbour*, so dropping it re-breaks the edge it was carrying,
+/// the next call cuts the same corner again, and the pair never settles — the
+/// playground bake goes into a cycle adding six triangles per call for ever.
+/// Refusing leaves the pass with nothing to clean up after, which is what lets
+/// the loop above have a fixed point to find.
+///
+/// What the refusals cost is a residue: 1 746 of the playground's 175 781 edges
+/// still carried by one triangle, against 42 698 of 325 269 before any of this
+/// existed.
+///
+/// ## Determinism
+///
+/// Triangles are visited in order; a triangle's edges in order `0, 1, 2`; the
+/// points on an edge sorted along it with ties broken by vertex index; the work
+/// list is a stack, so the emitted order is fixed. The grid is read through keys
+/// the caller computes and never iterated (DESIGN §9a).
+fn split_t_junctions(verts: &[Vec3], tris: Vec<[u32; 3]>) -> (Vec<[u32; 3]>, usize) {
+    // Which edges are broken. `lonely` is maintained rather than counted at the
+    // end so that the early-out never iterates the map.
+    let mut carriers: HashMap<(u32, u32), u32> = HashMap::with_capacity(tris.len() * 2);
+    let mut lonely = 0usize;
+    for tri in &tris {
+        for k in 0..3usize {
+            let count = carriers.entry(edge_key(tri[k], tri[(k + 1) % 3])).or_insert(0);
+            *count += 1;
+            match *count {
+                1 => lonely += 1,
+                2 => lonely -= 1,
+                _ => {}
+            }
+        }
+    }
+    if lonely == 0 {
+        return (tris, 0);
+    }
+
+    let mut grid = CellGrid::with_capacity(T_SPLIT_CELL, verts.len());
+    for p in verts {
+        grid.push(*p);
+    }
+
+    let mut out: Vec<[u32; 3]> = Vec::with_capacity(tris.len());
+    // Per triangle: the split points of all three edges, back to back, with a
+    // `[start, end)` range each. Reused across triangles, so the whole pass
+    // allocates a bounded amount however many splits it finds.
+    let mut points: Vec<u32> = Vec::new();
+    let mut hits: Vec<(f32, u32)> = Vec::new();
+    let mut work: Vec<PendingCut> = Vec::new();
+    let mut cuts = 0usize;
+    for tri in &tris {
+        points.clear();
+        let mut ranges = [(0u32, 0u32); 3];
+        for k in 0..3usize {
+            let (a, b) = (tri[k], tri[(k + 1) % 3]);
+            let start = points.len() as u32;
+            if carriers[&edge_key(a, b)] == 1 {
+                interior_vertices(&grid, verts, a, b, &mut hits);
+                points.extend(hits.iter().map(|(_, index)| *index));
+            }
+            ranges[k] = (start, points.len() as u32);
+        }
+        if ranges.iter().all(|(start, end)| start == end) {
+            out.push(*tri);
+            continue;
+        }
+
+        // Cut at the *first* point along the edge, so the near half is finished
+        // and only the far half carries anything on. Rotating the triangle so
+        // the cut edge is edge 0 keeps one rule for all three.
+        work.push(PendingCut { tri: *tri, ranges });
+        while let Some(PendingCut { tri, ranges }) = work.pop() {
+            let Some(k) = (0..3usize).find(|k| ranges[*k].0 < ranges[*k].1) else {
+                out.push(tri);
+                continue;
+            };
+            let (v0, v1, v2) = (tri[k], tri[(k + 1) % 3], tri[(k + 2) % 3]);
+            let (cut, rest) = (ranges[k].0, (ranges[k].0 + 1, ranges[k].1));
+            let (opposite, closing) = (ranges[(k + 1) % 3], ranges[(k + 2) % 3]);
+            let point = points[cut as usize];
+            const NONE: (u32, u32) = (0, 0);
+            // A cut that would shear a sliver off a corner is **refused**, not
+            // made and then dropped by the gate downstream. Dropping it would
+            // re-break the edge the sliver was carrying, a later pass would cut
+            // the same corner again, and the pair does not converge: on the
+            // playground bake it settles into a cycle that adds six triangles
+            // for ever. Refusing is also what makes the whole build idempotent,
+            // which `3dimenshift`'s bake cache requires by construction — it
+            // stores a built collider's soup and rebuilds it.
+            let (near, far) = ([v0, point, v2], [point, v1, v2]);
+            if !is_solid(verts, near) || !is_solid(verts, far) {
+                let mut ranges = ranges;
+                ranges[k] = rest;
+                work.push(PendingCut { tri, ranges });
+                continue;
+            }
+            cuts += 1;
+            work.push(PendingCut {
+                tri: far,
+                ranges: [rest, opposite, NONE],
+            });
+            work.push(PendingCut {
+                tri: near,
+                ranges: [NONE, NONE, closing],
+            });
+        }
+    }
+    (out, cuts)
+}
+
+/// The undirected key of the edge between two welded vertices.
+#[inline]
+fn edge_key(v0: u32, v1: u32) -> (u32, u32) {
+    (v0.min(v1), v0.max(v1))
+}
+
+/// One triangle [`split_t_junctions`] has yet to finish cutting, and where the
+/// split points it still has to honour live.
+struct PendingCut {
+    tri: [u32; 3],
+    /// `[start, end)` into the pass's split-point buffer, one range per edge, in
+    /// the same edge numbering the triangle uses: `0` is `tri[0]→tri[1]`.
+    ranges: [(u32, u32); 3],
+}
+
+/// The welded vertices lying in the **interior** of the segment `a→b`, ordered
+/// along it, ties broken by vertex index.
+///
+/// "Interior" is the parameter along the edge landing in `[0, 1]`, and the only
+/// endpoint test is the identity of `a` and `b` themselves. Excluding a *ball*
+/// around each end instead would be the intuitive thing and is wrong at this
+/// tolerance: [`T_JUNCTION_TOLERANCE`] is a millimetre and a baked triangle can
+/// be a few millimetres across, so the two balls would swallow the whole of
+/// every small edge — measured, that alone took the playground's leftover broken
+/// edges from 1 746 back up to 4 000-odd. What the ball was guarding against is a
+/// cut so close to a corner that the near half is a sliver, and that is guarded
+/// where it belongs: [`split_t_junctions`] tests the two halves it is about to
+/// make and refuses the cut, which is a decision about *this* triangle rather
+/// than a blanket exclusion zone around every corner in the soup.
+///
+/// The scan walks the segment one **slab** at a time along its dominant axis —
+/// the axis it moves furthest on — and asks the grid for the cells the segment's
+/// piece of that slab reaches, grown by the tolerance. Walking a fixed axis
+/// rather than stepping a ray means no accumulated float error can skip a cell,
+/// and pinning the dominant axis bounds the other two to a couple of cells
+/// apiece: the cost is a handful of probes per slab and the slab count is the
+/// edge's length in cells, so a long edge costs what it spans and a short one
+/// costs one lookup.
+fn interior_vertices(
+    grid: &CellGrid,
+    verts: &[Vec3],
+    a: u32,
+    b: u32,
+    out: &mut Vec<(f32, u32)>,
+) {
+    out.clear();
+    let (pa, pb) = (verts[a as usize], verts[b as usize]);
+    let ab = pb - pa;
+    let length_sq = ab.length_squared();
+    let tolerance_sq = T_JUNCTION_TOLERANCE * T_JUNCTION_TOLERANCE;
+    if length_sq <= tolerance_sq {
+        return;
+    }
+
+    let axis = {
+        let d = ab.abs();
+        if d.x >= d.y && d.x >= d.z {
+            0
+        } else if d.y >= d.z {
+            1
+        } else {
+            2
+        }
+    };
+    let reach = Vec3::splat(T_JUNCTION_TOLERANCE);
+    let span = (
+        pa[axis].min(pb[axis]) - T_JUNCTION_TOLERANCE,
+        pa[axis].max(pb[axis]) + T_JUNCTION_TOLERANCE,
+    );
+    let (lo_slab, hi_slab) = (
+        (span.0 / grid.cell).floor() as i64,
+        (span.1 / grid.cell).floor() as i64,
+    );
+    // The dominant axis moves at least as fast as either other, so a slab of it
+    // is crossed in at most one cell of each of theirs: the box below is a
+    // couple of cells however long the edge is.
+    let travel = ab[axis];
+    for slab in lo_slab..=hi_slab {
+        // The stretch of the segment whose dominant coordinate can be within the
+        // tolerance of this slab, clamped to the segment itself. A vertex in the
+        // slab and within the tolerance of the segment is within the tolerance
+        // of *this* stretch.
+        let (near, far) = (
+            slab as f32 * grid.cell - T_JUNCTION_TOLERANCE,
+            (slab + 1) as f32 * grid.cell + T_JUNCTION_TOLERANCE,
+        );
+        let (t0, t1) = if travel != 0.0 {
+            let (u, v) = ((near - pa[axis]) / travel, (far - pa[axis]) / travel);
+            (u.min(v).clamp(0.0, 1.0), u.max(v).clamp(0.0, 1.0))
+        } else {
+            (0.0, 1.0)
+        };
+        let (p0, p1) = (pa + ab * t0, pa + ab * t1);
+        grid.for_each_in_slab(
+            axis,
+            slab,
+            p0.min(p1) - reach,
+            p0.max(p1) + reach,
+            |index| {
+                if index == a || index == b {
+                    return;
+                }
+                let p = verts[index as usize];
+                let t = (p - pa).dot(ab) / length_sq;
+                if !(0.0..=1.0).contains(&t) {
+                    return;
+                }
+                if (pa + ab * t).distance_squared(p) > tolerance_sq {
+                    return;
+                }
+                out.push((t, index));
+            },
+        );
+    }
+
+    // A cell is visited once — the dominant axis is pinned per slab and a cell
+    // belongs to one slab — so there is nothing to deduplicate, and `(t, index)`
+    // is a strict total order over what is left.
+    out.sort_unstable_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
 }
 
 /// How far off a triangle's plane a neighbour's far vertex has to lie, relative
@@ -1081,8 +1629,7 @@ fn mark_exposed_edges(verts: &[Vec3], items: &mut [BuildTri]) {
     let mut shared: HashMap<(u32, u32), Vec<(u32, u32)>> = HashMap::with_capacity(items.len() * 2);
     for (index, item) in items.iter().enumerate() {
         for k in 0..3usize {
-            let (v0, v1) = (item.tri[k], item.tri[(k + 1) % 3]);
-            let key = (v0.min(v1), v0.max(v1));
+            let key = edge_key(item.tri[k], item.tri[(k + 1) % 3]);
             shared
                 .entry(key)
                 .or_default()
@@ -1105,8 +1652,7 @@ fn mark_exposed_edges(verts: &[Vec3], items: &mut [BuildTri]) {
         let mut ridges = [Vec3::ZERO; 3];
         for k in 0..3usize {
             let (v0, v1) = (tri[k], tri[(k + 1) % 3]);
-            let key = (v0.min(v1), v0.max(v1));
-            let on_edge = &shared[&key];
+            let on_edge = &shared[&edge_key(v0, v1)];
             let mut exposed = true;
             for &(other, opposite) in on_edge {
                 if other == index as u32 {
