@@ -25,6 +25,12 @@ pub mod camera;
 /// Collision v2 (DESIGN §9): capsule character solver, OBBs, layers, queries.
 /// Additive — `physics` is untouched by it.
 pub mod collide;
+/// Where the user's cache and config directories are, per platform — the one
+/// resolver [`cache`]'s disk store and `runt_app::storage` both call. Native
+/// only: the web equivalents (IndexedDB, `localStorage`) are *named* rather
+/// than located, and no path resolution reaches them.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dirs;
 pub mod draw;
 pub mod ecs;
 /// The in-game scene editor's toolkit (DESIGN §10a). Off by default with the

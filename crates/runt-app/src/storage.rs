@@ -51,6 +51,14 @@ pub fn save(app: &str, key: &str, value: &str) -> bool {
 /// names unreadable and still need this predicate to decide what to escape —
 /// the store simply refuses anything that is not an identifier-ish word. Keys
 /// are written by the program, not the player, so this costs a game nothing.
+///
+/// Stricter than [`runt_core::dirs::is_app_name`], which the resolver applies
+/// to `app` underneath this, and deliberately not merged with it: that one is
+/// the floor every caller needs (a name that cannot climb out of its directory)
+/// while this one is a policy about *file* names in a directory a human will
+/// occasionally open. Loosening this to the floor would let a config file be
+/// called `°`, and tightening the floor to this would silently narrow what a
+/// cache directory may be named.
 fn is_safe(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
@@ -69,20 +77,25 @@ fn is_safe(name: &str) -> bool {
 mod imp {
     use std::path::PathBuf;
 
-    /// `$XDG_CONFIG_HOME/<app>/<key>`, falling back to `$HOME/.config`.
+    /// `<the user's config directory>/<app>/<key>`, per
+    /// [`runt_core::dirs::config_dir`]: `$XDG_CONFIG_HOME` or `$HOME/.config`
+    /// on Linux, `%APPDATA%` on Windows, `~/Library/Application Support` on
+    /// macOS.
     ///
-    /// Dependency-light on the same terms as [`runt_core::cache`]'s disk store:
-    /// no `dirs`, no `directories`, no platform crate. The XDG variables are two
-    /// `env::var` calls, and on macOS/Windows — where the "right" directory is
-    /// somewhere else entirely — `$HOME/.config` is still a directory a program
-    /// may write to, which is all this needs to be until there is a shipping
-    /// story that says otherwise.
+    /// This used to read the two XDG variables here and say that on
+    /// macOS/Windows — where the "right" directory is somewhere else entirely —
+    /// `$HOME/.config` was all this needed to be "until there is a shipping
+    /// story that says otherwise". There is now such a story, and it turned out
+    /// worse than the comment allowed for: Windows has no `$HOME` either, so
+    /// this returned `None` and every save silently did nothing.
+    ///
+    /// What has *not* changed is the dependency budget — [`runt_core::dirs`] is
+    /// still `env::var_os` and nothing else, no `dirs`, no `directories`, no
+    /// platform crate — nor the ability to point the writes somewhere else:
+    /// `$XDG_CONFIG_HOME` wins wherever it is set, which is what the round-trip
+    /// test below relies on and why that test keeps passing on a macOS runner.
     fn path(app: &str, key: &str) -> Option<PathBuf> {
-        let base = match std::env::var_os("XDG_CONFIG_HOME") {
-            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-            _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
-        };
-        Some(base.join(app).join(key))
+        Some(runt_core::dirs::config_dir(app)?.join(key))
     }
 
     pub fn load(app: &str, key: &str) -> Option<String> {
@@ -101,7 +114,7 @@ mod imp {
 
     pub fn save(app: &str, key: &str, value: &str) -> bool {
         let Some(path) = path(app, key) else {
-            log::warn!("storage: no config directory ($XDG_CONFIG_HOME and $HOME both unset)");
+            log::warn!("storage: the environment names no config directory for {app:?}");
             return false;
         };
         let Some(dir) = path.parent() else {

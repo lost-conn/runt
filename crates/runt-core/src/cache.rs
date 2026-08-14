@@ -279,26 +279,29 @@ mod native {
             ))
         }
 
-        /// `$XDG_CACHE_HOME/<app>/content`, falling back to `$HOME/.cache`.
+        /// `<the user's cache directory>/<app>/content`, per
+        /// [`crate::dirs::cache_dir`] — `$XDG_CACHE_HOME` or `$HOME/.cache` on
+        /// Linux, `%LOCALAPPDATA%` on Windows, `~/Library/Caches` on macOS.
         ///
         /// What a *shipped* program should use, where [`in_target`] is what a
         /// program built in this workspace gets: a cache belongs in the user's
         /// cache directory, not next to the build artifacts, and it is named
-        /// per app so two games cannot collide on a param key. Same
-        /// dependency-light XDG resolution as `runt_app::storage`, and `None`
-        /// when the environment offers nowhere to write — the caller then falls
-        /// back to a store that keeps nothing, which costs time and nothing
-        /// else.
+        /// per app so two games cannot collide on a param key. The `content`
+        /// suffix leaves the app's directory room for whatever else it wants to
+        /// keep beside its baked geometry.
+        ///
+        /// The resolution lives in [`crate::dirs`] rather than here because
+        /// `runt_app::storage` needs the same answer for config, and two copies
+        /// of it is how this came to be Linux-only in the first place. It is
+        /// still dependency-light on the same terms — plain `env::var_os`, no
+        /// `dirs`, no platform crate — and still `None` when the environment
+        /// offers nowhere to write (or when `app` could climb out of the
+        /// directory it names). The caller then falls back to a store that
+        /// keeps nothing, which costs time and nothing else.
         pub fn in_cache_dir(app: &str) -> Option<NativeDiskCache> {
-            if app.is_empty() || app.contains('/') || app.contains("..") {
-                log::warn!("runt-cache: refusing unsafe app name {app:?}");
-                return None;
-            }
-            let base = match std::env::var_os("XDG_CACHE_HOME") {
-                Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-                _ => PathBuf::from(std::env::var_os("HOME")?).join(".cache"),
-            };
-            Some(NativeDiskCache::new(base.join(app).join("content")))
+            Some(NativeDiskCache::new(
+                crate::dirs::cache_dir(app)?.join("content"),
+            ))
         }
 
         pub fn root(&self) -> &Path {

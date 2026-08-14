@@ -114,7 +114,9 @@ the head of `FixedSim`. Each game owns its *vocabulary*: an enum implementing
 `ActionId`, whose dense index is the bit position in `Actions<A>` and the row
 in the table. The engine has no opinion about whether a game has a "jump";
 gameplay systems read `Actions<A>` and never a `Key`, so remapping is editing
-data (a RON blob in the KV store — `localStorage` on web, XDG config natively)
+data (a RON blob in the KV store — `localStorage` on web, and natively a file
+in the platform's config directory: `%APPDATA%`, `~/Library/Application
+Support`, or `$XDG_CONFIG_HOME`/`~/.config`, resolved by `runt-core`'s `dirs`)
 rather than editing systems, and a rebind UI is a later view onto the same
 bytes. Replays stay independent of the bindings because a trace records **raw
 `InputEvent`s**, not resolved actions: playback re-derives the actions from

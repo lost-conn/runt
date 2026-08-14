@@ -6,10 +6,14 @@
 //! device. This module is that pick:
 //!
 //! ```text
-//! native   $XDG_CACHE_HOME/<app>/content/…   NativeDiskCache, read+written in place
+//! native   <user cache dir>/<app>/content/…  NativeDiskCache, read+written in place
 //! web      IndexedDB "<app>-cache"/entries   read once into a MemCache,
 //!                                            flushed back out after a frame
 //! ```
+//!
+//! …where the user's cache directory is `$XDG_CACHE_HOME` or `$HOME/.cache` on
+//! Linux, `%LOCALAPPDATA%` on Windows and `~/Library/Caches` on macOS — see
+//! [`runt_core::dirs`], which resolves it for the config directory too.
 //!
 //! ## Why the web path is shaped like this
 //!

@@ -380,11 +380,19 @@ fn the_user_cache_directory_is_per_app_and_refuses_a_path() {
         assert!(root.ends_with("runt-selftest/content"), "{}", root.display());
         assert!(root.is_absolute());
     } else {
-        // No HOME and no XDG_CACHE_HOME: nowhere to put it, which is a legal
-        // answer (the caller falls back to a store that keeps nothing).
-        assert!(std::env::var_os("HOME").is_none());
+        // Nowhere to write at all, which is a legal answer (the caller falls
+        // back to a store that keeps nothing). This is the only shape it can
+        // take: `runt_core::dirs` reads a different variable per platform, so
+        // the claim worth asserting from here is that it agrees with itself,
+        // and the per-platform mapping is checked exhaustively in that module's
+        // own tests — where the environment is an argument rather than a
+        // process-global.
+        assert_eq!(runt_core::dirs::cache_dir("runt-selftest"), None);
     }
-    for hostile in ["", "..", "../../etc", "a/b"] {
+    // `\` joins the list now that the resolver builds Windows paths: on a
+    // Windows host `a\b` is two components, and a name that is two components
+    // is a name that can point somewhere it was not given.
+    for hostile in ["", "..", "../../etc", "a/b", "a\\b"] {
         assert!(
             NativeDiskCache::in_cache_dir(hostile).is_none(),
             "{hostile:?} must not become a directory"
