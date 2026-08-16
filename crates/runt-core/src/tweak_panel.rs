@@ -363,6 +363,34 @@ impl PanelNav {
         scale: 1.0,
     };
 
+    /// Both devices at once: pressed here or pressed there.
+    ///
+    /// A game that drives a panel from its own action table still wants the
+    /// keyboard underneath — and wants the two to *add*, so that a verb only
+    /// one of them can express (this panel's fold and reset have no obvious
+    /// gamepad button) survives being combined rather than being dropped by
+    /// whichever side spoke last.
+    ///
+    /// `scale` is the exception and takes `self`'s unless `self` left it at
+    /// `1.0`: a step is one multiplier, not two multiplied together, and a
+    /// device with no modifiers must not scale down a device that has them.
+    pub fn or(self, other: PanelNav) -> PanelNav {
+        PanelNav {
+            up: self.up || other.up,
+            down: self.down || other.down,
+            dec: self.dec || other.dec,
+            inc: self.inc || other.inc,
+            activate: self.activate || other.activate,
+            fold: self.fold || other.fold,
+            reset: self.reset || other.reset,
+            scale: if self.scale == 1.0 {
+                other.scale
+            } else {
+                self.scale
+            },
+        }
+    }
+
     /// The keyboard, exactly as both panels have always read it.
     ///
     /// Kept as one function rather than inlined at the call sites precisely so
@@ -394,7 +422,29 @@ impl PanelNav {
 /// Does nothing at all — one resource read and a branch — when the panel is
 /// closed. Opening it is the game's business (see the module docs); this only
 /// runs the panel that is already up.
+///
+/// The keyboard's version of [`drive`]. A game whose panel answers to something
+/// else — a pad, a remote, a test — schedules its own system around `drive`
+/// instead of adding this one, which is why the nav is the only thing that
+/// differs between them.
 pub fn panel_input(world: &mut World) {
+    let Some(nav) = world.get_resource::<Input>().map(PanelNav::from_keys) else {
+        return;
+    };
+    drive(world, nav);
+}
+
+/// One tick of the panel, driven by a nav the caller decided.
+///
+/// [`panel_input`] is this with [`PanelNav::from_keys`] in front of it. The
+/// split exists because the world plumbing here — enumerate the fields, run
+/// [`decide`], apply through [`tweak::set_and_record`] — is the same work
+/// whatever pressed the button, and a game that reads its own input table
+/// should not have to copy it to say so.
+///
+/// The [`Input`] is still read from the world for the finger's half of
+/// `decide`; only the nav comes from the caller.
+pub fn drive(world: &mut World, nav: PanelNav) {
     let open = world
         .get_resource::<TweakPanel>()
         .is_some_and(|panel| panel.open);
@@ -406,7 +456,6 @@ pub fn panel_input(world: &mut World) {
     };
     let fields = tweak::fields_of(world);
 
-    let nav = PanelNav::from_keys(&input);
     let action = world.resource_scope(|_world, mut panel: Mut<TweakPanel>| {
         decide(&mut panel, &fields, nav, &input)
     });
@@ -1009,6 +1058,37 @@ mod tests {
         // 1.0, so a caller that spreads it has a live step waiting rather than
         // one multiplied to zero.
         assert_eq!(decide(&mut panel, &fields, PanelNav::NONE, &quiet), None);
+    }
+
+    #[test]
+    fn two_devices_or_together_without_either_losing_a_verb() {
+        let keys = PanelNav {
+            fold: true,
+            reset: true,
+            scale: COARSE,
+            ..PanelNav::NONE
+        };
+        let pad = PanelNav {
+            up: true,
+            activate: true,
+            ..PanelNav::NONE
+        };
+
+        let both = keys.or(pad);
+        assert!(both.up && both.activate, "the pad's verbs survive");
+        assert!(
+            both.fold && both.reset,
+            "…and so do the two the pad cannot express"
+        );
+        assert_eq!(
+            both.scale, COARSE,
+            "a device with no modifiers must not scale down one that has them"
+        );
+        assert_eq!(
+            pad.or(keys).scale,
+            COARSE,
+            "…from either side, since a step is one multiplier and not two"
+        );
     }
 
     #[test]
