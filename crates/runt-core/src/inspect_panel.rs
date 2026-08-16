@@ -17,10 +17,14 @@
 //!
 //! ```text
 //! game        selection → inspect::build(&spec, name) → tree.rows()
-//! Set::Input  decide(&mut panel, &rows, &input, viewport) → Some((path, edit))
+//! Set::Input  decide(&mut panel, &rows, nav, &input, viewport) → Some((path, edit))
 //! game        inspect::apply(&mut spec, &path, &edit) → regenerate
 //! Set::Ui     draw(…)
 //! ```
+//!
+//! `nav` is a [`PanelNav`] — what the device said, with the device forgotten.
+//! [`PanelNav::from_keys`] is the keyboard this panel was written against and
+//! is what a caller with nothing else to say passes.
 //!
 //! # Two widgets the tweak panel has no verb for
 //!
@@ -45,12 +49,12 @@
 use bevy_ecs::prelude::*;
 
 use crate::ecs::Viewport;
-use crate::input::{Input, Key};
+use crate::input::Input;
 use crate::inspect::{self, Edit, FieldPath, Widget};
 use crate::tweak::TweakValue;
 use crate::tweak_panel::{
-    self, PanelFont, BACKDROP, BAR_WIDTH, COARSE, DIM, DRAG_SPAN, FINE, KEY_ACTIVATE, KEY_DEC,
-    KEY_DOWN, KEY_INC, KEY_UP, MARGIN, PAD, RIM, SCALE, SELECTED, TEXT, WIDTH,
+    self, PanelFont, PanelNav, BACKDROP, BAR_WIDTH, DIM, DRAG_SPAN, MARGIN, PAD, RIM, SCALE,
+    SELECTED, TEXT, WIDTH,
 };
 use crate::ui::UiBatch;
 
@@ -129,18 +133,24 @@ impl InspectPanel {
 
 /// The whole state machine: move the cursor, or produce one edit.
 ///
-/// The keys are the tweak panel's: Up/Down move, Left/Right step or cycle
-/// (Shift coarse, Ctrl fine), Enter is the row's own verb — toggle a bool,
+/// The vocabulary is the tweak panel's: up/down move, dec/inc step or cycle
+/// (scaled coarse or fine), activate is the row's own verb — toggle a bool,
 /// cycle a choice or a variant, **reroll a seed**. Group, vector and colour
 /// header rows are selectable and inert, like a folded thought: a swatch is a
 /// preview, not a picker, and inventing "Enter opens a colour dialog" here
 /// would be exactly the kind of control this panel has never had one of.
+///
+/// `nav` is what the device said and `input` is the finger — see [`PanelNav`]
+/// on why those are two arguments. [`PanelNav::fold`] and
+/// [`PanelNav::reset`] have no meaning here and are ignored: this panel has no
+/// groups to fold and no authored value to go back to.
 ///
 /// The caller applies the returned edit with [`inspect::apply`] and rebuilds
 /// the tree; this function never sees the value.
 pub fn decide(
     panel: &mut InspectPanel,
     rows: &[Row],
+    nav: PanelNav,
     input: &Input,
     viewport: Viewport,
 ) -> Option<(FieldPath, Edit)> {
@@ -152,10 +162,10 @@ pub fn decide(
     // tree under the cursor.
     panel.cursor = panel.cursor.min(rows.len() - 1);
 
-    if input.just_pressed(KEY_UP) {
+    if nav.up {
         panel.cursor = (panel.cursor + rows.len() - 1) % rows.len();
     }
-    if input.just_pressed(KEY_DOWN) {
+    if nav.down {
         panel.cursor = (panel.cursor + 1) % rows.len();
     }
 
@@ -166,22 +176,15 @@ pub fn decide(
     }
 
     let (_, widget) = &rows[panel.cursor];
-    if input.just_pressed(KEY_ACTIVATE) {
+    if nav.activate {
         return activate(widget);
     }
 
-    let delta = i32::from(input.just_pressed(KEY_INC)) - i32::from(input.just_pressed(KEY_DEC));
+    let delta = i32::from(nav.inc) - i32::from(nav.dec);
     if delta == 0 {
         return None;
     }
-    let scale = if input.held(Key::Shift) {
-        COARSE
-    } else if input.held(Key::Ctrl) {
-        FINE
-    } else {
-        1.0
-    };
-    step(widget, delta, scale)
+    step(widget, delta, nav.scale)
 }
 
 /// Enter on a row: bools flip, enums advance, seeds reroll, numbers do nothing
@@ -478,7 +481,7 @@ fn color_swatch(batch: &mut UiBatch, rgb: [f32; 3], x: f32, y: f32, pitch: f32) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::{InputEvent, TouchPhase};
+    use crate::input::{InputEvent, Key, TouchPhase};
     use crate::inspect::VectorComponent;
     use crate::reflect::FieldRange;
 
@@ -562,20 +565,32 @@ mod tests {
         input
     }
 
+    /// [`decide`] as every table below drives it — the keyboard, through
+    /// [`PanelNav::from_keys`]. The tweak panel's own helper carries the
+    /// argument for why this indirection is worth having.
+    fn decide_keys(
+        panel: &mut InspectPanel,
+        rows: &[Row],
+        input: &Input,
+        viewport: Viewport,
+    ) -> Option<(FieldPath, Edit)> {
+        decide(panel, rows, PanelNav::from_keys(input), input, viewport)
+    }
+
     #[test]
     fn the_cursor_wraps_and_survives_the_tree_shrinking_under_it() {
         let mut panel = InspectPanel::new();
         panel.open = true;
         let rows = rows();
-        decide(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Up)]), view());
+        decide_keys(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Up)]), view());
         assert_eq!(panel.cursor(), 4, "up from the top wraps to the bottom");
 
         // A variant switch shortened the tree; the cursor lands on the end.
         let shorter = &rows[..2];
-        decide(&mut panel, shorter, &tick([]), view());
+        decide_keys(&mut panel, shorter, &tick([]), view());
         assert_eq!(panel.cursor(), 1);
 
-        decide(&mut panel, &[], &tick([]), view());
+        decide_keys(&mut panel, &[], &tick([]), view());
         assert_eq!(panel.cursor(), 0, "no rows is not a panic");
     }
 
@@ -586,7 +601,7 @@ mod tests {
         let rows = rows();
         panel.cursor = 1; // radius
 
-        let plus = decide(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Right)]), view());
+        let plus = decide_keys(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Right)]), view());
         let Some((path, Edit::Float(v))) = plus else {
             panic!("right produced no edit");
         };
@@ -601,10 +616,67 @@ mod tests {
         let mut held = Input::new();
         held.begin_tick([InputEvent::KeyDown(Key::Shift)]);
         held.begin_tick([InputEvent::KeyDown(Key::Left)]);
-        let Some((_, Edit::Float(v))) = decide(&mut panel, &rows, &held, view()) else {
+        let Some((_, Edit::Float(v))) = decide_keys(&mut panel, &rows, &held, view()) else {
             panic!("shift+left produced no edit");
         };
         assert!((v - 1.0).abs() < 1e-5, "{v} is not ten steps down");
+    }
+
+    /// The seam's whole point: a device that is not a keyboard.
+    ///
+    /// Nothing here presses a key — the [`Input`] handed over is a silent tick,
+    /// present only because the finger's half of `decide` still wants one.
+    #[test]
+    fn a_nav_built_by_hand_drives_the_panel_with_no_keyboard_at_all() {
+        let mut panel = InspectPanel::new();
+        panel.open = true;
+        let rows = rows();
+        let quiet = tick([]);
+
+        decide(
+            &mut panel,
+            &rows,
+            PanelNav {
+                down: true,
+                ..PanelNav::NONE
+            },
+            &quiet,
+            view(),
+        );
+        assert_eq!(panel.cursor(), 1, "radius, one row past the variant");
+
+        let edit = decide(
+            &mut panel,
+            &rows,
+            PanelNav {
+                inc: true,
+                ..PanelNav::NONE
+            },
+            &quiet,
+            view(),
+        );
+        let Some((path, Edit::Float(v))) = edit else {
+            panic!("a hand-built inc produced no edit");
+        };
+        assert_eq!(path, FieldPath::root().field("radius"));
+        assert!((v - 2.1).abs() < 1e-6, "{v} is not one step up");
+
+        // `fold` and `reset` are the tweak panel's; this one has no verb for
+        // either and must not invent one.
+        assert_eq!(
+            decide(
+                &mut panel,
+                &rows,
+                PanelNav {
+                    fold: true,
+                    reset: true,
+                    ..PanelNav::NONE
+                },
+                &quiet,
+                view(),
+            ),
+            None
+        );
     }
 
     #[test]
@@ -615,13 +687,13 @@ mod tests {
 
         panel.cursor = 2; // lit
         assert_eq!(
-            decide(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Enter)]), view()),
+            decide_keys(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Enter)]), view()),
             Some((FieldPath::root().field("lit"), Edit::Bool(true)))
         );
 
         panel.cursor = 1; // radius — a float has no "activate"
         assert_eq!(
-            decide(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Enter)]), view()),
+            decide_keys(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Enter)]), view()),
             None
         );
     }
@@ -634,16 +706,16 @@ mod tests {
         panel.cursor = 0; // the generator select
 
         assert_eq!(
-            decide(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Right)]), view()),
+            decide_keys(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Right)]), view()),
             Some((FieldPath::root(), Edit::Variant("Cube".into())))
         );
         assert_eq!(
-            decide(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Left)]), view()),
+            decide_keys(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Left)]), view()),
             Some((FieldPath::root(), Edit::Variant("Plane".into()))),
             "left from the first option wraps to the last"
         );
         assert_eq!(
-            decide(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Enter)]), view()),
+            decide_keys(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Enter)]), view()),
             Some((FieldPath::root(), Edit::Variant("Cube".into()))),
             "enter is the same verb as right"
         );
@@ -659,7 +731,7 @@ mod tests {
         let expected = inspect::reroll(42);
         assert_ne!(expected, 42);
         assert_eq!(
-            decide(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Enter)]), view()),
+            decide_keys(&mut panel, &rows, &tick([InputEvent::KeyDown(Key::Enter)]), view()),
             Some((FieldPath::root().field("seed"), Edit::Seed(expected)))
         );
     }
@@ -672,7 +744,7 @@ mod tests {
         panel.cursor = 4; // nested
         for key in [Key::Enter, Key::Right, Key::Left] {
             assert_eq!(
-                decide(&mut panel, &rows, &tick([InputEvent::KeyDown(key)]), view()),
+                decide_keys(&mut panel, &rows, &tick([InputEvent::KeyDown(key)]), view()),
                 None
             );
         }
@@ -688,7 +760,7 @@ mod tests {
         panel.cursor = 0;
         for key in [Key::Enter, Key::Right, Key::Left] {
             assert_eq!(
-                decide(&mut panel, &rows, &tick([InputEvent::KeyDown(key)]), view()),
+                decide_keys(&mut panel, &rows, &tick([InputEvent::KeyDown(key)]), view()),
                 None
             );
         }
@@ -731,7 +803,7 @@ mod tests {
             y,
         }]);
         assert_eq!(
-            decide(&mut panel, &rows, &live.clone(), viewport),
+            decide_keys(&mut panel, &rows, &live.clone(), viewport),
             None,
             "a tap only selects"
         );
@@ -745,7 +817,7 @@ mod tests {
             x: x + DRAG_SPAN * 0.25,
             y,
         }]);
-        let Some((path, Edit::Float(v))) = decide(&mut panel, &rows, &live.clone(), viewport)
+        let Some((path, Edit::Float(v))) = decide_keys(&mut panel, &rows, &live.clone(), viewport)
         else {
             panic!("the drag produced no edit");
         };
@@ -759,7 +831,7 @@ mod tests {
             x: 400.0,
             y,
         }]);
-        assert_eq!(decide(&mut panel, &rows, &live.clone(), viewport), None);
+        assert_eq!(decide_keys(&mut panel, &rows, &live.clone(), viewport), None);
     }
 
     #[test]
@@ -769,7 +841,7 @@ mod tests {
         let rows = rows();
         let y = MARGIN + PAD + tweak_panel::row_pitch() * 2.0 + 1.0;
         // The top-left corner is the tweak panel's turf.
-        decide(
+        decide_keys(
             &mut panel,
             &rows,
             &tick([InputEvent::Touch {

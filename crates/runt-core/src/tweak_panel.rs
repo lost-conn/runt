@@ -292,6 +292,102 @@ pub const FINE: f32 = 0.1;
 /// deliberate full sweep, and everything shorter should be a nudge.
 pub const DRAG_SPAN: f32 = 480.0;
 
+/// What one tick of panel navigation *means*, with the device it came from
+/// already forgotten.
+///
+/// Both [`decide`]s used to read [`Input`] directly, which quietly made "a
+/// panel" and "a keyboard" the same thing: the table at [`KEY_UP`] is a list of
+/// `Key`s, and a game driving these panels from a gamepad, a remote or a
+/// scripted test had nowhere to say so. This is the seam. The keys keep their
+/// constants and keep their meaning — [`from_keys`](PanelNav::from_keys) *is*
+/// the old reads, moved intact — and a caller with another device builds one of
+/// these by hand instead.
+///
+/// Every field is an **edge**, not a level, for the reason [`KEY_UP`]'s table
+/// gives: repeat is per press, and a held direction that swept a value would
+/// want a key-repeat clock, which is a second timebase in something that has to
+/// replay.
+///
+/// [`fold`](PanelNav::fold) and [`reset`](PanelNav::reset) are this panel's
+/// alone — [`crate::inspect_panel`] has no verb for either and ignores them.
+/// One struct over both panels rather than two that differ by two fields: they
+/// are the same vocabulary, and a panel that happens not to have a verb is not
+/// a different vocabulary.
+///
+/// The pointer is deliberately **not** here. A touch carries a position, an id
+/// and a lifetime, and flattening that into booleans would lose the drag — so
+/// both `decide`s take a `PanelNav` *and* an [`Input`], and the second one is
+/// the finger's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PanelNav {
+    /// Move the cursor up a row.
+    pub up: bool,
+    /// …and down.
+    pub down: bool,
+    /// Step the value down; cycle an enum backwards.
+    pub dec: bool,
+    /// …and up, and forwards.
+    pub inc: bool,
+    /// The row's own verb: flip a bool, cycle a choice, reroll a seed, fold a
+    /// group header.
+    pub activate: bool,
+    /// Fold or unfold the group the cursor is in. This panel only.
+    pub fold: bool,
+    /// Put this field back to its authored value. This panel only.
+    pub reset: bool,
+    /// The multiplier on one step of [`dec`](PanelNav::dec) /
+    /// [`inc`](PanelNav::inc), already resolved to [`COARSE`], [`FINE`] or
+    /// `1.0`.
+    ///
+    /// Resolved by whoever built the value rather than carried as two modifier
+    /// flags, so that a device with no modifiers to spare passes `1.0` and
+    /// never has to learn that `COARSE` exists.
+    pub scale: f32,
+}
+
+impl PanelNav {
+    /// Nothing pressed, and one step is one step.
+    ///
+    /// The base for a hand-built value: `PanelNav { up: true, ..PanelNav::NONE }`.
+    /// There is deliberately no `Default` — a derived one would zero
+    /// [`scale`](PanelNav::scale), and a nav whose every step multiplies to
+    /// nothing is a panel that silently refuses to edit.
+    pub const NONE: PanelNav = PanelNav {
+        up: false,
+        down: false,
+        dec: false,
+        inc: false,
+        activate: false,
+        fold: false,
+        reset: false,
+        scale: 1.0,
+    };
+
+    /// The keyboard, exactly as both panels have always read it.
+    ///
+    /// Kept as one function rather than inlined at the call sites precisely so
+    /// that "the keyboard still means what it meant" is one place to look and
+    /// one place to be wrong.
+    pub fn from_keys(input: &Input) -> PanelNav {
+        PanelNav {
+            up: input.just_pressed(KEY_UP),
+            down: input.just_pressed(KEY_DOWN),
+            dec: input.just_pressed(KEY_DEC),
+            inc: input.just_pressed(KEY_INC),
+            activate: input.just_pressed(KEY_ACTIVATE),
+            fold: input.just_pressed(KEY_FOLD),
+            reset: input.just_pressed(KEY_RESET),
+            scale: if input.held(Key::Shift) {
+                COARSE
+            } else if input.held(Key::Ctrl) {
+                FINE
+            } else {
+                1.0
+            },
+        }
+    }
+}
+
 /// `Set::Input` (exclusive): read this tick's keys and touches, and write what
 /// they say into the world.
 ///
@@ -310,8 +406,10 @@ pub fn panel_input(world: &mut World) {
     };
     let fields = tweak::fields_of(world);
 
-    let action = world
-        .resource_scope(|_world, mut panel: Mut<TweakPanel>| decide(&mut panel, &fields, &input));
+    let nav = PanelNav::from_keys(&input);
+    let action = world.resource_scope(|_world, mut panel: Mut<TweakPanel>| {
+        decide(&mut panel, &fields, nav, &input)
+    });
 
     match action {
         Some(Action::Set(path, value)) => {
@@ -340,7 +438,15 @@ pub enum Action {
 }
 
 /// The whole state machine: move the cursor, fold a group, or produce an edit.
-pub fn decide(panel: &mut TweakPanel, fields: &[TweakField], input: &Input) -> Option<Action> {
+///
+/// `nav` is what the device said; `input` is the finger — see [`PanelNav`] on
+/// why those are two arguments and not one.
+pub fn decide(
+    panel: &mut TweakPanel,
+    fields: &[TweakField],
+    nav: PanelNav,
+    input: &Input,
+) -> Option<Action> {
     let rows = panel.rows(fields);
     if rows.is_empty() {
         panel.cursor = 0;
@@ -351,10 +457,10 @@ pub fn decide(panel: &mut TweakPanel, fields: &[TweakField], input: &Input) -> O
     // row rather than select nothing.
     panel.cursor = panel.cursor.min(rows.len() - 1);
 
-    if input.just_pressed(KEY_UP) {
+    if nav.up {
         panel.cursor = (panel.cursor + rows.len() - 1) % rows.len();
     }
-    if input.just_pressed(KEY_DOWN) {
+    if nav.down {
         panel.cursor = (panel.cursor + 1) % rows.len();
     }
 
@@ -366,13 +472,13 @@ pub fn decide(panel: &mut TweakPanel, fields: &[TweakField], input: &Input) -> O
     }
 
     let row = rows[panel.cursor];
-    let fold = input.just_pressed(KEY_FOLD);
+    let fold = nav.fold;
     match row {
         Row::Group(root) => {
             // Enter and Tab do the same thing on a header. Two keys for one
             // verb, because Enter is what a player reaches for and Tab is what
             // the same fold means on a field row.
-            if fold || input.just_pressed(KEY_ACTIVATE) {
+            if fold || nav.activate {
                 let collapsed = panel.is_collapsed(root);
                 panel.set_collapsed(root, !collapsed);
             }
@@ -384,25 +490,17 @@ pub fn decide(panel: &mut TweakPanel, fields: &[TweakField], input: &Input) -> O
                 panel.set_collapsed(field.root, true);
                 return None;
             }
-            if input.just_pressed(KEY_RESET) {
+            if nav.reset {
                 return Some(Action::Reset(field.path.clone()));
             }
-            if input.just_pressed(KEY_ACTIVATE) {
+            if nav.activate {
                 return activate(field);
             }
-            let delta =
-                i32::from(input.just_pressed(KEY_INC)) - i32::from(input.just_pressed(KEY_DEC));
+            let delta = i32::from(nav.inc) - i32::from(nav.dec);
             if delta == 0 {
                 return None;
             }
-            let scale = if input.held(Key::Shift) {
-                COARSE
-            } else if input.held(Key::Ctrl) {
-                FINE
-            } else {
-                1.0
-            };
-            step(field, delta as f32 * field.step() * scale)
+            step(field, delta as f32 * field.step() * nav.scale)
         }
     }
 }
@@ -738,6 +836,18 @@ mod tests {
         input.clone()
     }
 
+    /// [`decide`] as every table below drives it: the keyboard, through the
+    /// very conversion [`panel_input`] uses.
+    ///
+    /// These tests were written against a `decide` that read [`Input`] itself.
+    /// That they are unchanged in what they press and what they assert is the
+    /// proof that [`PanelNav`] *moved* the reads rather than changing them —
+    /// which is the whole claim of the seam, and is worth one indirection to
+    /// keep checkable.
+    fn decide_keys(panel: &mut TweakPanel, fields: &[TweakField], input: &Input) -> Option<Action> {
+        decide(panel, fields, PanelNav::from_keys(input), input)
+    }
+
     #[test]
     fn a_closed_panel_has_no_rows_and_draws_nothing() {
         let mut panel = TweakPanel::new();
@@ -781,13 +891,13 @@ mod tests {
         panel.open = true;
         let fields = fields();
 
-        decide(&mut panel, &fields, &tick([InputEvent::KeyDown(Key::Down)]));
+        decide_keys(&mut panel, &fields, &tick([InputEvent::KeyDown(Key::Down)]));
         assert_eq!(panel.cursor(), 1);
         // Up from the top wraps to the bottom, which is what makes a five-row
         // list navigable with two keys.
         let mut panel_top = TweakPanel::new();
         panel_top.open = true;
-        decide(
+        decide_keys(
             &mut panel_top,
             &fields,
             &tick([InputEvent::KeyDown(Key::Up)]),
@@ -798,11 +908,11 @@ mod tests {
         // rather than off it.
         panel.cursor = 4;
         let shorter = vec![fields[0].clone()];
-        decide(&mut panel, &shorter, &tick([]));
+        decide_keys(&mut panel, &shorter, &tick([]));
         assert_eq!(panel.cursor(), 1);
 
         // …and no rows at all is not a panic.
-        decide(&mut panel, &[], &tick([]));
+        decide_keys(&mut panel, &[], &tick([]));
         assert_eq!(panel.cursor(), 0);
     }
 
@@ -814,7 +924,7 @@ mod tests {
         panel.cursor = 1; // sky.clouds
 
         // Default step for an undeclared range is a hundredth of it: 0.1 here.
-        let plus = decide(
+        let plus = decide_keys(
             &mut panel,
             &fields,
             &tick([InputEvent::KeyDown(Key::Right)]),
@@ -828,7 +938,7 @@ mod tests {
         held.begin_tick([InputEvent::KeyDown(Key::Shift)]);
         let coarse = again(&mut held, [InputEvent::KeyDown(Key::Right)]);
         assert_eq!(
-            decide(&mut panel, &fields, &coarse),
+            decide_keys(&mut panel, &fields, &coarse),
             Some(Action::Set("sky.clouds".into(), TweakValue::Float(3.0))),
             "shift is ten steps"
         );
@@ -836,10 +946,69 @@ mod tests {
         let mut held = Input::new();
         held.begin_tick([InputEvent::KeyDown(Key::Ctrl)]);
         let fine = again(&mut held, [InputEvent::KeyDown(Key::Left)]);
-        let Some(Action::Set(_, TweakValue::Float(v))) = decide(&mut panel, &fields, &fine) else {
+        let Some(Action::Set(_, TweakValue::Float(v))) = decide_keys(&mut panel, &fields, &fine) else {
             panic!("ctrl+left produced no edit");
         };
         assert!((v - 1.99).abs() < 1e-5, "{v} is not a tenth of a step down");
+    }
+
+    /// The seam's whole point: a device that is not a keyboard.
+    ///
+    /// Nothing here presses a key — the [`Input`] handed over is a silent tick,
+    /// present only because the finger's half of `decide` still wants one — and
+    /// the panel moves and edits regardless, by the same arithmetic the arrows
+    /// take above.
+    #[test]
+    fn a_nav_built_by_hand_drives_the_panel_with_no_keyboard_at_all() {
+        let mut panel = TweakPanel::new();
+        panel.open = true;
+        let fields = fields();
+        let quiet = tick([]);
+
+        decide(
+            &mut panel,
+            &fields,
+            PanelNav {
+                down: true,
+                ..PanelNav::NONE
+            },
+            &quiet,
+        );
+        assert_eq!(panel.cursor, 1, "sky.clouds, one row past its header");
+
+        assert_eq!(
+            decide(
+                &mut panel,
+                &fields,
+                PanelNav {
+                    inc: true,
+                    ..PanelNav::NONE
+                },
+                &quiet,
+            ),
+            Some(Action::Set("sky.clouds".into(), TweakValue::Float(2.1))),
+            "one step, the very step the Right arrow takes"
+        );
+
+        assert_eq!(
+            decide(
+                &mut panel,
+                &fields,
+                PanelNav {
+                    inc: true,
+                    scale: COARSE,
+                    ..PanelNav::NONE
+                },
+                &quiet,
+            ),
+            Some(Action::Set("sky.clouds".into(), TweakValue::Float(3.0))),
+            "a device with a coarse modifier of its own says so in `scale`"
+        );
+
+        // And a nav with nothing pressed edits nothing — `NONE`'s scale is
+        // 1.0, so a caller that spreads it has a live step waiting rather than
+        // one multiplied to zero.
+        assert_eq!(decide(&mut panel, &fields, PanelNav::NONE, &quiet), None);
     }
 
     #[test]
@@ -850,7 +1019,7 @@ mod tests {
 
         panel.cursor = 2; // sky.lit
         assert_eq!(
-            decide(
+            decide_keys(
                 &mut panel,
                 &fields,
                 &tick([InputEvent::KeyDown(Key::Enter)])
@@ -860,7 +1029,7 @@ mod tests {
 
         panel.cursor = 1; // sky.clouds — a float has no "activate"
         assert_eq!(
-            decide(
+            decide_keys(
                 &mut panel,
                 &fields,
                 &tick([InputEvent::KeyDown(Key::Enter)])
@@ -876,13 +1045,13 @@ mod tests {
         let fields = fields();
 
         panel.cursor = 0; // the `sky` header
-        decide(
+        decide_keys(
             &mut panel,
             &fields,
             &tick([InputEvent::KeyDown(Key::Enter)]),
         );
         assert!(panel.is_collapsed(0));
-        decide(
+        decide_keys(
             &mut panel,
             &fields,
             &tick([InputEvent::KeyDown(Key::Enter)]),
@@ -891,13 +1060,13 @@ mod tests {
 
         panel.cursor = 1;
         assert_eq!(
-            decide(&mut panel, &fields, &tick([InputEvent::KeyDown(Key::R)])),
+            decide_keys(&mut panel, &fields, &tick([InputEvent::KeyDown(Key::R)])),
             Some(Action::Reset("sky.clouds".into()))
         );
         // Tab on a field folds the group it belongs to, which is the way back
         // out of a long list without walking the cursor up it.
         panel.cursor = 1;
-        decide(&mut panel, &fields, &tick([InputEvent::KeyDown(Key::Tab)]));
+        decide_keys(&mut panel, &fields, &tick([InputEvent::KeyDown(Key::Tab)]));
         assert!(panel.is_collapsed(0));
     }
 
@@ -911,7 +1080,7 @@ mod tests {
         held.begin_tick([InputEvent::KeyDown(Key::Ctrl)]);
         let fine = again(&mut held, [InputEvent::KeyDown(Key::Right)]);
         assert_eq!(
-            decide(&mut panel, &fields, &fine),
+            decide_keys(&mut panel, &fields, &fine),
             Some(Action::Set("cam.steps".into(), TweakValue::Int(4))),
             "a tenth of a step on an integer is still one"
         );
@@ -934,7 +1103,7 @@ mod tests {
             y,
         }]);
         assert_eq!(
-            decide(&mut panel, &fields, &down),
+            decide_keys(&mut panel, &fields, &down),
             None,
             "a tap only selects"
         );
@@ -949,7 +1118,7 @@ mod tests {
             x: 40.0,
             y,
         }]);
-        decide(&mut panel, &fields, &live.clone());
+        decide_keys(&mut panel, &fields, &live.clone());
         let moved = again(
             &mut live,
             [InputEvent::Touch {
@@ -959,7 +1128,7 @@ mod tests {
                 y,
             }],
         );
-        let Some(Action::Set(path, TweakValue::Float(v))) = decide(&mut panel, &fields, &moved)
+        let Some(Action::Set(path, TweakValue::Float(v))) = decide_keys(&mut panel, &fields, &moved)
         else {
             panic!("the drag produced no edit");
         };
@@ -976,7 +1145,7 @@ mod tests {
                 y,
             }],
         );
-        assert_eq!(decide(&mut panel, &fields, &up), None);
+        assert_eq!(decide_keys(&mut panel, &fields, &up), None);
     }
 
     /// The stub the two drawing tests share: one quad per character, so a
@@ -1032,7 +1201,7 @@ mod tests {
         // A tap on the first visible line selects the row that line *is*.
         let y = MARGIN + PAD + row_pitch() + 1.0;
         let first_visible = panel.scroll();
-        decide(
+        decide_keys(
             &mut panel,
             &fields,
             &tick([InputEvent::Touch {
@@ -1052,7 +1221,7 @@ mod tests {
         let fields = fields();
         let y = MARGIN + PAD + row_pitch() * 2.0 + 1.0;
         // Right of the panel's own width: the game's, not the panel's.
-        decide(
+        decide_keys(
             &mut panel,
             &fields,
             &tick([InputEvent::Touch {
