@@ -176,6 +176,11 @@ pub struct TweakPanel {
     /// The row a finger went down on, so a tap that does not move is a select
     /// and a tap that does is a drag.
     touch_row: Option<usize>,
+    /// Fractional units an analog sweep has earned on an **integer** field and
+    /// not yet spent — see
+    /// [`InspectPanel`](crate::inspect_panel::InspectPanel)'s own, which
+    /// carries the argument.
+    sweep_carry: f64,
     /// The first row the **last drawn frame** put on screen.
     ///
     /// Written by [`draw`] and read by the touch hit test, which is the only
@@ -281,6 +286,14 @@ pub const KEY_FOLD: Key = Key::Tab;
 /// binding here anyway: the panel claims every key it uses while it is open.
 pub const KEY_RESET: Key = Key::R;
 
+/// How long a full [`PanelNav::sweep`] takes to cross a value's whole range.
+///
+/// Two seconds is a deliberate compromise: fast enough that reaching the far
+/// end of a range is not a chore, slow enough that the last third of the stick
+/// is still aimable. The fine end is bought by the caller's curve rather than
+/// by this number — see [`PanelNav::sweep`].
+pub const SWEEP_SECONDS: f32 = 2.0;
+
 /// Shift's multiplier on one step.
 pub const COARSE: f32 = 10.0;
 /// Ctrl's.
@@ -303,10 +316,17 @@ pub const DRAG_SPAN: f32 = 480.0;
 /// the old reads, moved intact — and a caller with another device builds one of
 /// these by hand instead.
 ///
-/// Every field is an **edge**, not a level, for the reason [`KEY_UP`]'s table
-/// gives: repeat is per press, and a held direction that swept a value would
-/// want a key-repeat clock, which is a second timebase in something that has to
-/// replay.
+/// Every *boolean* field is an **edge**, not a level, for the reason
+/// [`KEY_UP`]'s table gives: repeat is per press, and a held key that swept a
+/// value would want a key-repeat clock, which is a second timebase in something
+/// that has to replay.
+///
+/// [`sweep`](PanelNav::sweep) is the one continuous channel, and it does not
+/// break that rule — it answers it. A key-repeat clock is a second timebase
+/// because it is invented inside the panel; an analog stick is a *value in the
+/// input*, integrated over the simulation's own fixed tick, so a recorded trace
+/// reproduces the sweep exactly the way it reproduces a press. There is no
+/// second clock, which was the whole objection.
 ///
 /// [`fold`](PanelNav::fold) and [`reset`](PanelNav::reset) are this panel's
 /// alone — [`crate::inspect_panel`] has no verb for either and ignores them.
@@ -335,6 +355,19 @@ pub struct PanelNav {
     pub fold: bool,
     /// Put this field back to its authored value. This panel only.
     pub reset: bool,
+    /// A continuous nudge, `-1..=1`, already curved by whoever built the value.
+    ///
+    /// Where [`dec`](PanelNav::dec) / [`inc`](PanelNav::inc) are one step per
+    /// press, this is a **rate**: [`decide`] integrates it over `dt`, so a stick
+    /// held a third of the way moves a value slowly and a full push crosses its
+    /// range in [`SWEEP_SECONDS`]. `0.0` — [`NONE`](PanelNav::NONE)'s value, and
+    /// [`from_keys`](PanelNav::from_keys)' — means a keyboard, which sweeps
+    /// nothing and steps as it always did.
+    ///
+    /// Curved by the caller rather than here because the shape of the curve is a
+    /// feel decision about a particular device, and this struct's whole job is
+    /// not to know what device it is.
+    pub sweep: f32,
     /// The multiplier on one step of [`dec`](PanelNav::dec) /
     /// [`inc`](PanelNav::inc), already resolved to [`COARSE`], [`FINE`] or
     /// `1.0`.
@@ -360,6 +393,7 @@ impl PanelNav {
         activate: false,
         fold: false,
         reset: false,
+        sweep: 0.0,
         scale: 1.0,
     };
 
@@ -383,6 +417,14 @@ impl PanelNav {
             activate: self.activate || other.activate,
             fold: self.fold || other.fold,
             reset: self.reset || other.reset,
+            // The larger deflection wins rather than the sum: two devices
+            // pushing the same way are one hand asking once, and adding them
+            // would sweep at twice the rate either asked for.
+            sweep: if other.sweep.abs() > self.sweep.abs() {
+                other.sweep
+            } else {
+                self.sweep
+            },
             scale: if self.scale == 1.0 {
                 other.scale
             } else {
@@ -405,6 +447,8 @@ impl PanelNav {
             activate: input.just_pressed(KEY_ACTIVATE),
             fold: input.just_pressed(KEY_FOLD),
             reset: input.just_pressed(KEY_RESET),
+            // A keyboard has no analog anything: it steps.
+            sweep: 0.0,
             scale: if input.held(Key::Shift) {
                 COARSE
             } else if input.held(Key::Ctrl) {
@@ -434,6 +478,19 @@ pub fn panel_input(world: &mut World) {
     drive(world, nav);
 }
 
+/// The simulation's tick length, for [`PanelNav::sweep`]'s integration.
+///
+/// Read from the world rather than passed, because [`drive`] is already the
+/// world-shaped half and a caller assembling a nav has no business also
+/// knowing the tick rate. The fallback is the engine's own default, which is
+/// what a world without a [`FixedTick`] would have been ticking at anyway.
+fn tick_dt(world: &World) -> f32 {
+    world
+        .get_resource::<crate::ecs::FixedTick>()
+        .map(|tick| tick.dt_secs)
+        .unwrap_or(1.0 / 60.0)
+}
+
 /// One tick of the panel, driven by a nav the caller decided.
 ///
 /// [`panel_input`] is this with [`PanelNav::from_keys`] in front of it. The
@@ -456,8 +513,9 @@ pub fn drive(world: &mut World, nav: PanelNav) {
     };
     let fields = tweak::fields_of(world);
 
+    let dt = tick_dt(world);
     let action = world.resource_scope(|_world, mut panel: Mut<TweakPanel>| {
-        decide(&mut panel, &fields, nav, &input)
+        decide(&mut panel, &fields, nav, &input, dt)
     });
 
     match action {
@@ -495,6 +553,7 @@ pub fn decide(
     fields: &[TweakField],
     nav: PanelNav,
     input: &Input,
+    dt: f32,
 ) -> Option<Action> {
     let rows = panel.rows(fields);
     if rows.is_empty() {
@@ -506,11 +565,17 @@ pub fn decide(
     // row rather than select nothing.
     panel.cursor = panel.cursor.min(rows.len() - 1);
 
+    let was = panel.cursor;
     if nav.up {
         panel.cursor = (panel.cursor + rows.len() - 1) % rows.len();
     }
     if nav.down {
         panel.cursor = (panel.cursor + 1) % rows.len();
+    }
+    // See `InspectPanel::sweep_carry`: a sweep belongs to the row it was aimed
+    // at, and moving off one abandons the fraction it had earned.
+    if panel.cursor != was || nav.sweep == 0.0 {
+        panel.sweep_carry = 0.0;
     }
 
     // Touch, before the keys' edits so a finger and a keyboard cannot both move
@@ -546,11 +611,42 @@ pub fn decide(
                 return activate(field);
             }
             let delta = i32::from(nav.inc) - i32::from(nav.dec);
-            if delta == 0 {
+            if delta != 0 {
+                return step(field, delta as f32 * field.step() * nav.scale);
+            }
+            if nav.sweep != 0.0 {
+                return sweep(&mut panel.sweep_carry, field, nav.sweep, dt);
+            }
+            None
+        }
+    }
+}
+
+/// One tick of an analog sweep: a rate, integrated.
+///
+/// [`crate::inspect_panel::decide`]'s twin, over this panel's value type — and
+/// its docs carry the argument for why only numbers sweep and why an integer
+/// needs a carry.
+fn sweep(carry: &mut f64, field: &TweakField, amount: f32, dt: f32) -> Option<Action> {
+    let span = field.range.max - field.range.min;
+    let delta = amount * span / SWEEP_SECONDS * dt;
+    match &field.value {
+        TweakValue::Float(v) => {
+            (delta != 0.0).then(|| Action::Set(field.path.clone(), TweakValue::Float(v + delta)))
+        }
+        TweakValue::Int(v) => {
+            *carry += delta as f64;
+            let whole = carry.trunc();
+            if whole == 0.0 {
                 return None;
             }
-            step(field, delta as f32 * field.step() * nav.scale)
+            *carry -= whole;
+            Some(Action::Set(
+                field.path.clone(),
+                TweakValue::Int(v + whole as i64),
+            ))
         }
+        _ => None,
     }
 }
 
@@ -878,6 +974,10 @@ mod tests {
         input
     }
 
+    /// One tick at the engine's fixed rate — what `drive` reads off `FixedTick`
+    /// in a real world. Only the sweep looks at it.
+    const TEST_DT: f32 = 1.0 / 60.0;
+
     /// …and a second tick against the same `Input`, so a held modifier stays
     /// held while an edge fires.
     fn again(input: &mut Input, events: impl IntoIterator<Item = InputEvent>) -> Input {
@@ -894,7 +994,7 @@ mod tests {
     /// which is the whole claim of the seam, and is worth one indirection to
     /// keep checkable.
     fn decide_keys(panel: &mut TweakPanel, fields: &[TweakField], input: &Input) -> Option<Action> {
-        decide(panel, fields, PanelNav::from_keys(input), input)
+        decide(panel, fields, PanelNav::from_keys(input), input, TEST_DT)
     }
 
     #[test]
@@ -1022,6 +1122,7 @@ mod tests {
                 ..PanelNav::NONE
             },
             &quiet,
+            TEST_DT,
         );
         assert_eq!(panel.cursor, 1, "sky.clouds, one row past its header");
 
@@ -1034,6 +1135,7 @@ mod tests {
                     ..PanelNav::NONE
                 },
                 &quiet,
+                TEST_DT,
             ),
             Some(Action::Set("sky.clouds".into(), TweakValue::Float(2.1))),
             "one step, the very step the Right arrow takes"
@@ -1049,6 +1151,7 @@ mod tests {
                     ..PanelNav::NONE
                 },
                 &quiet,
+                TEST_DT,
             ),
             Some(Action::Set("sky.clouds".into(), TweakValue::Float(3.0))),
             "a device with a coarse modifier of its own says so in `scale`"
@@ -1057,7 +1160,89 @@ mod tests {
         // And a nav with nothing pressed edits nothing — `NONE`'s scale is
         // 1.0, so a caller that spreads it has a live step waiting rather than
         // one multiplied to zero.
-        assert_eq!(decide(&mut panel, &fields, PanelNav::NONE, &quiet), None);
+        assert_eq!(
+            decide(&mut panel, &fields, PanelNav::NONE, &quiet, TEST_DT),
+            None
+        );
+    }
+
+    /// A stick sweeps a value as a **rate**, and the keyboard still steps.
+    ///
+    /// The rate is a fraction of the field's own range per `SWEEP_SECONDS`, so
+    /// a full push crosses `sky.clouds`' 0..10 in two seconds — five a second,
+    /// or 1/12 of a unit per tick at 60 Hz.
+    #[test]
+    fn a_full_sweep_crosses_the_range_in_sweep_seconds() {
+        let mut panel = TweakPanel::new();
+        panel.open = true;
+        let fields = fields();
+        panel.cursor = 1; // sky.clouds, a Float over 0..10 starting at 2.0
+        let quiet = tick([]);
+
+        let nav = PanelNav {
+            sweep: 1.0,
+            ..PanelNav::NONE
+        };
+        let Some(Action::Set(_, TweakValue::Float(v))) =
+            decide(&mut panel, &fields, nav, &quiet, TEST_DT)
+        else {
+            panic!("a full sweep produced no edit");
+        };
+        let per_tick = 10.0 / SWEEP_SECONDS * TEST_DT;
+        assert!(
+            (v - (2.0 + per_tick)).abs() < 1e-5,
+            "{v} is not one tick of a full-range sweep"
+        );
+
+        // Half the stick is half the rate — it is a rate, not a step.
+        let half = PanelNav {
+            sweep: 0.5,
+            ..PanelNav::NONE
+        };
+        let Some(Action::Set(_, TweakValue::Float(v))) =
+            decide(&mut panel, &fields, half, &quiet, TEST_DT)
+        else {
+            panic!("half a sweep produced no edit");
+        };
+        assert!((v - (2.0 + per_tick * 0.5)).abs() < 1e-5, "{v}");
+
+        // …and a nav with no sweep in it edits nothing, so the keyboard path
+        // is untouched by any of this.
+        assert_eq!(
+            decide(&mut panel, &fields, PanelNav::NONE, &quiet, TEST_DT),
+            None
+        );
+    }
+
+    /// An integer field moves in whole units, and a sweep too slow to fill one
+    /// in a tick still gets there — the carry is what stops small deflections
+    /// rounding to nothing forever.
+    #[test]
+    fn a_slow_sweep_still_eventually_moves_an_integer() {
+        let mut panel = TweakPanel::new();
+        panel.open = true;
+        let fields = fields();
+        panel.cursor = 4; // cam.steps, an Int
+        let quiet = tick([]);
+        let crawl = PanelNav {
+            sweep: 0.05,
+            ..PanelNav::NONE
+        };
+
+        // 0.05 × 10 / 2s × 1/60 ≈ 0.0042 a tick: nothing lands for a while.
+        assert_eq!(decide(&mut panel, &fields, crawl, &quiet, TEST_DT), None);
+        let mut moved = None;
+        for _ in 0..600 {
+            if let Some(action) = decide(&mut panel, &fields, crawl, &quiet, TEST_DT) {
+                moved = Some(action);
+                break;
+            }
+        }
+        assert_eq!(
+            moved,
+            Some(Action::Set("cam.steps".into(), TweakValue::Int(4))),
+            "the carry never spent a whole unit"
+        );
     }
 
     #[test]

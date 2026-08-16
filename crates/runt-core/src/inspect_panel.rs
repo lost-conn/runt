@@ -54,7 +54,7 @@ use crate::inspect::{self, Edit, FieldPath, Widget};
 use crate::tweak::TweakValue;
 use crate::tweak_panel::{
     self, PanelFont, PanelNav, BACKDROP, BAR_WIDTH, DIM, DRAG_SPAN, MARGIN, PAD, RIM, SCALE,
-    SELECTED, TEXT, WIDTH,
+    SELECTED, SWEEP_SECONDS, TEXT, WIDTH,
 };
 use crate::ui::UiBatch;
 
@@ -95,6 +95,17 @@ pub struct InspectPanel {
     /// The first row the last drawn frame put on screen; see
     /// [`TweakPanel::scroll`](crate::tweak_panel::TweakPanel::scroll).
     scroll: usize,
+    /// Fractional units an analog sweep has accumulated on an **integer** row
+    /// but not yet spent.
+    ///
+    /// A float row needs none of this — it takes whatever fraction the tick
+    /// produced. An integer one cannot: a slow sweep is a few thousandths of a
+    /// unit per tick, and rounding each tick's contribution on its own would
+    /// round every one of them to nothing, so the row would simply refuse to
+    /// move below some stick deflection. Carried here and spent a whole unit at
+    /// a time instead. Cleared whenever the sweep stops or the cursor moves, so
+    /// it can never leak into a row it was not earned on.
+    sweep_carry: f64,
 }
 
 impl InspectPanel {
@@ -152,6 +163,7 @@ pub fn decide(
     rows: &[Row],
     nav: PanelNav,
     input: &Input,
+    dt: f32,
     viewport: Viewport,
 ) -> Option<(FieldPath, Edit)> {
     if rows.is_empty() {
@@ -162,11 +174,17 @@ pub fn decide(
     // tree under the cursor.
     panel.cursor = panel.cursor.min(rows.len() - 1);
 
+    let was = panel.cursor;
     if nav.up {
         panel.cursor = (panel.cursor + rows.len() - 1) % rows.len();
     }
     if nav.down {
         panel.cursor = (panel.cursor + 1) % rows.len();
+    }
+    // A sweep is about the row it was aimed at; moving off one abandons
+    // whatever fraction it had earned there.
+    if panel.cursor != was || nav.sweep == 0.0 {
+        panel.sweep_carry = 0.0;
     }
 
     // Touch before the keys' edits, so a finger and a keyboard cannot both
@@ -181,10 +199,53 @@ pub fn decide(
     }
 
     let delta = i32::from(nav.inc) - i32::from(nav.dec);
-    if delta == 0 {
-        return None;
+    if delta != 0 {
+        return step(widget, delta, nav.scale);
     }
-    step(widget, delta, nav.scale)
+    if nav.sweep != 0.0 {
+        return sweep(&mut panel.sweep_carry, widget, nav.sweep, dt);
+    }
+    None
+}
+
+/// One tick of an analog sweep: a rate, integrated.
+///
+/// The rate is a fraction of the row's own declared range per
+/// [`SWEEP_SECONDS`], so a colour channel and a distance in metres both feel
+/// the same under the same stick deflection without either being tuned by hand.
+///
+/// Only numbers sweep. A bool, a choice, a variant and a seed are all *steps* —
+/// there is no half of the way from one enum variant to the next — and a stick
+/// pushed at one of them does nothing rather than cycling continuously, which
+/// would make holding a direction spin through the options unusably.
+fn sweep(
+    carry: &mut f64,
+    widget: &Widget,
+    amount: f32,
+    dt: f32,
+) -> Option<(FieldPath, Edit)> {
+    match widget {
+        Widget::Float {
+            path, value, range, ..
+        } => {
+            let span = (range.max - range.min) as f64;
+            let delta = amount as f64 * span / SWEEP_SECONDS as f64 * dt as f64;
+            (delta != 0.0).then(|| (path.clone(), Edit::Float(value + delta)))
+        }
+        Widget::Int {
+            path, value, range, ..
+        } => {
+            let span = (range.max - range.min) as f64;
+            *carry += amount as f64 * span / SWEEP_SECONDS as f64 * dt as f64;
+            let whole = carry.trunc();
+            if whole == 0.0 {
+                return None;
+            }
+            *carry -= whole;
+            Some((path.clone(), Edit::Int(value + whole as i64)))
+        }
+        _ => None,
+    }
 }
 
 /// Enter on a row: bools flip, enums advance, seeds reroll, numbers do nothing
@@ -558,6 +619,11 @@ mod tests {
         Viewport::new(1280, 720)
     }
 
+    /// One tick at the engine's fixed rate — what `drive` reads off `FixedTick`
+    /// in a real world. Only the sweep looks at it; every edge test is
+    /// unaffected by its value.
+    const TEST_DT: f32 = 1.0 / 60.0;
+
     /// One tick of input built from events, the way `Sim::tick` builds it.
     fn tick(events: impl IntoIterator<Item = InputEvent>) -> Input {
         let mut input = Input::new();
@@ -574,7 +640,7 @@ mod tests {
         input: &Input,
         viewport: Viewport,
     ) -> Option<(FieldPath, Edit)> {
-        decide(panel, rows, PanelNav::from_keys(input), input, viewport)
+        decide(panel, rows, PanelNav::from_keys(input), input, TEST_DT, viewport)
     }
 
     #[test]
@@ -641,6 +707,7 @@ mod tests {
                 ..PanelNav::NONE
             },
             &quiet,
+            TEST_DT,
             view(),
         );
         assert_eq!(panel.cursor(), 1, "radius, one row past the variant");
@@ -653,6 +720,7 @@ mod tests {
                 ..PanelNav::NONE
             },
             &quiet,
+            TEST_DT,
             view(),
         );
         let Some((path, Edit::Float(v))) = edit else {
@@ -673,6 +741,7 @@ mod tests {
                     ..PanelNav::NONE
                 },
                 &quiet,
+                TEST_DT,
                 view(),
             ),
             None
