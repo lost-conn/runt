@@ -84,8 +84,19 @@ fn world() -> World {
 }
 
 /// The batch a game's `Set::Ui` would hand the renderer, with the panel in
-/// whatever state `open` says.
+/// whatever state `open` says — and holding the verbs, which is the ordinary
+/// case and the one every test below is about. [`batch_unfocused`] is the
+/// other half.
 fn batch_for(world: &mut World, open: bool) -> UiBatch {
+    batch_with_focus(world, open, true)
+}
+
+/// …and the same panel with the nav verbs pointed somewhere else.
+fn batch_unfocused(world: &mut World) -> UiBatch {
+    batch_with_focus(world, true, false)
+}
+
+fn batch_with_focus(world: &mut World, open: bool, focused: bool) -> UiBatch {
     world.resource_mut::<TweakPanel>().set_open(open);
     let fields = tweak::fields_of(world);
     let overrides = world.resource::<tweak::TweakOverrides>().len();
@@ -93,7 +104,7 @@ fn batch_for(world: &mut World, open: bool) -> UiBatch {
     let viewport = *world.resource::<Viewport>();
     let mut batch = UiBatch::new();
     tweak_panel::draw(
-        &mut panel, &fields, &mut batch, &BlockFont, viewport, overrides,
+        &mut panel, &fields, &mut batch, &BlockFont, viewport, overrides, focused,
     );
     // The panel remembers the window it drew, so hand it back rather than
     // dropping it — the touch hit test reads it next tick.
@@ -171,6 +182,39 @@ fn an_edited_field_reads_back_changed_and_marks_itself_overridden() {
             .iter()
             .any(|q| q.color == UiQuad::rgba(tweak_panel::OVERRIDDEN)),
         "no row drew in the overridden colour"
+    );
+}
+
+/// A panel that is up but is not the one being navigated draws no cursor bar.
+///
+/// The bar is a claim on ↑↓, and on a screen with two panels open only one of
+/// them can honour it: `decide` already answers a `PanelNav::NONE` with
+/// nothing, so an unfocused panel is inert, and a highlighted row on it points
+/// at presses that will land somewhere else. Everything *else* it draws is
+/// unchanged — the panel is still a readable list of live values, which is why
+/// a host keeps it up at all.
+#[test]
+fn a_panel_that_is_not_being_navigated_draws_no_cursor_bar() {
+    let mut world = world();
+    let bar = UiQuad::rgba(tweak_panel::SELECTED);
+
+    let focused = batch_for(&mut world, true);
+    assert!(
+        focused.quads.iter().any(|q| q.color == bar),
+        "a focused panel drew no cursor bar — this test proves nothing"
+    );
+
+    let unfocused = batch_unfocused(&mut world);
+    assert!(
+        !unfocused.quads.iter().any(|q| q.color == bar),
+        "an unfocused panel still highlighted a row"
+    );
+    // …and it is otherwise the same picture: one quad fewer, not a panel that
+    // went away or lost its rows.
+    assert_eq!(
+        unfocused.len() + 1,
+        focused.len(),
+        "withholding the bar changed more than the bar"
     );
 }
 

@@ -384,6 +384,21 @@ fn touch(
 /// waiting to happen. Draws nothing when closed, when the viewport is unknown,
 /// or when there are no rows (no selection is an absent panel, not an empty
 /// box).
+///
+/// # `focused`, and why the cursor can be invisible
+///
+/// Open and *being navigated* are two different states, and a host with more
+/// than one panel up has to be able to say so: [`decide`] already answers a
+/// [`PanelNav::NONE`] with nothing, so the panel that is not holding the verbs
+/// is inert — and a highlighted row on an inert panel is a claim on ↑↓ that
+/// the next press will not honour. Pass `false` and the row bar is simply not
+/// drawn; the list stays legible, and the cursor comes back where it was the
+/// moment the verbs do.
+///
+/// A host that only ever shows one panel passes `true` and never thinks about
+/// it. Which panel has them is the host's question — the arbitration is a
+/// property of a screen, not of a widget — so this takes the answer rather
+/// than keeping a bit it could not maintain.
 pub fn draw(
     panel: &mut InspectPanel,
     rows: &[Row],
@@ -391,6 +406,7 @@ pub fn draw(
     font: &dyn PanelFont,
     viewport: Viewport,
     title: &str,
+    focused: bool,
 ) {
     if !panel.open || !viewport.is_known() || rows.is_empty() {
         return;
@@ -424,7 +440,9 @@ pub fn draw(
 
     for (offset, (depth, widget)) in rows[first..first + shown].iter().enumerate() {
         let index = first + offset;
-        if index == panel.cursor {
+        // The cursor bar is drawn only while this panel is the one being
+        // navigated — see the `focused` argument.
+        if focused && index == panel.cursor {
             batch.solid([left + 1.0, y - 1.0, WIDTH - 2.0, pitch], SELECTED);
         }
         let indent = x + 8.0 * *depth as f32;
@@ -954,14 +972,14 @@ mod tests {
     fn a_closed_panel_and_an_empty_selection_both_draw_nothing() {
         let mut panel = InspectPanel::new();
         let mut batch = UiBatch::new();
-        draw(&mut panel, &rows(), &mut batch, &BlockFont, view(), "TORUS");
+        draw(&mut panel, &rows(), &mut batch, &BlockFont, view(), "TORUS", true);
         assert!(batch.is_empty(), "a closed panel is not a pass");
 
         panel.open = true;
-        draw(&mut panel, &[], &mut batch, &BlockFont, view(), "TORUS");
+        draw(&mut panel, &[], &mut batch, &BlockFont, view(), "TORUS", true);
         assert!(batch.is_empty(), "no selection is an absent panel");
 
-        draw(&mut panel, &rows(), &mut batch, &BlockFont, view(), "TORUS");
+        draw(&mut panel, &rows(), &mut batch, &BlockFont, view(), "TORUS", true);
         assert!(!batch.is_empty(), "an open panel with rows draws");
     }
 
@@ -976,7 +994,7 @@ mod tests {
         panel.open = true;
         let rows = vec![(0, color("blown", [5.0, -2.0, f32::NAN]))];
         let mut batch = UiBatch::new();
-        draw(&mut panel, &rows, &mut batch, &BlockFont, view(), "MATERIAL");
+        draw(&mut panel, &rows, &mut batch, &BlockFont, view(), "MATERIAL", true);
         assert!(!batch.is_empty(), "the rim and the swatch still draw");
         for quad in &batch.quads {
             assert!(

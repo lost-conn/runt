@@ -815,6 +815,12 @@ pub fn row_pitch() -> f32 {
 /// Draws nothing when the panel is closed, when the viewport is unknown (before
 /// the first frame), or when nothing is registered — a game with the system
 /// installed and no roots gets an empty batch, not an empty box.
+///
+/// `focused` is *this panel is the one being navigated*, and `false` withholds
+/// the cursor bar: a highlighted row on a panel whose next ↑ belongs to some
+/// other panel is a lie about where the hands are. A host with one panel passes
+/// `true` and forgets about it; [`inspect_panel::draw`](crate::inspect_panel::draw)
+/// takes the same argument and states the case at length.
 pub fn draw(
     panel: &mut TweakPanel,
     fields: &[TweakField],
@@ -822,6 +828,7 @@ pub fn draw(
     font: &dyn PanelFont,
     viewport: Viewport,
     override_count: usize,
+    focused: bool,
 ) {
     if !panel.open || !viewport.is_known() {
         return;
@@ -867,7 +874,10 @@ pub fn draw(
 
     for (offset, row) in rows[first..first + shown].iter().enumerate() {
         let index = first + offset;
-        if index == panel.cursor {
+        // Only while this panel is the one being navigated —
+        // [`inspect_panel::draw`](crate::inspect_panel::draw)'s `focused`
+        // carries the argument in full, and the two panels answer it alike.
+        if focused && index == panel.cursor {
             batch.solid([MARGIN + 1.0, y - 1.0, WIDTH - 2.0, pitch], SELECTED);
         }
         match row {
@@ -1008,6 +1018,7 @@ mod tests {
             &BlockFont,
             Viewport::new(1280, 720),
             0,
+            true,
         );
         assert!(batch.is_empty(), "a closed panel is not a pass");
     }
@@ -1456,7 +1467,7 @@ mod tests {
         let short = Viewport::new(320, (MARGIN * 2.0 + PAD * 2.0 + row_pitch() * 7.0) as u32);
         panel.cursor = fields.len();
         let mut batch = UiBatch::new();
-        draw(&mut panel, &fields, &mut batch, &BlockFont, short, 0);
+        draw(&mut panel, &fields, &mut batch, &BlockFont, short, 0, true);
         assert!(
             !batch.is_empty(),
             "a panel taller than the screen drew nothing"
